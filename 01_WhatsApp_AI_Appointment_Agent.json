@@ -100,7 +100,7 @@
       ],
       "parameters": {
         "language": "javascript",
-        "jsCode": "const inbound = $('Parse_WhatsApp_Inbound').first().json;\nconst dbRes = $input.first()?.json || {};\n\nconst doctors = Array.isArray(dbRes.active_doctors) ? dbRes.active_doctors : [];\nconst appts = Array.isArray(dbRes.recent_appointments) ? dbRes.recent_appointments : [];\nconst unavailability = Array.isArray(dbRes.active_unavailability) ? dbRes.active_unavailability : [];\n\n// Check for active PENDING (that is NOT expired) (Bug #11)\nconst now = new Date();\nconst activePending = appts.find(a => a.status === 'PENDING' && (!a.expires_at || new Date(a.expires_at) > now));\nconst activeConfirmed = appts.find(a => (a.status === 'CONFIRMED' || a.status === 'RESCHEDULED') && new Date(a.end_time) > now);\n\nconst clinicTimezone = doctors[0]?.timezone || 'Asia/Kolkata';\nconst todayLocalStr = new Intl.DateTimeFormat('en-CA', { timeZone: clinicTimezone }).format(now);\nconst todayWeekday = new Intl.DateTimeFormat('en-US', { timeZone: clinicTimezone, weekday: 'long' }).format(now);\n\nconst prompt = `You are an intelligent clinic receptionist AI.\nToday's local date is ${todayLocalStr} (${todayWeekday}) in ${clinicTimezone} timezone.\n\nDoctors available at clinic:\n${doctors.map(d => `- ID: \"${d.doctor_id}\", Name: \"${d.doctor_name}\", Specialty: \"${d.specialty}\", Working Hours: ${d.working_hours.start}-${d.working_hours.end}`).join('\\n')}\n\nCustomer Info:\n- Name: \"${inbound.customer_name || 'Customer'}\"\n- Phone: \"${inbound.phone}\"\n- Latest Message: \"${inbound.message}\"\n\nActive Holds/Bookings:\n- Pending Hold: ${activePending ? JSON.stringify(activePending) : 'None'}\n- Confirmed Booking: ${activeConfirmed ? JSON.stringify(activeConfirmed) : 'None'}\n\nTasks:\nAnalyze the message and extract Intent and Entities.\nIntents: \"BOOK\", \"CHECK_AVAILABILITY\", \"CONFIRM\", \"RESCHEDULE\", \"CANCEL\", \"GENERAL_QUESTIONS\", \"UNKNOWN\"\nRules:\n- If customer says \"YES\", \"CONFIRM\", \"OK\", \"Sure\", \"book it\" and there is a Pending Hold -> Intent MUST be \"CONFIRM\".\n- DO NOT invent calendar availability.\n- Extract requested_date (YYYY-MM-DD), requested_time (HH:MM in 24h), doctor_id (must match one of [${doctors.map(d => d.doctor_id).join(', ')}]), service.\n\nOutput MUST be a single raw JSON object:\n{\n  \"intent\": \"BOOK\" | \"CHECK_AVAILABILITY\" | \"CONFIRM\" | \"RESCHEDULE\" | \"CANCEL\" | \"GENERAL_QUESTIONS\" | \"UNKNOWN\",\n  \"doctor_id\": string | null,\n  \"service\": string | null,\n  \"requested_date\": \"YYYY-MM-DD\" | null,\n  \"requested_time\": \"HH:MM\" | null,\n  \"general_answer\": string | null\n}`;\n\nreturn [{\n  json: {\n    correlation_id: inbound.correlation_id,\n    phone: inbound.phone,\n    customer_name: inbound.customer_name,\n    message: inbound.message,\n    channel: inbound.channel,\n    active_doctors: doctors,\n    active_pending: activePending || null,\n    active_confirmed: activeConfirmed || null,\n    active_unavailability: unavailability,\n    today_local: todayLocalStr,\n    clinic_timezone: clinicTimezone,\n    gemini_model: \"gemini-1.5-flash\",\n    gemini_prompt: prompt\n  }\n}];\n"
+        "jsCode": "const inbound = $('Parse_WhatsApp_Inbound').first().json;\nconst dbRes = $input.first()?.json || {};\n\n// Detect DB service failure (Bug #7)\nif (dbRes.error || !Array.isArray(dbRes.active_doctors) || dbRes.active_doctors.length === 0) {\n  return [{\n    json: {\n      correlation_id: inbound.correlation_id,\n      phone: inbound.phone,\n      customer_name: inbound.customer_name,\n      message: inbound.message,\n      channel: inbound.channel,\n      db_error: true,\n      error_msg: \"Database service is temporarily unavailable.\"\n    }\n  }];\n}\n\nconst doctors = dbRes.active_doctors;\nconst appts = Array.isArray(dbRes.recent_appointments) ? dbRes.recent_appointments : [];\nconst unavailability = Array.isArray(dbRes.active_unavailability) ? dbRes.active_unavailability : [];\n\n// Check for active PENDING (that is NOT expired)\nconst now = new Date();\nconst activePending = appts.find(a => a.status === 'PENDING' && (!a.expires_at || new Date(a.expires_at) > now));\nconst activeConfirmed = appts.find(a => (a.status === 'CONFIRMED' || a.status === 'RESCHEDULED') && new Date(a.end_time) > now);\n\nconst clinicTimezone = doctors[0]?.timezone || 'Asia/Kolkata';\nconst todayLocalStr = new Intl.DateTimeFormat('en-CA', { timeZone: clinicTimezone }).format(now);\nconst todayWeekday = new Intl.DateTimeFormat('en-US', { timeZone: clinicTimezone, weekday: 'long' }).format(now);\n\nconst prompt = `You are an intelligent clinic receptionist AI.\nToday's local date is ${todayLocalStr} (${todayWeekday}) in ${clinicTimezone} timezone.\n\nDoctors available at clinic:\n${doctors.map(d => `- ID: \"${d.doctor_id}\", Name: \"${d.doctor_name}\", Specialty: \"${d.specialty}\", Working Hours: ${d.working_hours.start}-${d.working_hours.end}`).join('\\n')}\n\nCustomer Info:\n- Name: \"${inbound.customer_name || 'Customer'}\"\n- Phone: \"${inbound.phone}\"\n- Latest Message: \"${inbound.message}\"\n\nActive Holds/Bookings:\n- Pending Hold: ${activePending ? JSON.stringify(activePending) : 'None'}\n- Confirmed Booking: ${activeConfirmed ? JSON.stringify(activeConfirmed) : 'None'}\n\nTasks:\nAnalyze the message and extract Intent and Entities.\nIntents: \"BOOK\", \"CHECK_AVAILABILITY\", \"CONFIRM\", \"RESCHEDULE\", \"CANCEL\", \"GENERAL_QUESTIONS\", \"UNKNOWN\"\nRules:\n- If customer says \"YES\", \"CONFIRM\", \"OK\", \"Sure\", \"book it\" and there is a Pending Hold -> Intent MUST be \"CONFIRM\".\n- DO NOT invent calendar availability.\n- Extract requested_date (YYYY-MM-DD), requested_time (HH:MM in 24h), doctor_id (must match one of [${doctors.map(d => d.doctor_id).join(', ')}]), service.\n\nOutput MUST be a single raw JSON object:\n{\n  \"intent\": \"BOOK\" | \"CHECK_AVAILABILITY\" | \"CONFIRM\" | \"RESCHEDULE\" | \"CANCEL\" | \"GENERAL_QUESTIONS\" | \"UNKNOWN\",\n  \"doctor_id\": string | null,\n  \"service\": string | null,\n  \"requested_date\": \"YYYY-MM-DD\" | null,\n  \"requested_time\": \"HH:MM\" | null,\n  \"general_answer\": string | null\n}`;\n\nreturn [{\n  json: {\n    correlation_id: inbound.correlation_id,\n    phone: inbound.phone,\n    customer_name: inbound.customer_name,\n    message: inbound.message,\n    channel: inbound.channel,\n    db_error: false,\n    active_doctors: doctors,\n    active_pending: activePending || null,\n    active_confirmed: activeConfirmed || null,\n    active_unavailability: unavailability,\n    today_local: todayLocalStr,\n    clinic_timezone: clinicTimezone,\n    gemini_model: \"gemini-1.5-flash\",\n    gemini_prompt: prompt\n  }\n}];\n"
       }
     },
     {
@@ -421,7 +421,7 @@
       ],
       "parameters": {
         "language": "javascript",
-        "jsCode": "\nfunction getUtcFromLocal(dateStr, timeStr, timeZone) {\n  const [yyyy, mm, dd] = dateStr.split('-').map(Number);\n  const [hh, min] = timeStr.split(':').map(Number);\n  const utcDate = new Date(Date.UTC(yyyy, mm - 1, dd, hh, min, 0));\n  const invDate = new Date(utcDate.toLocaleString('en-US', { timeZone: 'UTC' }));\n  const targetDate = new Date(utcDate.toLocaleString('en-US', { timeZone: timeZone }));\n  const diff = targetDate.getTime() - invDate.getTime();\n  return new Date(utcDate.getTime() - diff);\n}\n\nfunction formatInTimezone(dateObj, timeZone, options) {\n  return new Intl.DateTimeFormat('en-US', { timeZone, ...options }).format(dateObj);\n}\n\nfunction getLocalWeekday(dateStr, timeStr, timeZone) {\n  const d = getUtcFromLocal(dateStr, timeStr || '12:00', timeZone);\n  const dayStr = new Intl.DateTimeFormat('en-US', { timeZone, weekday: 'short' }).format(d);\n  const map = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };\n  return map[dayStr];\n}\n\nconst prev = $('Validate_Booking_Input').first().json;\nconst allInputs = $input.all();\n\n// Explicit Google Calendar failure detection (Bug #4)\nconst gcalError = allInputs.some(i => i.json?.error || i.error);\nif (gcalError) {\n  return [{\n    json: {\n      ...prev,\n      is_slot_available: false,\n      calendar_error: true,\n      available_alternatives: [],\n      error_msg: \"We are temporarily unable to verify calendar availability. Please try again shortly.\"\n    }\n  }];\n}\n\nconst gcalItems = allInputs.map(i => i.json).filter(j => j && (j.id || j.start));\n\nconst doc = prev.doctor || {};\nconst tz = doc.timezone || 'Asia/Kolkata';\nconst wh = doc.working_hours || { start: \"09:00\", end: \"17:00\" };\nconst slotDuration = doc.slot_duration_minutes || 30;\nconst bufferMin = doc.buffer_minutes || 0;\nconst cutoffMin = doc.booking_cutoff_minutes || 60;\nconst unavailList = prev.active_unavailability || [];\n\nconst reqStart = new Date(prev.start_time_iso);\nconst reqEnd = new Date(prev.end_time_iso);\n\n// Helper to check overlap with GCal events considering buffer\nfunction isGCalOverlap(startA, endA, events) {\n  for (const ev of events) {\n    const evStartStr = ev.start?.dateTime || ev.start?.date;\n    const evEndStr = ev.end?.dateTime || ev.end?.date;\n    if (!evStartStr || !evEndStr) continue;\n    const evStart = new Date(evStartStr);\n    const evEnd = new Date(evEndStr);\n    const evStartBuffered = new Date(evStart.getTime() - bufferMin * 60000);\n    const evEndBuffered = new Date(evEnd.getTime() + bufferMin * 60000);\n    if (startA < evEndBuffered && endA > evStartBuffered) {\n      return true;\n    }\n  }\n  return false;\n}\n\n// Helper to check overlap with Doctor Unavailability\nfunction isDoctorLeaveOverlap(startA, endA, leaveList) {\n  for (const u of leaveList) {\n    if (u.doctor_id === doc.doctor_id) {\n      const uStart = new Date(u.start_time);\n      const uEnd = new Date(u.end_time);\n      if (startA < uEnd && endA > uStart) return true;\n    }\n  }\n  return false;\n}\n\nconst isRequestedFree = !isGCalOverlap(reqStart, reqEnd, gcalItems) && !isDoctorLeaveOverlap(reqStart, reqEnd, unavailList);\n\n// Calculate alternatives\nconst [startH, startM] = wh.start.split(':').map(Number);\nconst [endH, endM] = wh.end.split(':').map(Number);\nconst allAlternatives = [];\nconst now = new Date();\n\nfor (let h = startH; h < endH; h++) {\n  for (let m = 0; m < 60; m += slotDuration) {\n    const hhStr = String(h).padStart(2, '0');\n    const mmStr = String(m).padStart(2, '0');\n    const timeStr = `${hhStr}:${mmStr}`;\n    \n    const slotStart = getUtcFromLocal(prev.requested_date, timeStr, tz);\n    const slotEnd = new Date(slotStart.getTime() + slotDuration * 60000);\n\n    // Cutoff check\n    if (slotStart.getTime() < now.getTime() + cutoffMin * 60000) continue;\n\n    // Availability checks\n    if (!isGCalOverlap(slotStart, slotEnd, gcalItems) && !isDoctorLeaveOverlap(slotStart, slotEnd, unavailList)) {\n      allAlternatives.push(timeStr);\n    }\n  }\n}\n\nreturn [{\n  json: {\n    ...prev,\n    is_slot_available: isRequestedFree,\n    available_alternatives: allAlternatives.slice(0, 4),\n    existing_events_count: gcalItems.length\n  }\n}];\n"
+        "jsCode": "\nfunction getUtcFromLocal(dateStr, timeStr, timeZone) {\n  const [yyyy, mm, dd] = dateStr.split('-').map(Number);\n  const [hh, min] = timeStr.split(':').map(Number);\n  const utcDate = new Date(Date.UTC(yyyy, mm - 1, dd, hh, min, 0));\n  const invDate = new Date(utcDate.toLocaleString('en-US', { timeZone: 'UTC' }));\n  const targetDate = new Date(utcDate.toLocaleString('en-US', { timeZone: timeZone }));\n  const diff = targetDate.getTime() - invDate.getTime();\n  return new Date(utcDate.getTime() - diff);\n}\n\nfunction formatInTimezone(dateObj, timeZone, options) {\n  return new Intl.DateTimeFormat('en-US', { timeZone, ...options }).format(dateObj);\n}\n\nfunction getLocalWeekday(dateStr, timeStr, timeZone) {\n  const d = getUtcFromLocal(dateStr, timeStr || '12:00', timeZone);\n  const dayStr = new Intl.DateTimeFormat('en-US', { timeZone, weekday: 'short' }).format(d);\n  const map = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };\n  return map[dayStr];\n}\n\nconst prev = $('Validate_Booking_Input').first().json;\nconst allInputs = $input.all();\n\n// Explicit Google Calendar failure detection (Bug #4)\nconst gcalError = allInputs.some(i => i.json?.error || i.error);\nif (gcalError) {\n  return [{\n    json: {\n      ...prev,\n      is_slot_available: false,\n      calendar_error: true,\n      available_alternatives: [],\n      error_msg: \"We are temporarily unable to verify calendar availability. Please try again shortly.\"\n    }\n  }];\n}\n\nconst gcalItems = allInputs.map(i => i.json).filter(j => j && (j.id || j.start));\n\nconst doc = prev.doctor || {};\nconst tz = doc.timezone || 'Asia/Kolkata';\nconst wh = doc.working_hours || { start: \"09:00\", end: \"17:00\" };\nconst slotDuration = doc.slot_duration_minutes || 30;\nconst bufferMin = doc.buffer_minutes || 0;\nconst cutoffMin = doc.booking_cutoff_minutes || 60;\nconst unavailList = prev.active_unavailability || [];\n\nconst reqStart = new Date(prev.start_time_iso);\nconst reqEnd = new Date(prev.end_time_iso);\n\nfunction isGCalOverlap(startA, endA, events) {\n  for (const ev of events) {\n    const evStartStr = ev.start?.dateTime || ev.start?.date;\n    const evEndStr = ev.end?.dateTime || ev.end?.date;\n    if (!evStartStr || !evEndStr) continue;\n    const evStart = new Date(evStartStr);\n    const evEnd = new Date(evEndStr);\n    const evStartBuffered = new Date(evStart.getTime() - bufferMin * 60000);\n    const evEndBuffered = new Date(evEnd.getTime() + bufferMin * 60000);\n    if (startA < evEndBuffered && endA > evStartBuffered) {\n      return true;\n    }\n  }\n  return false;\n}\n\nfunction isDoctorLeaveOverlap(startA, endA, leaveList) {\n  for (const u of leaveList) {\n    if (u.doctor_id === doc.doctor_id) {\n      const uStart = new Date(u.start_time);\n      const uEnd = new Date(u.end_time);\n      if (startA < uEnd && endA > uStart) return true;\n    }\n  }\n  return false;\n}\n\nconst isRequestedFree = !isGCalOverlap(reqStart, reqEnd, gcalItems) && !isDoctorLeaveOverlap(reqStart, reqEnd, unavailList);\n\nconst [startH, startM] = wh.start.split(':').map(Number);\nconst [endH, endM] = wh.end.split(':').map(Number);\nconst allAlternatives = [];\nconst now = new Date();\n\nfor (let h = startH; h < endH; h++) {\n  for (let m = 0; m < 60; m += slotDuration) {\n    const hhStr = String(h).padStart(2, '0');\n    const mmStr = String(m).padStart(2, '0');\n    const timeStr = `${hhStr}:${mmStr}`;\n    \n    const slotStart = getUtcFromLocal(prev.requested_date, timeStr, tz);\n    const slotEnd = new Date(slotStart.getTime() + slotDuration * 60000);\n\n    if (slotStart.getTime() < now.getTime() + cutoffMin * 60000) continue;\n\n    if (!isGCalOverlap(slotStart, slotEnd, gcalItems) && !isDoctorLeaveOverlap(slotStart, slotEnd, unavailList)) {\n      allAlternatives.push(timeStr);\n    }\n  }\n}\n\nreturn [{\n  json: {\n    ...prev,\n    is_slot_available: isRequestedFree,\n    calendar_error: false,\n    available_alternatives: allAlternatives.slice(0, 4),\n    existing_events_count: gcalItems.length\n  }\n}];\n"
       }
     },
     {
@@ -812,7 +812,7 @@
       ],
       "parameters": {
         "language": "javascript",
-        "jsCode": "\nfunction getUtcFromLocal(dateStr, timeStr, timeZone) {\n  const [yyyy, mm, dd] = dateStr.split('-').map(Number);\n  const [hh, min] = timeStr.split(':').map(Number);\n  const utcDate = new Date(Date.UTC(yyyy, mm - 1, dd, hh, min, 0));\n  const invDate = new Date(utcDate.toLocaleString('en-US', { timeZone: 'UTC' }));\n  const targetDate = new Date(utcDate.toLocaleString('en-US', { timeZone: timeZone }));\n  const diff = targetDate.getTime() - invDate.getTime();\n  return new Date(utcDate.getTime() - diff);\n}\n\nfunction formatInTimezone(dateObj, timeZone, options) {\n  return new Intl.DateTimeFormat('en-US', { timeZone, ...options }).format(dateObj);\n}\n\nfunction getLocalWeekday(dateStr, timeStr, timeZone) {\n  const d = getUtcFromLocal(dateStr, timeStr || '12:00', timeZone);\n  const dayStr = new Intl.DateTimeFormat('en-US', { timeZone, weekday: 'short' }).format(d);\n  const map = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };\n  return map[dayStr];\n}\n\nconst prev = $('Validate_Pending_For_Confirm').first().json;\nconst allInputs = $input.all();\n\n// Explicit Google Calendar failure detection (Bug #4)\nconst gcalError = allInputs.some(i => i.json?.error || i.error);\nif (gcalError) {\n  return [{ json: { ...prev, is_final_slot_free: false, conflict_reason: \"Calendar lookup error.\" } }];\n}\n\nconst gcalItems = allInputs.map(i => i.json).filter(j => j && (j.id || j.start));\nconst reqStart = new Date(prev.start_time_iso);\nconst reqEnd = new Date(prev.end_time_iso);\nconst now = new Date();\n\nlet isFree = true;\nlet reason = \"\";\n\n// 1. Check pending expiration and status (Bug #3)\nif (!prev.active_pending || prev.active_pending.status !== 'PENDING') {\n  isFree = false;\n  reason = \"Appointment is no longer in PENDING state.\";\n} else if (prev.active_pending.expires_at && new Date(prev.active_pending.expires_at) <= now) {\n  isFree = false;\n  reason = \"Appointment hold has expired.\";\n}\n\n// 2. Validate Doctor exists and is active (Bug #3)\nconst doc = (prev.active_doctors || []).find(d => d.doctor_id === prev.doctor_id) || prev.doctor;\nif (!doc) {\n  isFree = false;\n  reason = \"Doctor not found or inactive.\";\n}\n\n// 3. Validate working days and working hours (Bug #3)\nif (isFree && doc) {\n  const tz = doc.timezone || 'Asia/Kolkata';\n  const weekdayNum = getLocalWeekday(formatInTimezone(reqStart, tz, { year: 'numeric', month: '2-digit', day: '2-digit' }).replace(/\\//g, '-'), '12:00', tz);\n  const workingDays = doc.working_days || [1,2,3,4,5,6];\n  if (!workingDays.includes(weekdayNum)) {\n    isFree = false;\n    reason = \"Requested date is not a working day for this doctor.\";\n  }\n}\n\n// 4. Validate Doctor Leave / Unavailability (Bug #3)\nif (isFree) {\n  const unavailList = prev.active_unavailability || [];\n  for (const u of unavailList) {\n    if (u.doctor_id === prev.doctor_id) {\n      const uStart = new Date(u.start_time);\n      const uEnd = new Date(u.end_time);\n      if (reqStart < uEnd && reqEnd > uStart) {\n        isFree = false;\n        reason = `Doctor is unavailable: ${u.reason || 'On Leave'}`;\n        break;\n      }\n    }\n  }\n}\n\n// 5. Check GCal events overlap\nif (isFree) {\n  for (const ev of gcalItems) {\n    const evStartStr = ev.start?.dateTime || ev.start?.date;\n    const evEndStr = ev.end?.dateTime || ev.end?.date;\n    if (!evStartStr || !evEndStr) continue;\n    const evStart = new Date(evStartStr);\n    const evEnd = new Date(evEndStr);\n    if (reqStart < evEnd && reqEnd > evStart) {\n      isFree = false;\n      reason = \"Slot is already booked on the doctor's calendar.\";\n      break;\n    }\n  }\n}\n\nreturn [{ json: { ...prev, is_final_slot_free: isFree, conflict_reason: reason } }];\n"
+        "jsCode": "\nfunction getUtcFromLocal(dateStr, timeStr, timeZone) {\n  const [yyyy, mm, dd] = dateStr.split('-').map(Number);\n  const [hh, min] = timeStr.split(':').map(Number);\n  const utcDate = new Date(Date.UTC(yyyy, mm - 1, dd, hh, min, 0));\n  const invDate = new Date(utcDate.toLocaleString('en-US', { timeZone: 'UTC' }));\n  const targetDate = new Date(utcDate.toLocaleString('en-US', { timeZone: timeZone }));\n  const diff = targetDate.getTime() - invDate.getTime();\n  return new Date(utcDate.getTime() - diff);\n}\n\nfunction formatInTimezone(dateObj, timeZone, options) {\n  return new Intl.DateTimeFormat('en-US', { timeZone, ...options }).format(dateObj);\n}\n\nfunction getLocalWeekday(dateStr, timeStr, timeZone) {\n  const d = getUtcFromLocal(dateStr, timeStr || '12:00', timeZone);\n  const dayStr = new Intl.DateTimeFormat('en-US', { timeZone, weekday: 'short' }).format(d);\n  const map = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };\n  return map[dayStr];\n}\n\nconst prev = $('Validate_Pending_For_Confirm').first().json;\nconst allInputs = $input.all();\n\n// Explicit Google Calendar failure detection (Bug #3, Bug #4)\nconst gcalError = allInputs.some(i => i.json?.error || i.error);\nif (gcalError) {\n  return [{\n    json: {\n      ...prev,\n      is_final_slot_free: false,\n      calendar_check_failed: true,\n      error_msg: \"We are temporarily unable to verify calendar availability. Your booking hold is still saved. Please try confirming again in a moment by replying YES.\"\n    }\n  }];\n}\n\nconst gcalItems = allInputs.map(i => i.json).filter(j => j && (j.id || j.start));\nconst reqStart = new Date(prev.start_time_iso);\nconst reqEnd = new Date(prev.end_time_iso);\nconst now = new Date();\n\nlet isFree = true;\nlet reason = \"\";\n\n// 1. Check pending expiration and status\nif (!prev.active_pending || prev.active_pending.status !== 'PENDING') {\n  isFree = false;\n  reason = \"Appointment is no longer in PENDING state.\";\n} else if (prev.active_pending.expires_at && new Date(prev.active_pending.expires_at) <= now) {\n  isFree = false;\n  reason = \"Appointment hold has expired.\";\n}\n\n// 2. Validate Doctor exists and is active\nconst doc = (prev.active_doctors || []).find(d => d.doctor_id === prev.doctor_id) || prev.doctor;\nif (!doc) {\n  isFree = false;\n  reason = \"Doctor not found or inactive.\";\n}\n\n// 3. Validate working days and working hours\nif (isFree && doc) {\n  const tz = doc.timezone || 'Asia/Kolkata';\n  const weekdayNum = getLocalWeekday(formatInTimezone(reqStart, tz, { year: 'numeric', month: '2-digit', day: '2-digit' }).replace(/\\//g, '-'), '12:00', tz);\n  const workingDays = doc.working_days || [1,2,3,4,5,6];\n  if (!workingDays.includes(weekdayNum)) {\n    isFree = false;\n    reason = \"Requested date is not a working day for this doctor.\";\n  }\n}\n\n// 4. Validate Doctor Leave / Unavailability\nif (isFree) {\n  const unavailList = prev.active_unavailability || [];\n  for (const u of unavailList) {\n    if (u.doctor_id === prev.doctor_id) {\n      const uStart = new Date(u.start_time);\n      const uEnd = new Date(u.end_time);\n      if (reqStart < uEnd && reqEnd > uStart) {\n        isFree = false;\n        reason = `Doctor is unavailable: ${u.reason || 'On Leave'}`;\n        break;\n      }\n    }\n  }\n}\n\n// 5. Check GCal events overlap\nif (isFree) {\n  for (const ev of gcalItems) {\n    const evStartStr = ev.start?.dateTime || ev.start?.date;\n    const evEndStr = ev.end?.dateTime || ev.end?.date;\n    if (!evStartStr || !evEndStr) continue;\n    const evStart = new Date(evStartStr);\n    const evEnd = new Date(evEndStr);\n    if (reqStart < evEnd && reqEnd > evStart) {\n      isFree = false;\n      reason = \"Slot is already booked on the doctor's calendar.\";\n      break;\n    }\n  }\n}\n\nreturn [{\n  json: {\n    ...prev,\n    is_final_slot_free: isFree,\n    calendar_check_failed: false,\n    conflict_reason: reason\n  }\n}];\n"
       }
     },
     {
@@ -1161,7 +1161,7 @@
       ],
       "parameters": {
         "language": "javascript",
-        "jsCode": "\nconst prev = $('Validate_Reschedule_Request').first().json;\nconst allInputs = $input.all();\n\n// Explicit Google Calendar failure detection (Bug #4)\nconst gcalError = allInputs.some(i => i.json?.error || i.error);\nif (gcalError) {\n  return [{ json: { ...prev, is_reschedule_slot_free: false, calendar_error: true } }];\n}\n\nconst gcalItems = allInputs.map(i => i.json).filter(j => j && (j.id || j.start));\nconst reqStart = new Date(prev.new_start_iso);\nconst reqEnd = new Date(prev.new_end_iso);\n\nlet isFree = true;\nfor (const ev of gcalItems) {\n  if (prev.calendar_event_id && ev.id === prev.calendar_event_id) continue;\n  const evStart = new Date(ev.start?.dateTime || ev.start?.date);\n  const evEnd = new Date(ev.end?.dateTime || ev.end?.date);\n  if (reqStart < evEnd && reqEnd > evStart) {\n    isFree = false;\n    break;\n  }\n}\n\nreturn [{ json: { ...prev, is_reschedule_slot_free: isFree } }];\n"
+        "jsCode": "\nconst prev = $('Validate_Reschedule_Request').first().json;\nconst allInputs = $input.all();\n\n// Explicit Google Calendar failure detection (Bug #4)\nconst gcalError = allInputs.some(i => i.json?.error || i.error);\nif (gcalError) {\n  return [{ json: { ...prev, is_reschedule_slot_free: false, calendar_error: true } }];\n}\n\nconst gcalItems = allInputs.map(i => i.json).filter(j => j && (j.id || j.start));\nconst reqStart = new Date(prev.new_start_iso);\nconst reqEnd = new Date(prev.new_end_iso);\n\nlet isFree = true;\nfor (const ev of gcalItems) {\n  if (prev.calendar_event_id && ev.id === prev.calendar_event_id) continue;\n  const evStart = new Date(ev.start?.dateTime || ev.start?.date);\n  const evEnd = new Date(ev.end?.dateTime || ev.end?.date);\n  if (reqStart < evEnd && reqEnd > evStart) {\n    isFree = false;\n    break;\n  }\n}\n\nreturn [{ json: { ...prev, is_reschedule_slot_free: isFree, calendar_error: false } }];\n"
       }
     },
     {
@@ -1595,6 +1595,266 @@
         "respondWith": "json",
         "responseBody": "={{ JSON.stringify({ success: true, status: 'general_reply_sent' }) }}"
       }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.calendar_check_failed }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "w1-if-gcal-check-failed",
+      "name": "If_GCal_Check_Failed",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        3600,
+        1100
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://graph.facebook.com/v20.0/FROM_PHONE_NUMBER_ID/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n{\n  \"messaging_product\": \"whatsapp\",\n  \"recipient_type\": \"individual\",\n  \"to\": $json.phone,\n  \"type\": \"text\",\n  \"text\": {\n    \"preview_url\": false,\n    \"body\": $json.error_msg || \"\u26a0\ufe0f We are temporarily unable to verify calendar availability. Your booking hold is still saved. Please try confirming again in a moment by replying YES.\"\n  }\n}\n}"
+      },
+      "id": "w1-send-gcal-err",
+      "name": "Send_WhatsApp_GCal_Error",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3800,
+        1000
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "whatsapp_cloud_api_credentials",
+          "name": "WhatsApp Cloud API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'calendar_check_failed', hold_intact: true }) }}"
+      },
+      "id": "w1-respond-gcal-err",
+      "name": "Respond_GCal_Error",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        4000,
+        1000
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.db_error }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "notEquals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "w1-if-db-healthy",
+      "name": "If_DB_Healthy",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        950,
+        600
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://graph.facebook.com/v20.0/FROM_PHONE_NUMBER_ID/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n{\n  \"messaging_product\": \"whatsapp\",\n  \"recipient_type\": \"individual\",\n  \"to\": $json.phone,\n  \"type\": \"text\",\n  \"text\": {\n    \"preview_url\": false,\n    \"body\": \"\u26a0\ufe0f Our clinic database service is temporarily unavailable. Please try again in a few moments.\"\n  }\n}\n}"
+      },
+      "id": "w1-send-db-err",
+      "name": "Send_WhatsApp_DB_Error",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1150,
+        750
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "whatsapp_cloud_api_credentials",
+          "name": "WhatsApp Cloud API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'database_unavailable' }) }}"
+      },
+      "id": "w1-respond-db-err",
+      "name": "Respond_DB_Error",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1350,
+        750
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "delete",
+        "calendar": {
+          "__rl": true,
+          "value": "={{ $('Verify_Final_Availability').item.json.calendar_id }}",
+          "mode": "id"
+        },
+        "eventId": "={{ $('GCal_Create_Confirmed_Event').item.json.id }}"
+      },
+      "continueOnFail": true,
+      "id": "w1-gcal-rollback-confirmed",
+      "name": "GCal_Rollback_Confirmed_Event",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1.2,
+      "position": [
+        4200,
+        750
+      ],
+      "credentials": {
+        "googleCalendarOAuth2": {
+          "id": "google_calendar_credentials_id",
+          "name": "Google Calendar account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.confirmed_success }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "w1-if-confirm-db-success",
+      "name": "If_Confirmed_DB_Success",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        4000,
+        600
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'confirmation_failed', hold_expired: true }) }}"
+      },
+      "id": "w1-respond-confirm-failed",
+      "name": "Respond_Confirmed_Failed",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        4600,
+        750
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://graph.facebook.com/v20.0/FROM_PHONE_NUMBER_ID/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n{\n  \"messaging_product\": \"whatsapp\",\n  \"recipient_type\": \"individual\",\n  \"to\": $('Verify_Final_Availability').item.json.phone,\n  \"type\": \"text\",\n  \"text\": {\n    \"preview_url\": false,\n    \"body\": \"\u26a0\ufe0f *Confirmation Failed*\\n\\nWe were unable to confirm your booking because the hold expired or was already updated. Please reply with a new date and time to rebook.\"\n  }\n}\n}"
+      },
+      "id": "w1-send-confirm-failed",
+      "name": "Send_WhatsApp_Confirmation_Failed",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        4400,
+        750
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "whatsapp_cloud_api_credentials",
+          "name": "WhatsApp Cloud API"
+        }
+      }
     }
   ],
   "connections": {
@@ -1646,7 +1906,7 @@
       "main": [
         [
           {
-            "node": "Gemini_AI_Agent",
+            "node": "If_DB_Healthy",
             "type": "main",
             "index": 0
           }
@@ -1965,7 +2225,7 @@
         ],
         [
           {
-            "node": "Postgres_Mark_Interim_Conflict",
+            "node": "If_GCal_Check_Failed",
             "type": "main",
             "index": 0
           }
@@ -2020,7 +2280,7 @@
       "main": [
         [
           {
-            "node": "Send_WhatsApp_Confirmed_Receipt",
+            "node": "If_Confirmed_DB_Success",
             "type": "main",
             "index": 0
           }
@@ -2251,6 +2511,104 @@
         [
           {
             "node": "Respond_General_Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If_GCal_Check_Failed": {
+      "main": [
+        [
+          {
+            "node": "Send_WhatsApp_GCal_Error",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Postgres_Mark_Interim_Conflict",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send_WhatsApp_GCal_Error": {
+      "main": [
+        [
+          {
+            "node": "Respond_GCal_Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If_DB_Healthy": {
+      "main": [
+        [
+          {
+            "node": "Gemini_AI_Agent",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send_WhatsApp_DB_Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send_WhatsApp_DB_Error": {
+      "main": [
+        [
+          {
+            "node": "Respond_DB_Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If_Confirmed_DB_Success": {
+      "main": [
+        [
+          {
+            "node": "Send_WhatsApp_Confirmed_Receipt",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "GCal_Rollback_Confirmed_Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GCal_Rollback_Confirmed_Event": {
+      "main": [
+        [
+          {
+            "node": "Send_WhatsApp_Confirmation_Failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send_WhatsApp_Confirmation_Failed": {
+      "main": [
+        [
+          {
+            "node": "Respond_Confirmed_Failed",
             "type": "main",
             "index": 0
           }

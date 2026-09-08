@@ -44,7 +44,7 @@
       ],
       "parameters": {
         "language": "javascript",
-        "jsCode": "const item = $input.item.json;\nconst headers = item.headers || {};\nconst query = item.query || {};\nconst body = item.body || {};\n\n// Server-side authentication check (Bug #1)\nconst configuredSecret = $env.DASHBOARD_SECRET || '';\nconst clientSecret = headers['x-dashboard-secret'] || headers['authorization']?.replace(/^Bearer\\s+/i, '').trim() || query.secret || body.secret || '';\n\nconst isAuthorized = configuredSecret ? (clientSecret === configuredSecret) : true;\n\n// Whitelisted API actions\nconst allowedActions = [\n  'SERVE_HTML',\n  'GET_APPOINTMENTS',\n  'CREATE_APPOINTMENT',\n  'UPDATE_STATUS',\n  'RESCHEDULE_APPOINTMENT',\n  'CANCEL_APPOINTMENT',\n  'SET_DOCTOR_LEAVE'\n];\n\nlet action = 'SERVE_HTML';\nif (body.action) {\n  action = body.action;\n} else if (query.action) {\n  action = query.action;\n}\n\nlet error = null;\n\nif (!isAuthorized) {\n  action = 'UNAUTHORIZED';\n  error = 'Unauthorized: invalid or missing dashboard secret';\n} else if (!allowedActions.includes(action)) {\n  action = 'INVALID_ACTION';\n  error = 'Invalid action requested';\n}\n\nreturn [{\n  json: {\n    action: action,\n    payload: body,\n    query: query,\n    client_secret: clientSecret,\n    error: error,\n    is_authorized: isAuthorized,\n    received_at: new Date().toISOString()\n  }\n}];\n"
+        "jsCode": "const item = $input.item.json;\nconst headers = item.headers || {};\nconst query = item.query || {};\nconst body = item.body || {};\n\n// Server-side authentication check (fail-closed) (Bug #2)\nconst configuredSecret = $env.DASHBOARD_SECRET || '';\nconst clientSecret = headers['x-dashboard-secret'] || headers['authorization']?.replace(/^Bearer\\s+/i, '').trim() || query.secret || body.secret || '';\n\nconst isAuthorized = Boolean(configuredSecret) && Boolean(clientSecret) && clientSecret === configuredSecret;\n\n// Whitelisted API actions\nconst allowedActions = [\n  'SERVE_HTML',\n  'GET_APPOINTMENTS',\n  'CREATE_APPOINTMENT',\n  'UPDATE_STATUS',\n  'RESCHEDULE_APPOINTMENT',\n  'CANCEL_APPOINTMENT',\n  'SET_DOCTOR_LEAVE'\n];\n\nlet action = 'SERVE_HTML';\nif (body.action) {\n  action = body.action;\n} else if (query.action) {\n  action = query.action;\n}\n\nlet error = null;\n\nif (!isAuthorized) {\n  action = 'UNAUTHORIZED';\n  error = 'Unauthorized: invalid or missing dashboard secret';\n} else if (!allowedActions.includes(action)) {\n  action = 'INVALID_ACTION';\n  error = 'Invalid action requested';\n}\n\nreturn [{\n  json: {\n    action: action,\n    payload: body,\n    query: query,\n    error: error,\n    is_authorized: isAuthorized,\n    received_at: new Date().toISOString()\n  }\n}];\n"
       }
     },
     {
@@ -57,7 +57,6 @@
         300
       ],
       "parameters": {
-        "mode": "rules",
         "rules": {
           "values": [
             {
@@ -192,164 +191,48 @@
                   }
                 ]
               }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": false,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "UNAUTHORIZED",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": false,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "INVALID_ACTION",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              }
             }
           ]
         },
-        "fallbackOutput": 7,
-        "values": [
-          {
-            "conditions": {
-              "options": {
-                "caseSensitive": false,
-                "leftValue": "",
-                "typeValidation": "strict"
-              },
-              "conditions": [
-                {
-                  "leftValue": "={{ $json.action }}",
-                  "rightValue": "SERVE_HTML",
-                  "operator": {
-                    "type": "string",
-                    "operation": "equals"
-                  }
-                }
-              ]
-            }
-          },
-          {
-            "conditions": {
-              "options": {
-                "caseSensitive": false,
-                "leftValue": "",
-                "typeValidation": "strict"
-              },
-              "conditions": [
-                {
-                  "leftValue": "={{ $json.action }}",
-                  "rightValue": "GET_APPOINTMENTS",
-                  "operator": {
-                    "type": "string",
-                    "operation": "equals"
-                  }
-                }
-              ]
-            }
-          },
-          {
-            "conditions": {
-              "options": {
-                "caseSensitive": false,
-                "leftValue": "",
-                "typeValidation": "strict"
-              },
-              "conditions": [
-                {
-                  "leftValue": "={{ $json.action }}",
-                  "rightValue": "CREATE_APPOINTMENT",
-                  "operator": {
-                    "type": "string",
-                    "operation": "equals"
-                  }
-                }
-              ]
-            }
-          },
-          {
-            "conditions": {
-              "options": {
-                "caseSensitive": false,
-                "leftValue": "",
-                "typeValidation": "strict"
-              },
-              "conditions": [
-                {
-                  "leftValue": "={{ $json.action }}",
-                  "rightValue": "UPDATE_STATUS",
-                  "operator": {
-                    "type": "string",
-                    "operation": "equals"
-                  }
-                }
-              ]
-            }
-          },
-          {
-            "conditions": {
-              "options": {
-                "caseSensitive": false,
-                "leftValue": "",
-                "typeValidation": "strict"
-              },
-              "conditions": [
-                {
-                  "leftValue": "={{ $json.action }}",
-                  "rightValue": "RESCHEDULE_APPOINTMENT",
-                  "operator": {
-                    "type": "string",
-                    "operation": "equals"
-                  }
-                }
-              ]
-            }
-          },
-          {
-            "conditions": {
-              "options": {
-                "caseSensitive": false,
-                "leftValue": "",
-                "typeValidation": "strict"
-              },
-              "conditions": [
-                {
-                  "leftValue": "={{ $json.action }}",
-                  "rightValue": "CANCEL_APPOINTMENT",
-                  "operator": {
-                    "type": "string",
-                    "operation": "equals"
-                  }
-                }
-              ]
-            }
-          },
-          {
-            "conditions": {
-              "options": {
-                "caseSensitive": false,
-                "leftValue": "",
-                "typeValidation": "strict"
-              },
-              "conditions": [
-                {
-                  "leftValue": "={{ $json.action }}",
-                  "rightValue": "SET_DOCTOR_LEAVE",
-                  "operator": {
-                    "type": "string",
-                    "operation": "equals"
-                  }
-                }
-              ]
-            }
-          },
-          {
-            "conditions": {
-              "options": {
-                "caseSensitive": false,
-                "leftValue": "",
-                "typeValidation": "strict"
-              },
-              "conditions": [
-                {
-                  "leftValue": "={{ $json.action }}",
-                  "rightValue": "UNAUTHORIZED",
-                  "operator": {
-                    "type": "string",
-                    "operation": "equals"
-                  }
-                }
-              ]
-            }
-          }
-        ]
+        "fallbackOutput": 8
       }
     },
     {
@@ -537,7 +420,8 @@
           "id": "postgres_credentials_id",
           "name": "PostgreSQL Account"
         }
-      }
+      },
+      "continueOnFail": true
     },
     {
       "id": "565699eb-8915-47b8-b850-b77651136a3b",
@@ -807,18 +691,108 @@
     {
       "parameters": {
         "respondWith": "json",
-        "responseBody": "={{ JSON.stringify({ success: false, error: $json.error || 'Unauthorized or invalid action' }) }}",
+        "responseBody": "={{ JSON.stringify({ success: false, error: $json.error || 'Unauthorized: invalid or missing dashboard secret' }) }}",
         "options": {
-          "responseCode": "={{ $json.action === 'UNAUTHORIZED' ? 401 : 400 }}"
+          "responseCode": 401
         }
       },
-      "id": "reception-err-respond",
-      "name": "Respond_Dashboard_Error_JSON",
+      "id": "reception-unauthorized-respond",
+      "name": "Respond_Dashboard_Unauthorized",
       "type": "n8n-nodes-base.respondToWebhook",
       "typeVersion": 1.1,
       "position": [
         900,
         750
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ success: false, error: $json.error || 'Invalid action requested' }) }}",
+        "options": {
+          "responseCode": 400
+        }
+      },
+      "id": "reception-invalid-action-respond",
+      "name": "Respond_Dashboard_Invalid_Action",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        900,
+        900
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.appointment_id }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "w3-if-manual-insert-success",
+      "name": "If_Manual_Insert_Success",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1900,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "delete",
+        "calendar": {
+          "__rl": true,
+          "value": "={{ $('Calc_Manual_Times').item.json.calendar_id }}",
+          "mode": "id"
+        },
+        "eventId": "={{ $('GCal_Create_Manual_Event').item.json.id }}"
+      },
+      "continueOnFail": true,
+      "id": "w3-gcal-rollback-manual",
+      "name": "GCal_Rollback_Manual_Event",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1.2,
+      "position": [
+        2100,
+        420
+      ],
+      "credentials": {
+        "googleCalendarOAuth2": {
+          "id": "google_calendar_credentials_id",
+          "name": "Google Calendar account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ success: false, error: 'Database insert failed. Calendar event has been rolled back.' }) }}",
+        "options": {
+          "responseCode": 500
+        }
+      },
+      "id": "w3-respond-manual-failed",
+      "name": "Respond_Manual_Create_Failed_JSON",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        2300,
+        420
       ]
     }
   ],
@@ -909,7 +883,14 @@
         ],
         [
           {
-            "node": "Respond_Dashboard_Error_JSON",
+            "node": "Respond_Dashboard_Unauthorized",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond_Dashboard_Invalid_Action",
             "type": "main",
             "index": 0
           }
@@ -997,7 +978,7 @@
       "main": [
         [
           {
-            "node": "Respond_Manual_Create_JSON",
+            "node": "If_Manual_Insert_Success",
             "type": "main",
             "index": 0
           }
@@ -1097,6 +1078,35 @@
         [
           {
             "node": "Respond_Doctor_Leave_JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If_Manual_Insert_Success": {
+      "main": [
+        [
+          {
+            "node": "Respond_Manual_Create_JSON",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "GCal_Rollback_Manual_Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GCal_Rollback_Manual_Event": {
+      "main": [
+        [
+          {
+            "node": "Respond_Manual_Create_Failed_JSON",
             "type": "main",
             "index": 0
           }
