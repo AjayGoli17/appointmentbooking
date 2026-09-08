@@ -104,7 +104,7 @@
       ],
       "parameters": {
         "operation": "executeQuery",
-        "query": "\n    UPDATE appointments\n    SET reminder_3d_sent = CASE WHEN $1 = '3D' THEN TRUE ELSE reminder_3d_sent END,\n        reminder_1d_sent = CASE WHEN $1 = '1D' THEN TRUE ELSE reminder_1d_sent END,\n        reminder_4h_sent = CASE WHEN $1 = '4H' THEN TRUE ELSE reminder_4h_sent END,\n        reminder_1h_sent = CASE WHEN $1 = '1H' THEN TRUE ELSE reminder_1h_sent END,\n        updated_at = NOW()\n    WHERE appointment_id = $2;\n    ",
+        "query": "\n    UPDATE appointments\n    SET reminder_3d_sent = CASE WHEN $1 = '3D' THEN TRUE ELSE reminder_3d_sent END,\n        reminder_1d_sent = CASE WHEN $1 = '1D' THEN TRUE ELSE reminder_1d_sent END,\n        reminder_4h_sent = CASE WHEN $1 = '4H' THEN TRUE ELSE reminder_4h_sent END,\n        reminder_1h_sent = CASE WHEN $1 = '1H' THEN TRUE ELSE reminder_1h_sent END,\n        updated_at = NOW()\n    WHERE appointment_id = $2\n      AND status = 'CONFIRMED'\n      AND (\n        ($1 = '3D' AND reminder_3d_sent = FALSE AND reminder_3d_claimed_at IS NOT NULL)\n        OR ($1 = '1D' AND reminder_1d_sent = FALSE AND reminder_1d_claimed_at IS NOT NULL)\n        OR ($1 = '4H' AND reminder_4h_sent = FALSE AND reminder_4h_claimed_at IS NOT NULL)\n        OR ($1 = '1H' AND reminder_1h_sent = FALSE AND reminder_1h_claimed_at IS NOT NULL)\n      );\n    ",
         "queryParameters": "={{ [$('Format_Reminder_Payload').item.json.reminder_tier, $('Format_Reminder_Payload').item.json.appointment_id] }}"
       },
       "credentials": {

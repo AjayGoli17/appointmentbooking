@@ -45,7 +45,7 @@ CREATE TABLE IF NOT EXISTS appointments (
     ) WHERE (status IN ('PENDING', 'CONFIRMED', 'RESCHEDULED', 'ARRIVED', 'COMPLETED'))
 );
 
--- Hardened idempotent exclusion-constraint migration (Bug #4)
+-- Hardened idempotent exclusion-constraint migration
 DO $$
 DECLARE
     curr_def TEXT;
@@ -104,20 +104,10 @@ CREATE INDEX IF NOT EXISTS idx_appointments_status_start ON appointments(status,
 CREATE INDEX IF NOT EXISTS idx_appointments_expires ON appointments(expires_at) WHERE status = 'PENDING';
 CREATE INDEX IF NOT EXISTS idx_doctor_unavailability_lookup ON doctor_unavailability(doctor_id, start_time, end_time);
 
--- Seed initial doctors if empty
+-- Seed initial doctors if empty (IDEMPOTENT - does not overwrite existing configuration)
 INSERT INTO doctors (doctor_id, doctor_name, specialty, calendar_id, timezone, working_days, working_hours, slot_duration_minutes, buffer_minutes, booking_cutoff_minutes, is_active)
 VALUES 
 ('dr_smith', 'Dr. John Smith', 'General Physician', 'dr_smith@clinic.com', 'Asia/Kolkata', '[1,2,3,4,5,6]'::jsonb, '{"start": "09:00", "end": "17:00"}'::jsonb, 30, 0, 60, true),
 ('dr_emily', 'Dr. Emily Davis', 'Dental Specialist', 'dr_emily@clinic.com', 'Asia/Kolkata', '[1,2,3,4,5,6]'::jsonb, '{"start": "09:00", "end": "17:00"}'::jsonb, 30, 0, 60, true),
 ('dr_robert', 'Dr. Robert Wilson', 'Cardiologist', 'dr_robert@clinic.com', 'Asia/Kolkata', '[1,2,3,4,5,6]'::jsonb, '{"start": "09:00", "end": "17:00"}'::jsonb, 30, 0, 60, true)
-ON CONFLICT (doctor_id) DO UPDATE SET
-  doctor_name = EXCLUDED.doctor_name,
-  specialty = EXCLUDED.specialty,
-  calendar_id = EXCLUDED.calendar_id,
-  timezone = EXCLUDED.timezone,
-  working_days = EXCLUDED.working_days,
-  working_hours = EXCLUDED.working_hours,
-  slot_duration_minutes = EXCLUDED.slot_duration_minutes,
-  buffer_minutes = EXCLUDED.buffer_minutes,
-  booking_cutoff_minutes = EXCLUDED.booking_cutoff_minutes,
-  is_active = EXCLUDED.is_active;
+ON CONFLICT (doctor_id) DO NOTHING;

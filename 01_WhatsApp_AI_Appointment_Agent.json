@@ -25,7 +25,7 @@
       ],
       "parameters": {
         "operation": "executeQuery",
-        "query": "-- Enable btree_gist for exclusion constraints if available\nCREATE EXTENSION IF NOT EXISTS btree_gist;\n\nCREATE TABLE IF NOT EXISTS doctors (\n    doctor_id VARCHAR(100) PRIMARY KEY,\n    doctor_name VARCHAR(255) NOT NULL,\n    specialty VARCHAR(255) NOT NULL,\n    calendar_id VARCHAR(255) NOT NULL,\n    timezone VARCHAR(100) NOT NULL DEFAULT 'Asia/Kolkata',\n    working_days JSONB NOT NULL DEFAULT '[1,2,3,4,5,6]'::jsonb, -- 1=Mon, 6=Sat\n    working_hours JSONB NOT NULL DEFAULT '{\"start\": \"09:00\", \"end\": \"17:00\"}'::jsonb,\n    slot_duration_minutes INT NOT NULL DEFAULT 30,\n    buffer_minutes INT NOT NULL DEFAULT 0,\n    booking_cutoff_minutes INT NOT NULL DEFAULT 60,\n    is_active BOOLEAN NOT NULL DEFAULT TRUE,\n    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),\n    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()\n);\n\nCREATE TABLE IF NOT EXISTS appointments (\n    appointment_id SERIAL PRIMARY KEY,\n    customer_name VARCHAR(255) NOT NULL,\n    phone VARCHAR(50) NOT NULL,\n    doctor_id VARCHAR(100) NOT NULL REFERENCES doctors(doctor_id) ON UPDATE CASCADE,\n    service VARCHAR(255) NOT NULL,\n    start_time TIMESTAMP WITH TIME ZONE NOT NULL,\n    end_time TIMESTAMP WITH TIME ZONE NOT NULL,\n    status VARCHAR(50) NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'CONFIRMED', 'CANCELLED', 'RESCHEDULED', 'ARRIVED', 'COMPLETED', 'NO_SHOW')),\n    calendar_event_id VARCHAR(255),\n    expires_at TIMESTAMP WITH TIME ZONE,\n    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),\n    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),\n    reminder_3d_sent BOOLEAN DEFAULT FALSE,\n    reminder_1d_sent BOOLEAN DEFAULT FALSE,\n    reminder_4h_sent BOOLEAN DEFAULT FALSE,\n    reminder_1h_sent BOOLEAN DEFAULT FALSE,\n    reminder_3d_claimed_at TIMESTAMP WITH TIME ZONE,\n    reminder_1d_claimed_at TIMESTAMP WITH TIME ZONE,\n    reminder_4h_claimed_at TIMESTAMP WITH TIME ZONE,\n    reminder_1h_claimed_at TIMESTAMP WITH TIME ZONE,\n    CONSTRAINT chk_start_end CHECK (start_time < end_time),\n    CONSTRAINT no_overlapping_appointments EXCLUDE USING gist (\n        doctor_id WITH =,\n        tstzrange(start_time, end_time) WITH &&\n    ) WHERE (status IN ('PENDING', 'CONFIRMED', 'RESCHEDULED', 'ARRIVED', 'COMPLETED'))\n);\n\n-- Hardened idempotent exclusion-constraint migration (Bug #4)\nDO $$\nDECLARE\n    curr_def TEXT;\nBEGIN\n    SELECT pg_get_constraintdef(c.oid) INTO curr_def\n    FROM pg_constraint c\n    JOIN pg_class t ON c.conrelid = t.oid\n    WHERE t.relname = 'appointments' AND c.conname = 'no_overlapping_appointments';\n\n    IF curr_def IS NOT NULL THEN\n        -- Revalidate definition contains all 5 required statuses and gist range\n        IF curr_def NOT LIKE '%PENDING%' OR curr_def NOT LIKE '%CONFIRMED%' OR curr_def NOT LIKE '%RESCHEDULED%' OR curr_def NOT LIKE '%ARRIVED%' OR curr_def NOT LIKE '%COMPLETED%' THEN\n            ALTER TABLE appointments DROP CONSTRAINT no_overlapping_appointments;\n            ALTER TABLE appointments ADD CONSTRAINT no_overlapping_appointments\n            EXCLUDE USING gist (\n                doctor_id WITH =,\n                tstzrange(start_time, end_time) WITH &&\n            ) WHERE (status IN ('PENDING', 'CONFIRMED', 'RESCHEDULED', 'ARRIVED', 'COMPLETED'));\n        END IF;\n    ELSE\n        ALTER TABLE appointments ADD CONSTRAINT no_overlapping_appointments\n        EXCLUDE USING gist (\n            doctor_id WITH =,\n            tstzrange(start_time, end_time) WITH &&\n        ) WHERE (status IN ('PENDING', 'CONFIRMED', 'RESCHEDULED', 'ARRIVED', 'COMPLETED'));\n    END IF;\nEND $$;\n\nCREATE TABLE IF NOT EXISTS doctor_unavailability (\n    id SERIAL PRIMARY KEY,\n    doctor_id VARCHAR(100) NOT NULL REFERENCES doctors(doctor_id) ON UPDATE CASCADE,\n    start_time TIMESTAMP WITH TIME ZONE NOT NULL,\n    end_time TIMESTAMP WITH TIME ZONE NOT NULL,\n    reason VARCHAR(255),\n    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),\n    CONSTRAINT chk_unavail_start_end CHECK (start_time < end_time)\n);\n\nCREATE TABLE IF NOT EXISTS audit_logs (\n    id SERIAL PRIMARY KEY,\n    correlation_id VARCHAR(100) NOT NULL,\n    operation VARCHAR(100) NOT NULL,\n    appointment_id INT,\n    doctor_id VARCHAR(100),\n    result VARCHAR(50) NOT NULL,\n    error_code VARCHAR(100),\n    details JSONB,\n    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()\n);\n\n-- Indices for high performance & concurrency lookups\nCREATE INDEX IF NOT EXISTS idx_doctors_active ON doctors(doctor_id) WHERE is_active = TRUE;\nCREATE INDEX IF NOT EXISTS idx_appointments_doc_time ON appointments(doctor_id, start_time, end_time);\nCREATE INDEX IF NOT EXISTS idx_appointments_phone_status ON appointments(phone, status);\nCREATE INDEX IF NOT EXISTS idx_appointments_status_start ON appointments(status, start_time);\nCREATE INDEX IF NOT EXISTS idx_appointments_expires ON appointments(expires_at) WHERE status = 'PENDING';\nCREATE INDEX IF NOT EXISTS idx_doctor_unavailability_lookup ON doctor_unavailability(doctor_id, start_time, end_time);\n\n-- Seed initial doctors if empty\nINSERT INTO doctors (doctor_id, doctor_name, specialty, calendar_id, timezone, working_days, working_hours, slot_duration_minutes, buffer_minutes, booking_cutoff_minutes, is_active)\nVALUES \n('dr_smith', 'Dr. John Smith', 'General Physician', 'dr_smith@clinic.com', 'Asia/Kolkata', '[1,2,3,4,5,6]'::jsonb, '{\"start\": \"09:00\", \"end\": \"17:00\"}'::jsonb, 30, 0, 60, true),\n('dr_emily', 'Dr. Emily Davis', 'Dental Specialist', 'dr_emily@clinic.com', 'Asia/Kolkata', '[1,2,3,4,5,6]'::jsonb, '{\"start\": \"09:00\", \"end\": \"17:00\"}'::jsonb, 30, 0, 60, true),\n('dr_robert', 'Dr. Robert Wilson', 'Cardiologist', 'dr_robert@clinic.com', 'Asia/Kolkata', '[1,2,3,4,5,6]'::jsonb, '{\"start\": \"09:00\", \"end\": \"17:00\"}'::jsonb, 30, 0, 60, true)\nON CONFLICT (doctor_id) DO UPDATE SET\n  doctor_name = EXCLUDED.doctor_name,\n  specialty = EXCLUDED.specialty,\n  calendar_id = EXCLUDED.calendar_id,\n  timezone = EXCLUDED.timezone,\n  working_days = EXCLUDED.working_days,\n  working_hours = EXCLUDED.working_hours,\n  slot_duration_minutes = EXCLUDED.slot_duration_minutes,\n  buffer_minutes = EXCLUDED.buffer_minutes,\n  booking_cutoff_minutes = EXCLUDED.booking_cutoff_minutes,\n  is_active = EXCLUDED.is_active;\n"
+        "query": "-- Enable btree_gist for exclusion constraints if available\nCREATE EXTENSION IF NOT EXISTS btree_gist;\n\nCREATE TABLE IF NOT EXISTS doctors (\n    doctor_id VARCHAR(100) PRIMARY KEY,\n    doctor_name VARCHAR(255) NOT NULL,\n    specialty VARCHAR(255) NOT NULL,\n    calendar_id VARCHAR(255) NOT NULL,\n    timezone VARCHAR(100) NOT NULL DEFAULT 'Asia/Kolkata',\n    working_days JSONB NOT NULL DEFAULT '[1,2,3,4,5,6]'::jsonb, -- 1=Mon, 6=Sat\n    working_hours JSONB NOT NULL DEFAULT '{\"start\": \"09:00\", \"end\": \"17:00\"}'::jsonb,\n    slot_duration_minutes INT NOT NULL DEFAULT 30,\n    buffer_minutes INT NOT NULL DEFAULT 0,\n    booking_cutoff_minutes INT NOT NULL DEFAULT 60,\n    is_active BOOLEAN NOT NULL DEFAULT TRUE,\n    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),\n    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()\n);\n\nCREATE TABLE IF NOT EXISTS appointments (\n    appointment_id SERIAL PRIMARY KEY,\n    customer_name VARCHAR(255) NOT NULL,\n    phone VARCHAR(50) NOT NULL,\n    doctor_id VARCHAR(100) NOT NULL REFERENCES doctors(doctor_id) ON UPDATE CASCADE,\n    service VARCHAR(255) NOT NULL,\n    start_time TIMESTAMP WITH TIME ZONE NOT NULL,\n    end_time TIMESTAMP WITH TIME ZONE NOT NULL,\n    status VARCHAR(50) NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'CONFIRMED', 'CANCELLED', 'RESCHEDULED', 'ARRIVED', 'COMPLETED', 'NO_SHOW')),\n    calendar_event_id VARCHAR(255),\n    expires_at TIMESTAMP WITH TIME ZONE,\n    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),\n    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),\n    reminder_3d_sent BOOLEAN DEFAULT FALSE,\n    reminder_1d_sent BOOLEAN DEFAULT FALSE,\n    reminder_4h_sent BOOLEAN DEFAULT FALSE,\n    reminder_1h_sent BOOLEAN DEFAULT FALSE,\n    reminder_3d_claimed_at TIMESTAMP WITH TIME ZONE,\n    reminder_1d_claimed_at TIMESTAMP WITH TIME ZONE,\n    reminder_4h_claimed_at TIMESTAMP WITH TIME ZONE,\n    reminder_1h_claimed_at TIMESTAMP WITH TIME ZONE,\n    CONSTRAINT chk_start_end CHECK (start_time < end_time),\n    CONSTRAINT no_overlapping_appointments EXCLUDE USING gist (\n        doctor_id WITH =,\n        tstzrange(start_time, end_time) WITH &&\n    ) WHERE (status IN ('PENDING', 'CONFIRMED', 'RESCHEDULED', 'ARRIVED', 'COMPLETED'))\n);\n\n-- Hardened idempotent exclusion-constraint migration\nDO $$\nDECLARE\n    curr_def TEXT;\nBEGIN\n    SELECT pg_get_constraintdef(c.oid) INTO curr_def\n    FROM pg_constraint c\n    JOIN pg_class t ON c.conrelid = t.oid\n    WHERE t.relname = 'appointments' AND c.conname = 'no_overlapping_appointments';\n\n    IF curr_def IS NOT NULL THEN\n        -- Revalidate definition contains all 5 required statuses and gist range\n        IF curr_def NOT LIKE '%PENDING%' OR curr_def NOT LIKE '%CONFIRMED%' OR curr_def NOT LIKE '%RESCHEDULED%' OR curr_def NOT LIKE '%ARRIVED%' OR curr_def NOT LIKE '%COMPLETED%' THEN\n            ALTER TABLE appointments DROP CONSTRAINT no_overlapping_appointments;\n            ALTER TABLE appointments ADD CONSTRAINT no_overlapping_appointments\n            EXCLUDE USING gist (\n                doctor_id WITH =,\n                tstzrange(start_time, end_time) WITH &&\n            ) WHERE (status IN ('PENDING', 'CONFIRMED', 'RESCHEDULED', 'ARRIVED', 'COMPLETED'));\n        END IF;\n    ELSE\n        ALTER TABLE appointments ADD CONSTRAINT no_overlapping_appointments\n        EXCLUDE USING gist (\n            doctor_id WITH =,\n            tstzrange(start_time, end_time) WITH &&\n        ) WHERE (status IN ('PENDING', 'CONFIRMED', 'RESCHEDULED', 'ARRIVED', 'COMPLETED'));\n    END IF;\nEND $$;\n\nCREATE TABLE IF NOT EXISTS doctor_unavailability (\n    id SERIAL PRIMARY KEY,\n    doctor_id VARCHAR(100) NOT NULL REFERENCES doctors(doctor_id) ON UPDATE CASCADE,\n    start_time TIMESTAMP WITH TIME ZONE NOT NULL,\n    end_time TIMESTAMP WITH TIME ZONE NOT NULL,\n    reason VARCHAR(255),\n    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),\n    CONSTRAINT chk_unavail_start_end CHECK (start_time < end_time)\n);\n\nCREATE TABLE IF NOT EXISTS audit_logs (\n    id SERIAL PRIMARY KEY,\n    correlation_id VARCHAR(100) NOT NULL,\n    operation VARCHAR(100) NOT NULL,\n    appointment_id INT,\n    doctor_id VARCHAR(100),\n    result VARCHAR(50) NOT NULL,\n    error_code VARCHAR(100),\n    details JSONB,\n    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()\n);\n\n-- Indices for high performance & concurrency lookups\nCREATE INDEX IF NOT EXISTS idx_doctors_active ON doctors(doctor_id) WHERE is_active = TRUE;\nCREATE INDEX IF NOT EXISTS idx_appointments_doc_time ON appointments(doctor_id, start_time, end_time);\nCREATE INDEX IF NOT EXISTS idx_appointments_phone_status ON appointments(phone, status);\nCREATE INDEX IF NOT EXISTS idx_appointments_status_start ON appointments(status, start_time);\nCREATE INDEX IF NOT EXISTS idx_appointments_expires ON appointments(expires_at) WHERE status = 'PENDING';\nCREATE INDEX IF NOT EXISTS idx_doctor_unavailability_lookup ON doctor_unavailability(doctor_id, start_time, end_time);\n\n-- Seed initial doctors if empty (IDEMPOTENT - does not overwrite existing configuration)\nINSERT INTO doctors (doctor_id, doctor_name, specialty, calendar_id, timezone, working_days, working_hours, slot_duration_minutes, buffer_minutes, booking_cutoff_minutes, is_active)\nVALUES \n('dr_smith', 'Dr. John Smith', 'General Physician', 'dr_smith@clinic.com', 'Asia/Kolkata', '[1,2,3,4,5,6]'::jsonb, '{\"start\": \"09:00\", \"end\": \"17:00\"}'::jsonb, 30, 0, 60, true),\n('dr_emily', 'Dr. Emily Davis', 'Dental Specialist', 'dr_emily@clinic.com', 'Asia/Kolkata', '[1,2,3,4,5,6]'::jsonb, '{\"start\": \"09:00\", \"end\": \"17:00\"}'::jsonb, 30, 0, 60, true),\n('dr_robert', 'Dr. Robert Wilson', 'Cardiologist', 'dr_robert@clinic.com', 'Asia/Kolkata', '[1,2,3,4,5,6]'::jsonb, '{\"start\": \"09:00\", \"end\": \"17:00\"}'::jsonb, 30, 0, 60, true)\nON CONFLICT (doctor_id) DO NOTHING;\n"
       },
       "credentials": {
         "postgres": {
@@ -99,7 +99,7 @@
       ],
       "parameters": {
         "language": "javascript",
-        "jsCode": "const inbound = $('Parse_WhatsApp_Inbound').first().json;\nconst dbRes = $input.first()?.json || {};\n\n// Explicit DB failure check (Bug #2)\nconst isDbError = Boolean(dbRes.error) || !Array.isArray(dbRes.active_doctors);\nif (isDbError) {\n  return [{\n    json: {\n      correlation_id: inbound.correlation_id,\n      phone: inbound.phone,\n      customer_name: inbound.customer_name,\n      message: inbound.message,\n      channel: inbound.channel,\n      db_error: true,\n      error_msg: \"Database service is temporarily unavailable.\"\n    }\n  }];\n}\n\nconst doctors = dbRes.active_doctors; // Can be [] if clinic has no active doctors (valid state)\nconst appts = Array.isArray(dbRes.recent_appointments) ? dbRes.recent_appointments : [];\nconst unavailability = Array.isArray(dbRes.active_unavailability) ? dbRes.active_unavailability : [];\n\n// Check for active PENDING (that is NOT expired)\nconst now = new Date();\nconst activePending = appts.find(a => a.status === 'PENDING' && (!a.expires_at || new Date(a.expires_at) > now));\nconst activeConfirmed = appts.find(a => (a.status === 'CONFIRMED' || a.status === 'RESCHEDULED') && new Date(a.end_time) > now);\n\nconst clinicTimezone = doctors[0]?.timezone || 'Asia/Kolkata';\nconst todayLocalStr = new Intl.DateTimeFormat('en-CA', { timeZone: clinicTimezone }).format(now);\nconst todayWeekday = new Intl.DateTimeFormat('en-US', { timeZone: clinicTimezone, weekday: 'long' }).format(now);\n\nconst docListDesc = doctors.length > 0\n  ? doctors.map(d => `- ID: \"${d.doctor_id}\", Name: \"${d.doctor_name}\", Specialty: \"${d.specialty}\", Working Hours: ${d.working_hours.start}-${d.working_hours.end}`).join('\\n')\n  : 'No doctors are currently available at the clinic.';\n\nconst prompt = `You are an intelligent clinic receptionist AI.\nToday's local date is ${todayLocalStr} (${todayWeekday}) in ${clinicTimezone} timezone.\n\nDoctors available at clinic:\n${docListDesc}\n\nCustomer Info:\n- Name: \"${inbound.customer_name || 'Customer'}\"\n- Phone: \"${inbound.phone}\"\n- Latest Message: \"${inbound.message}\"\n\nActive Holds/Bookings:\n- Pending Hold: ${activePending ? JSON.stringify(activePending) : 'None'}\n- Confirmed Booking: ${activeConfirmed ? JSON.stringify(activeConfirmed) : 'None'}\n\nTasks:\nAnalyze the message and extract Intent and Entities.\nIntents: \"BOOK\", \"CHECK_AVAILABILITY\", \"CONFIRM\", \"RESCHEDULE\", \"CANCEL\", \"GENERAL_QUESTIONS\", \"UNKNOWN\"\nRules:\n- If customer says \"YES\", \"CONFIRM\", \"OK\", \"Sure\", \"book it\" and there is a Pending Hold -> Intent MUST be \"CONFIRM\".\n- DO NOT invent calendar availability.\n- If no doctors are available, inform the patient politely.\n- Extract requested_date (YYYY-MM-DD), requested_time (HH:MM in 24h), doctor_id (must match one of [${doctors.map(d => d.doctor_id).join(', ')}]), service.\n\nOutput MUST be a single raw JSON object:\n{\n  \"intent\": \"BOOK\" | \"CHECK_AVAILABILITY\" | \"CONFIRM\" | \"RESCHEDULE\" | \"CANCEL\" | \"GENERAL_QUESTIONS\" | \"UNKNOWN\",\n  \"doctor_id\": string | null,\n  \"service\": string | null,\n  \"requested_date\": \"YYYY-MM-DD\" | null,\n  \"requested_time\": \"HH:MM\" | null,\n  \"general_answer\": string | null\n}`;\n\nreturn [{\n  json: {\n    correlation_id: inbound.correlation_id,\n    phone: inbound.phone,\n    customer_name: inbound.customer_name,\n    message: inbound.message,\n    channel: inbound.channel,\n    db_error: false,\n    active_doctors: doctors,\n    active_pending: activePending || null,\n    active_confirmed: activeConfirmed || null,\n    active_unavailability: unavailability,\n    today_local: todayLocalStr,\n    clinic_timezone: clinicTimezone,\n    gemini_model: \"gemini-1.5-flash\",\n    gemini_prompt: prompt\n  }\n}];\n"
+        "jsCode": "const inbound = $('Parse_WhatsApp_Inbound').first().json;\nconst dbRes = $input.first()?.json || {};\n\n// Explicit DB failure check\nconst isDbError = Boolean(dbRes.error) || !Array.isArray(dbRes.active_doctors);\nif (isDbError) {\n  return [{\n    json: {\n      correlation_id: inbound.correlation_id,\n      phone: inbound.phone,\n      customer_name: inbound.customer_name,\n      message: inbound.message,\n      channel: inbound.channel,\n      db_error: true,\n      error_msg: \"Database service is temporarily unavailable.\"\n    }\n  }];\n}\n\nconst doctors = dbRes.active_doctors; // Can be [] if clinic has no active doctors (valid state)\nconst appts = Array.isArray(dbRes.recent_appointments) ? dbRes.recent_appointments : [];\nconst unavailability = Array.isArray(dbRes.active_unavailability) ? dbRes.active_unavailability : [];\n\n// Check for active PENDING (that is NOT expired)\nconst now = new Date();\nconst activePending = appts.find(a => a.status === 'PENDING' && (!a.expires_at || new Date(a.expires_at) > now));\nconst activeConfirmed = appts.find(a => (a.status === 'CONFIRMED' || a.status === 'RESCHEDULED') && new Date(a.end_time) > now);\n\nconst clinicTimezone = doctors[0]?.timezone || 'Asia/Kolkata';\nconst todayLocalStr = new Intl.DateTimeFormat('en-CA', { timeZone: clinicTimezone }).format(now);\nconst todayWeekday = new Intl.DateTimeFormat('en-US', { timeZone: clinicTimezone, weekday: 'long' }).format(now);\n\nconst docListDesc = doctors.length > 0\n  ? doctors.map(d => `- ID: \"${d.doctor_id}\", Name: \"${d.doctor_name}\", Specialty: \"${d.specialty}\", Working Hours: ${d.working_hours.start}-${d.working_hours.end}`).join('\\n')\n  : 'No doctors are currently available at the clinic.';\n\nconst prompt = `You are an intelligent clinic receptionist AI.\nToday's local date is ${todayLocalStr} (${todayWeekday}) in ${clinicTimezone} timezone.\n\nDoctors available at clinic:\n${docListDesc}\n\nCustomer Info:\n- Name: \"${inbound.customer_name || 'Customer'}\"\n- Phone: \"${inbound.phone}\"\n- Latest Message: \"${inbound.message}\"\n\nActive Holds/Bookings:\n- Pending Hold: ${activePending ? JSON.stringify(activePending) : 'None'}\n- Confirmed Booking: ${activeConfirmed ? JSON.stringify(activeConfirmed) : 'None'}\n\nTasks:\nAnalyze the message and extract Intent and Entities.\nIntents: \"BOOK\", \"CHECK_AVAILABILITY\", \"CONFIRM\", \"RESCHEDULE\", \"CANCEL\", \"GENERAL_QUESTIONS\", \"UNKNOWN\"\nRules:\n- If customer says \"YES\", \"CONFIRM\", \"OK\", \"Sure\", \"book it\" and there is a Pending Hold -> Intent MUST be \"CONFIRM\".\n- DO NOT invent calendar availability.\n- If no doctors are available, inform the patient politely.\n- Extract requested_date (YYYY-MM-DD), requested_time (HH:MM in 24h), doctor_id (must match one of [${doctors.map(d => d.doctor_id).join(', ')}]), service.\n\nOutput MUST be a single raw JSON object:\n{\n  \"intent\": \"BOOK\" | \"CHECK_AVAILABILITY\" | \"CONFIRM\" | \"RESCHEDULE\" | \"CANCEL\" | \"GENERAL_QUESTIONS\" | \"UNKNOWN\",\n  \"doctor_id\": string | null,\n  \"service\": string | null,\n  \"requested_date\": \"YYYY-MM-DD\" | null,\n  \"requested_time\": \"HH:MM\" | null,\n  \"general_answer\": string | null\n}`;\n\nreturn [{\n  json: {\n    correlation_id: inbound.correlation_id,\n    phone: inbound.phone,\n    customer_name: inbound.customer_name,\n    message: inbound.message,\n    channel: inbound.channel,\n    db_error: false,\n    active_doctors: doctors,\n    active_pending: activePending || null,\n    active_confirmed: activeConfirmed || null,\n    active_unavailability: unavailability,\n    today_local: todayLocalStr,\n    clinic_timezone: clinicTimezone,\n    gemini_model: \"gemini-1.5-flash\",\n    gemini_prompt: prompt\n  }\n}];\n"
       }
     },
     {
@@ -151,7 +151,7 @@
       ],
       "parameters": {
         "language": "javascript",
-        "jsCode": "const prev = $('Merge_Context_For_AI').first().json;\nconst response = $input.item.json;\nconst doctors = prev.active_doctors || [];\n\nlet isError = false;\nlet errorMessage = '';\n\nlet aiResult = {\n  intent: 'GENERAL_QUESTIONS',\n  doctor_id: doctors[0]?.doctor_id || 'dr_smith',\n  service: 'General Consultation',\n  requested_date: null,\n  requested_time: null,\n  general_answer: null\n};\n\nconst cleanMsg = (prev.message || '').trim().toLowerCase();\nconst isDirectConfirm = ['yes', 'confirm', 'y', 'sure', 'ok', 'okay', 'proceed', 'book it', 'yes please', 'confirm please'].includes(cleanMsg);\n\nif (prev.active_pending && isDirectConfirm) {\n  aiResult.intent = 'CONFIRM';\n  aiResult.doctor_id = prev.active_pending.doctor_id;\n  aiResult.service = prev.active_pending.service;\n} else if (response && response.candidates && response.candidates[0]?.content?.parts?.[0]?.text) {\n  try {\n    let rawText = response.candidates[0].content.parts[0].text.trim();\n    if (rawText.startsWith('```json')) {\n      rawText = rawText.replace(/^```json\\n?/, '').replace(/\\n?```$/, '');\n    } else if (rawText.startsWith('```')) {\n      rawText = rawText.replace(/^```\\n?/, '').replace(/\\n?```$/, '');\n    }\n    const parsed = JSON.parse(rawText);\n    aiResult = { ...aiResult, ...parsed };\n  } catch (e) {\n    isError = true;\n    errorMessage = 'Failed to parse AI intent response.';\n  }\n} else {\n  // Gemini failed (HTTP status != 200 or no text) (Bug #13)\n  // Fail safely: DO NOT treat as UNKNOWN or book/cancel\n  isError = true;\n  errorMessage = 'AI service temporarily unavailable.';\n}\n\n// Validate doctor_id against DB active doctors list (Bug #13)\nlet matchedDoctor = doctors.find(d => d.doctor_id === aiResult.doctor_id);\nif (!matchedDoctor) {\n  matchedDoctor = doctors.find(d => d.doctor_id === prev.active_pending?.doctor_id) ||\n                  doctors.find(d => d.doctor_id === prev.active_confirmed?.doctor_id) ||\n                  doctors[0];\n}\n\n// Validate requested_date format YYYY-MM-DD\nif (aiResult.requested_date && !/^\\d{4}-\\d{2}-\\d{2}$/.test(aiResult.requested_date)) {\n  aiResult.requested_date = null;\n}\n// Validate requested_time format HH:MM\nif (aiResult.requested_time && !/^\\d{2}:\\d{2}$/.test(aiResult.requested_time)) {\n  aiResult.requested_time = null;\n}\n\nreturn [{\n  json: {\n    correlation_id: prev.correlation_id,\n    phone: prev.phone,\n    customer_name: prev.customer_name,\n    message: prev.message,\n    channel: prev.channel,\n    is_ai_error: isError,\n    ai_error_message: errorMessage,\n    intent: isError ? 'AI_ERROR' : (aiResult.intent || 'GENERAL_QUESTIONS').toUpperCase(),\n    doctor: matchedDoctor,\n    service: aiResult.service || 'General Consultation',\n    requested_date: aiResult.requested_date,\n    requested_time: aiResult.requested_time,\n    general_answer: aiResult.general_answer,\n    active_pending: prev.active_pending,\n    active_confirmed: prev.active_confirmed,\n    active_unavailability: prev.active_unavailability,\n    active_doctors: prev.active_doctors\n  }\n}];\n"
+        "jsCode": "const prev = $('Merge_Context_For_AI').first().json;\nconst response = $input.item.json;\nconst doctors = prev.active_doctors || [];\n\nlet isError = false;\nlet errorMessage = '';\n\nlet aiResult = {\n  intent: 'GENERAL_QUESTIONS',\n  doctor_id: doctors[0]?.doctor_id || 'dr_smith',\n  service: 'General Consultation',\n  requested_date: null,\n  requested_time: null,\n  general_answer: null\n};\n\nconst cleanMsg = (prev.message || '').trim().toLowerCase();\nconst isDirectConfirm = ['yes', 'confirm', 'y', 'sure', 'ok', 'okay', 'proceed', 'book it', 'yes please', 'confirm please'].includes(cleanMsg);\n\nif (prev.active_pending && isDirectConfirm) {\n  aiResult.intent = 'CONFIRM';\n  aiResult.doctor_id = prev.active_pending.doctor_id;\n  aiResult.service = prev.active_pending.service;\n} else if (response && response.candidates && response.candidates[0]?.content?.parts?.[0]?.text) {\n  try {\n    let rawText = response.candidates[0].content.parts[0].text.trim();\n    if (rawText.startsWith('```json')) {\n      rawText = rawText.replace(/^```json\\n?/, '').replace(/\\n?```$/, '');\n    } else if (rawText.startsWith('```')) {\n      rawText = rawText.replace(/^```\\n?/, '').replace(/\\n?```$/, '');\n    }\n    const parsed = JSON.parse(rawText);\n    aiResult = { ...aiResult, ...parsed };\n  } catch (e) {\n    isError = true;\n    errorMessage = 'Failed to parse AI intent response.';\n  }\n} else {\n  isError = true;\n  errorMessage = 'AI service temporarily unavailable.';\n}\n\n// Validate doctor_id against DB active doctors list\nlet matchedDoctor = doctors.find(d => d.doctor_id === aiResult.doctor_id);\nif (!matchedDoctor) {\n  matchedDoctor = doctors.find(d => d.doctor_id === prev.active_pending?.doctor_id) ||\n                  doctors.find(d => d.doctor_id === prev.active_confirmed?.doctor_id) ||\n                  doctors[0];\n}\n\n// Strict Date validation (YYYY-MM-DD)\nfunction isValidDate(dateStr) {\n  if (!dateStr || typeof dateStr !== 'string') return false;\n  const match = dateStr.match(/^(\\d{4})-(\\d{2})-(\\d{2})$/);\n  if (!match) return false;\n  const [_, yStr, mStr, dStr] = match;\n  const y = Number(yStr), m = Number(mStr), d = Number(dStr);\n  if (m < 1 || m > 12 || d < 1 || d > 31) return false;\n  const testDate = new Date(Date.UTC(y, m - 1, d));\n  return testDate.getUTCFullYear() === y && testDate.getUTCMonth() === (m - 1) && testDate.getUTCDate() === d;\n}\n\n// Strict Time validation (HH:MM 00:00 - 23:59)\nfunction isValidTime(timeStr) {\n  if (!timeStr || typeof timeStr !== 'string') return false;\n  return /^([01]\\d|2[0-3]):([0-5]\\d)$/.test(timeStr);\n}\n\nif (!isValidDate(aiResult.requested_date)) {\n  aiResult.requested_date = null;\n}\nif (!isValidTime(aiResult.requested_time)) {\n  aiResult.requested_time = null;\n}\n\nreturn [{\n  json: {\n    correlation_id: prev.correlation_id,\n    phone: prev.phone,\n    customer_name: prev.customer_name,\n    message: prev.message,\n    channel: prev.channel,\n    is_ai_error: isError,\n    ai_error_message: errorMessage,\n    intent: isError ? 'AI_ERROR' : (aiResult.intent || 'GENERAL_QUESTIONS').toUpperCase(),\n    doctor: matchedDoctor,\n    service: aiResult.service || 'General Consultation',\n    requested_date: aiResult.requested_date,\n    requested_time: aiResult.requested_time,\n    general_answer: aiResult.general_answer,\n    active_pending: prev.active_pending,\n    active_confirmed: prev.active_confirmed,\n    active_unavailability: prev.active_unavailability,\n    active_doctors: prev.active_doctors\n  }\n}];\n"
       }
     },
     {
@@ -280,10 +280,29 @@
                   }
                 ]
               }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": false,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.intent }}",
+                    "rightValue": "AI_ERROR",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              }
             }
           ]
         },
-        "fallbackOutput": 6
+        "fallbackOutput": 5
       }
     },
     {
@@ -297,7 +316,7 @@
       ],
       "parameters": {
         "language": "javascript",
-        "jsCode": "\nfunction getUtcFromLocal(dateStr, timeStr, timeZone) {\n  const [yyyy, mm, dd] = dateStr.split('-').map(Number);\n  const [hh, min] = timeStr.split(':').map(Number);\n  const utcDate = new Date(Date.UTC(yyyy, mm - 1, dd, hh, min, 0));\n  const invDate = new Date(utcDate.toLocaleString('en-US', { timeZone: 'UTC' }));\n  const targetDate = new Date(utcDate.toLocaleString('en-US', { timeZone: timeZone }));\n  const diff = targetDate.getTime() - invDate.getTime();\n  return new Date(utcDate.getTime() - diff);\n}\n\nfunction formatInTimezone(dateObj, timeZone, options) {\n  return new Intl.DateTimeFormat('en-US', { timeZone, ...options }).format(dateObj);\n}\n\nfunction getLocalWeekday(dateStr, timeStr, timeZone) {\n  const d = getUtcFromLocal(dateStr, timeStr || '12:00', timeZone);\n  const dayStr = new Intl.DateTimeFormat('en-US', { timeZone, weekday: 'short' }).format(d);\n  const map = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };\n  return map[dayStr];\n}\n\nconst item = $input.item.json;\nconst doc = item.doctor || {};\nconst tz = doc.timezone || 'Asia/Kolkata';\nconst wh = doc.working_hours || { start: \"09:00\", end: \"17:00\" };\nconst workingDays = doc.working_days || [1, 2, 3, 4, 5, 6];\nconst slotDuration = doc.slot_duration_minutes || 30;\nconst bufferMin = doc.buffer_minutes || 0;\nconst cutoffMin = doc.booking_cutoff_minutes || 60;\nconst unavailList = item.active_unavailability || [];\n\nlet needsInfo = false;\nlet missingFields = [];\nlet replyMsg = '';\n\nif (!item.requested_date) {\n  needsInfo = true;\n  missingFields.push('preferred date (YYYY-MM-DD or tomorrow)');\n}\nif (!item.requested_time) {\n  needsInfo = true;\n  missingFields.push('preferred time (e.g. 10:00 AM)');\n}\n\nlet startUtc = null;\nlet endUtc = null;\n\nif (needsInfo) {\n  replyMsg = `Hello ${item.customer_name || 'there'}! To check availability with ${doc.doctor_name}, please provide your ${missingFields.join(' and ')}.`;\n} else {\n  // 1. Timezone-aware date construction (Bug #5)\n  startUtc = getUtcFromLocal(item.requested_date, item.requested_time, tz);\n  endUtc = new Date(startUtc.getTime() + slotDuration * 60000);\n\n  // 2. Working day check (Bug #6)\n  const localDayOfWeek = getLocalWeekday(item.requested_date, item.requested_time, tz);\n  if (!workingDays.includes(localDayOfWeek)) {\n    needsInfo = true;\n    replyMsg = `Sorry, ${doc.doctor_name} does not take appointments on that day. Available days: Monday-Saturday.`;\n  } else {\n    // 3. Working hours check (Bug #7)\n    const [startH, startM] = wh.start.split(':').map(Number);\n    const [endH, endM] = wh.end.split(':').map(Number);\n    const [reqH, reqM] = item.requested_time.split(':').map(Number);\n    const reqMin = reqH * 60 + reqM;\n    const openMin = startH * 60 + startM;\n    const closeMin = endH * 60 + endM;\n\n    if (reqMin < openMin || reqMin + slotDuration > closeMin) {\n      needsInfo = true;\n      replyMsg = `Operating hours for ${doc.doctor_name} are ${wh.start} to ${wh.end}. The requested time (${item.requested_time}) is outside working hours.`;\n    }\n  }\n\n  // 4. Booking cutoff check (Bug #9)\n  const now = new Date();\n  if (startUtc.getTime() < now.getTime() + cutoffMin * 60000) {\n    needsInfo = true;\n    replyMsg = `Appointments must be scheduled at least ${cutoffMin} minutes in advance. Please choose a later slot.`;\n  }\n\n  // 5. Doctor Leave / Unavailability check (Bug #3)\n  for (const u of unavailList) {\n    if (u.doctor_id === doc.doctor_id) {\n      const uStart = new Date(u.start_time);\n      const uEnd = new Date(u.end_time);\n      if (startUtc < uEnd && endUtc > uStart) {\n        needsInfo = true;\n        replyMsg = `Sorry, ${doc.doctor_name} is unavailable on ${item.requested_date} (${u.reason || 'Leave'}). Please pick another date.`;\n        break;\n      }\n    }\n  }\n}\n\n// Calculate search window for GCal: doctor local midnight to next local midnight (Bug #5)\nlet gcalMin = new Date().toISOString();\nlet gcalMax = new Date(Date.now() + 86400000).toISOString();\nif (item.requested_date) {\n  gcalMin = getUtcFromLocal(item.requested_date, '00:00', tz).toISOString();\n  gcalMax = getUtcFromLocal(item.requested_date, '23:59', tz).toISOString();\n}\n\nreturn [{\n  json: {\n    ...item,\n    needs_info: needsInfo,\n    missing_fields: missingFields,\n    missing_info_message: replyMsg,\n    start_time_iso: startUtc ? startUtc.toISOString() : null,\n    end_time_iso: endUtc ? endUtc.toISOString() : null,\n    gcal_time_min: gcalMin,\n    gcal_time_max: gcalMax\n  }\n}];\n"
+        "jsCode": "\nfunction getUtcFromLocal(dateStr, timeStr, timeZone) {\n  const [yyyy, mm, dd] = dateStr.split('-').map(Number);\n  const [hh, min] = timeStr.split(':').map(Number);\n  const utcDate = new Date(Date.UTC(yyyy, mm - 1, dd, hh, min, 0));\n  const invDate = new Date(utcDate.toLocaleString('en-US', { timeZone: 'UTC' }));\n  const targetDate = new Date(utcDate.toLocaleString('en-US', { timeZone: timeZone }));\n  const diff = targetDate.getTime() - invDate.getTime();\n  return new Date(utcDate.getTime() - diff);\n}\n\nfunction getWeekdayFromDate(dateObj, timeZone) {\n  const dayStr = new Intl.DateTimeFormat('en-US', { timeZone, weekday: 'short' }).format(dateObj);\n  const map = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };\n  return map[dayStr];\n}\n\nfunction isValidDate(dateStr) {\n  if (!dateStr || typeof dateStr !== 'string') return false;\n  const match = dateStr.match(/^(\\d{4})-(\\d{2})-(\\d{2})$/);\n  if (!match) return false;\n  const [_, yStr, mStr, dStr] = match;\n  const y = Number(yStr), m = Number(mStr), d = Number(dStr);\n  if (m < 1 || m > 12 || d < 1 || d > 31) return false;\n  const testDate = new Date(Date.UTC(y, m - 1, d));\n  return testDate.getUTCFullYear() === y && testDate.getUTCMonth() === (m - 1) && testDate.getUTCDate() === d;\n}\n\nfunction isValidTime(timeStr) {\n  if (!timeStr || typeof timeStr !== 'string') return false;\n  return /^([01]\\d|2[0-3]):([0-5]\\d)$/.test(timeStr);\n}\n\nconst item = $input.item.json;\nconst doc = item.doctor || {};\nconst tz = doc.timezone || 'Asia/Kolkata';\nconst wh = doc.working_hours || { start: \"09:00\", end: \"17:00\" };\nconst workingDays = doc.working_days || [1, 2, 3, 4, 5, 6];\nconst slotDuration = doc.slot_duration_minutes || 30;\nconst bufferMin = doc.buffer_minutes || 0;\nconst cutoffMin = doc.booking_cutoff_minutes || 60;\nconst unavailList = item.active_unavailability || [];\n\nlet needsInfo = false;\nlet missingFields = [];\nlet replyMsg = '';\n\nif (!isValidDate(item.requested_date)) {\n  needsInfo = true;\n  missingFields.push('preferred date (YYYY-MM-DD)');\n}\nif (!isValidTime(item.requested_time)) {\n  needsInfo = true;\n  missingFields.push('preferred time in 24h format (e.g. 10:00 or 14:30)');\n}\n\nlet startUtc = null;\nlet endUtc = null;\n\nif (needsInfo) {\n  replyMsg = `Hello ${item.customer_name || 'there'}! To check availability with ${doc.doctor_name || 'the doctor'}, please provide a valid ${missingFields.join(' and ')}.`;\n} else {\n  startUtc = getUtcFromLocal(item.requested_date, item.requested_time, tz);\n  endUtc = new Date(startUtc.getTime() + slotDuration * 60000);\n\n  // 1. Working day check\n  const localDayOfWeek = getWeekdayFromDate(startUtc, tz);\n  if (!workingDays.includes(localDayOfWeek)) {\n    needsInfo = true;\n    replyMsg = `Sorry, ${doc.doctor_name} does not take appointments on that day of the week.`;\n  } else {\n    // 2. Working hours check\n    const [startH, startM] = wh.start.split(':').map(Number);\n    const [endH, endM] = wh.end.split(':').map(Number);\n    const [reqH, reqM] = item.requested_time.split(':').map(Number);\n    const reqMin = reqH * 60 + reqM;\n    const openMin = startH * 60 + startM;\n    const closeMin = endH * 60 + endM;\n\n    if (reqMin < openMin || reqMin + slotDuration > closeMin) {\n      needsInfo = true;\n      replyMsg = `Operating hours for ${doc.doctor_name} are ${wh.start} to ${wh.end}. The requested time (${item.requested_time}) is outside working hours.`;\n    }\n  }\n\n  // 3. Booking cutoff check\n  const now = new Date();\n  if (startUtc.getTime() < now.getTime() + cutoffMin * 60000) {\n    needsInfo = true;\n    replyMsg = `Appointments must be scheduled at least ${cutoffMin} minutes in advance. Please choose a later slot.`;\n  }\n\n  // 4. Doctor Leave / Unavailability check\n  for (const u of unavailList) {\n    if (u.doctor_id === doc.doctor_id) {\n      const uStart = new Date(u.start_time);\n      const uEnd = new Date(u.end_time);\n      if (startUtc < uEnd && endUtc > uStart) {\n        needsInfo = true;\n        replyMsg = `Sorry, ${doc.doctor_name} is unavailable on ${item.requested_date} (${u.reason || 'Leave'}). Please pick another date.`;\n        break;\n      }\n    }\n  }\n}\n\n// Search window for GCal: local midnight to next local midnight\nlet gcalMin = new Date().toISOString();\nlet gcalMax = new Date(Date.now() + 86400000).toISOString();\nif (item.requested_date && isValidDate(item.requested_date)) {\n  gcalMin = getUtcFromLocal(item.requested_date, '00:00', tz).toISOString();\n  gcalMax = getUtcFromLocal(item.requested_date, '23:59', tz).toISOString();\n}\n\nreturn [{\n  json: {\n    ...item,\n    needs_info: needsInfo,\n    missing_fields: missingFields,\n    missing_info_message: replyMsg,\n    start_time_iso: startUtc ? startUtc.toISOString() : null,\n    end_time_iso: endUtc ? endUtc.toISOString() : null,\n    gcal_time_min: gcalMin,\n    gcal_time_max: gcalMax\n  }\n}];\n"
       }
     },
     {
@@ -675,7 +694,7 @@
       ],
       "parameters": {
         "respondWith": "json",
-        "responseBody": "={{ JSON.stringify({ success: true, status: 'pending_hold_created', appointment_id: $('Format_Pending_WhatsApp_Msg').item.json.appointment_id }) }}"
+        "responseBody": "={{ JSON.stringify({ success: Boolean($('Format_Pending_WhatsApp_Msg').item.json.appointment_id), status: $('Format_Pending_WhatsApp_Msg').item.json.appointment_id ? 'pending_hold_created' : 'slot_conflict', appointment_id: $('Format_Pending_WhatsApp_Msg').item.json.appointment_id || null }) }}"
       }
     },
     {
@@ -811,7 +830,7 @@
       ],
       "parameters": {
         "language": "javascript",
-        "jsCode": "\nfunction getUtcFromLocal(dateStr, timeStr, timeZone) {\n  const [yyyy, mm, dd] = dateStr.split('-').map(Number);\n  const [hh, min] = timeStr.split(':').map(Number);\n  const utcDate = new Date(Date.UTC(yyyy, mm - 1, dd, hh, min, 0));\n  const invDate = new Date(utcDate.toLocaleString('en-US', { timeZone: 'UTC' }));\n  const targetDate = new Date(utcDate.toLocaleString('en-US', { timeZone: timeZone }));\n  const diff = targetDate.getTime() - invDate.getTime();\n  return new Date(utcDate.getTime() - diff);\n}\n\nfunction formatInTimezone(dateObj, timeZone, options) {\n  return new Intl.DateTimeFormat('en-US', { timeZone, ...options }).format(dateObj);\n}\n\nfunction getLocalWeekday(dateStr, timeStr, timeZone) {\n  const d = getUtcFromLocal(dateStr, timeStr || '12:00', timeZone);\n  const dayStr = new Intl.DateTimeFormat('en-US', { timeZone, weekday: 'short' }).format(d);\n  const map = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };\n  return map[dayStr];\n}\n\nconst prev = $('Validate_Pending_For_Confirm').first().json;\nconst allInputs = $input.all();\n\n// Explicit Google Calendar failure detection (Bug #3, Bug #4)\nconst gcalError = allInputs.some(i => i.json?.error || i.error);\nif (gcalError) {\n  return [{\n    json: {\n      ...prev,\n      is_final_slot_free: false,\n      calendar_check_failed: true,\n      error_msg: \"We are temporarily unable to verify calendar availability. Your booking hold is still saved. Please try confirming again in a moment by replying YES.\"\n    }\n  }];\n}\n\nconst gcalItems = allInputs.map(i => i.json).filter(j => j && (j.id || j.start));\nconst reqStart = new Date(prev.start_time_iso);\nconst reqEnd = new Date(prev.end_time_iso);\nconst now = new Date();\n\nlet isFree = true;\nlet reason = \"\";\n\n// 1. Check pending expiration and status\nif (!prev.active_pending || prev.active_pending.status !== 'PENDING') {\n  isFree = false;\n  reason = \"Appointment is no longer in PENDING state.\";\n} else if (prev.active_pending.expires_at && new Date(prev.active_pending.expires_at) <= now) {\n  isFree = false;\n  reason = \"Appointment hold has expired.\";\n}\n\n// 2. Validate Doctor exists and is active\nconst doc = (prev.active_doctors || []).find(d => d.doctor_id === prev.doctor_id) || prev.doctor;\nif (!doc) {\n  isFree = false;\n  reason = \"Doctor not found or inactive.\";\n}\n\n// 3. Validate working days and working hours\nif (isFree && doc) {\n  const tz = doc.timezone || 'Asia/Kolkata';\n  const weekdayNum = getLocalWeekday(formatInTimezone(reqStart, tz, { year: 'numeric', month: '2-digit', day: '2-digit' }).replace(/\\//g, '-'), '12:00', tz);\n  const workingDays = doc.working_days || [1,2,3,4,5,6];\n  if (!workingDays.includes(weekdayNum)) {\n    isFree = false;\n    reason = \"Requested date is not a working day for this doctor.\";\n  }\n}\n\n// 4. Validate Doctor Leave / Unavailability\nif (isFree) {\n  const unavailList = prev.active_unavailability || [];\n  for (const u of unavailList) {\n    if (u.doctor_id === prev.doctor_id) {\n      const uStart = new Date(u.start_time);\n      const uEnd = new Date(u.end_time);\n      if (reqStart < uEnd && reqEnd > uStart) {\n        isFree = false;\n        reason = `Doctor is unavailable: ${u.reason || 'On Leave'}`;\n        break;\n      }\n    }\n  }\n}\n\n// 5. Check GCal events overlap\nif (isFree) {\n  for (const ev of gcalItems) {\n    const evStartStr = ev.start?.dateTime || ev.start?.date;\n    const evEndStr = ev.end?.dateTime || ev.end?.date;\n    if (!evStartStr || !evEndStr) continue;\n    const evStart = new Date(evStartStr);\n    const evEnd = new Date(evEndStr);\n    if (reqStart < evEnd && reqEnd > evStart) {\n      isFree = false;\n      reason = \"Slot is already booked on the doctor's calendar.\";\n      break;\n    }\n  }\n}\n\nreturn [{\n  json: {\n    ...prev,\n    is_final_slot_free: isFree,\n    calendar_check_failed: false,\n    conflict_reason: reason\n  }\n}];\n"
+        "jsCode": "\nfunction getWeekdayFromDate(dateObj, timeZone) {\n  const dayStr = new Intl.DateTimeFormat('en-US', { timeZone, weekday: 'short' }).format(dateObj);\n  const map = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };\n  return map[dayStr];\n}\n\nconst prev = $('Validate_Pending_For_Confirm').first().json;\nconst allInputs = $input.all();\n\n// Explicit Google Calendar failure detection\nconst gcalError = allInputs.some(i => i.json?.error || i.error);\nif (gcalError) {\n  return [{\n    json: {\n      ...prev,\n      is_final_slot_free: false,\n      calendar_check_failed: true,\n      error_msg: \"We are temporarily unable to verify calendar availability. Your booking hold is still saved. Please try confirming again in a moment by replying YES.\"\n    }\n  }];\n}\n\nconst gcalItems = allInputs.map(i => i.json).filter(j => j && (j.id || j.start));\nconst reqStart = new Date(prev.start_time_iso);\nconst reqEnd = new Date(prev.end_time_iso);\nconst now = new Date();\n\nlet isFree = true;\nlet reason = \"\";\n\n// 1. Check pending expiration and status\nif (!prev.active_pending || prev.active_pending.status !== 'PENDING') {\n  isFree = false;\n  reason = \"Appointment is no longer in PENDING state.\";\n} else if (prev.active_pending.expires_at && new Date(prev.active_pending.expires_at) <= now) {\n  isFree = false;\n  reason = \"Appointment hold has expired.\";\n}\n\n// 2. Validate Doctor exists and is active\nconst doc = (prev.active_doctors || []).find(d => d.doctor_id === prev.doctor_id) || prev.doctor;\nif (!doc) {\n  isFree = false;\n  reason = \"Doctor not found or inactive.\";\n}\n\n// 3. Validate working days and working hours (Timezone Safe)\nif (isFree && doc) {\n  const tz = doc.timezone || 'Asia/Kolkata';\n  const weekdayNum = getWeekdayFromDate(reqStart, tz);\n  const workingDays = doc.working_days || [1, 2, 3, 4, 5, 6];\n  if (!workingDays.includes(weekdayNum)) {\n    isFree = false;\n    reason = \"Requested date is not a working day for this doctor.\";\n  }\n}\n\n// 4. Validate Doctor Leave / Unavailability\nif (isFree) {\n  const unavailList = prev.active_unavailability || [];\n  for (const u of unavailList) {\n    if (u.doctor_id === prev.doctor_id) {\n      const uStart = new Date(u.start_time);\n      const uEnd = new Date(u.end_time);\n      if (reqStart < uEnd && reqEnd > uStart) {\n        isFree = false;\n        reason = `Doctor is unavailable: ${u.reason || 'On Leave'}`;\n        break;\n      }\n    }\n  }\n}\n\n// 5. Check GCal events overlap\nif (isFree) {\n  for (const ev of gcalItems) {\n    const evStartStr = ev.start?.dateTime || ev.start?.date;\n    const evEndStr = ev.end?.dateTime || ev.end?.date;\n    if (!evStartStr || !evEndStr) continue;\n    const evStart = new Date(evStartStr);\n    const evEnd = new Date(evEndStr);\n    if (reqStart < evEnd && reqEnd > evStart) {\n      isFree = false;\n      reason = \"Slot is already booked on the doctor's calendar.\";\n      break;\n    }\n  }\n}\n\nreturn [{\n  json: {\n    ...prev,\n    is_final_slot_free: isFree,\n    calendar_check_failed: false,\n    conflict_reason: reason\n  }\n}];\n"
       }
     },
     {
@@ -890,7 +909,7 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{\n{\n  \"messaging_product\": \"whatsapp\",\n  \"recipient_type\": \"individual\",\n  \"to\": $json.phone,\n  \"type\": \"text\",\n  \"text\": {\n    \"preview_url\": false,\n    \"body\": \"\u26a0\ufe0f We are sorry! That time slot was just booked or expired. Please reply with another date or time to book.\"\n  }\n}\n}}"
+        "jsonBody": "={{\n{\n  \"messaging_product\": \"whatsapp\",\n  \"recipient_type\": \"individual\",\n  \"to\": $json.phone || $('Validate_Reschedule_Request').item.json.phone || $('Verify_Final_Availability').item.json.phone || $('Parse_WhatsApp_Inbound').item.json.phone,\n  \"type\": \"text\",\n  \"text\": {\n    \"preview_url\": false,\n    \"body\": \"\u26a0\ufe0f We are sorry! That time slot was just booked or expired. Please reply with another date or time to book.\"\n  }\n}\n}}"
       },
       "credentials": {
         "httpHeaderAuth": {
@@ -1038,7 +1057,7 @@
       ],
       "parameters": {
         "language": "javascript",
-        "jsCode": "\nfunction getUtcFromLocal(dateStr, timeStr, timeZone) {\n  const [yyyy, mm, dd] = dateStr.split('-').map(Number);\n  const [hh, min] = timeStr.split(':').map(Number);\n  const utcDate = new Date(Date.UTC(yyyy, mm - 1, dd, hh, min, 0));\n  const invDate = new Date(utcDate.toLocaleString('en-US', { timeZone: 'UTC' }));\n  const targetDate = new Date(utcDate.toLocaleString('en-US', { timeZone: timeZone }));\n  const diff = targetDate.getTime() - invDate.getTime();\n  return new Date(utcDate.getTime() - diff);\n}\n\nfunction formatInTimezone(dateObj, timeZone, options) {\n  return new Intl.DateTimeFormat('en-US', { timeZone, ...options }).format(dateObj);\n}\n\nfunction getLocalWeekday(dateStr, timeStr, timeZone) {\n  const d = getUtcFromLocal(dateStr, timeStr || '12:00', timeZone);\n  const dayStr = new Intl.DateTimeFormat('en-US', { timeZone, weekday: 'short' }).format(d);\n  const map = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };\n  return map[dayStr];\n}\n\nconst prev = $input.item.json;\nconst active = prev.active_confirmed;\nconst doc = prev.doctor || {};\nconst tz = doc.timezone || 'Asia/Kolkata';\nconst wh = doc.working_hours || { start: \"09:00\", end: \"17:00\" };\nconst workingDays = doc.working_days || [1, 2, 3, 4, 5, 6];\nconst slotDuration = doc.slot_duration_minutes || 30;\nconst cutoffMin = doc.booking_cutoff_minutes || 60;\nconst unavailList = prev.active_unavailability || [];\n\nif (!active) {\n  return [{\n    json: {\n      ...prev,\n      can_reschedule: false,\n      error_msg: \"You do not have an active confirmed appointment to reschedule. Reply with a date and time to book a new appointment.\"\n    }\n  }];\n}\n\nif (!prev.requested_date || !prev.requested_time) {\n  const currentStart = formatInTimezone(new Date(active.start_time), tz, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });\n  return [{\n    json: {\n      ...prev,\n      can_reschedule: false,\n      error_msg: `Your current appointment (#${active.appointment_id}) is scheduled for ${currentStart}.\\n\\nPlease reply with your new requested date and time (e.g. 'Reschedule to tomorrow at 3 PM').`\n    }\n  }];\n}\n\n// Full booking rules validation for Reschedule (Bug #9, #36)\nconst newStartUtc = getUtcFromLocal(prev.requested_date, prev.requested_time, tz);\nconst newEndUtc = new Date(newStartUtc.getTime() + slotDuration * 60000);\n\nlet canResched = true;\nlet errorMsg = '';\n\nconst localDayOfWeek = getLocalWeekday(prev.requested_date, prev.requested_time, tz);\nif (!workingDays.includes(localDayOfWeek)) {\n  canResched = false;\n  errorMsg = `Sorry, ${doc.doctor_name} is closed on that day.`;\n} else {\n  const [startH, startM] = wh.start.split(':').map(Number);\n  const [endH, endM] = wh.end.split(':').map(Number);\n  const [reqH, reqM] = prev.requested_time.split(':').map(Number);\n  const reqMin = reqH * 60 + reqM;\n  if (reqMin < startH * 60 + startM || reqMin + slotDuration > endH * 60 + endM) {\n    canResched = false;\n    errorMsg = `Operating hours are ${wh.start} to ${wh.end}. The requested time is outside working hours.`;\n  }\n}\n\nconst now = new Date();\nif (newStartUtc.getTime() < now.getTime() + cutoffMin * 60000) {\n  canResched = false;\n  errorMsg = `Rescheduling must be done at least ${cutoffMin} minutes in advance.`;\n}\n\n// Doctor leave check\nfor (const u of unavailList) {\n  if (u.doctor_id === doc.doctor_id) {\n    const uStart = new Date(u.start_time);\n    const uEnd = new Date(u.end_time);\n    if (newStartUtc < uEnd && newEndUtc > uStart) {\n      canResched = false;\n      errorMsg = `Doctor is unavailable on that date (${u.reason || 'Leave'}).`;\n      break;\n    }\n  }\n}\n\nreturn [{\n  json: {\n    ...prev,\n    can_reschedule: canResched,\n    error_msg: errorMsg,\n    appointment_id: active.appointment_id,\n    calendar_event_id: active.calendar_event_id,\n    calendar_id: doc.calendar_id || active.calendar_id,\n    new_start_iso: newStartUtc.toISOString(),\n    new_end_iso: newEndUtc.toISOString()\n  }\n}];\n"
+        "jsCode": "\nfunction getUtcFromLocal(dateStr, timeStr, timeZone) {\n  const [yyyy, mm, dd] = dateStr.split('-').map(Number);\n  const [hh, min] = timeStr.split(':').map(Number);\n  const utcDate = new Date(Date.UTC(yyyy, mm - 1, dd, hh, min, 0));\n  const invDate = new Date(utcDate.toLocaleString('en-US', { timeZone: 'UTC' }));\n  const targetDate = new Date(utcDate.toLocaleString('en-US', { timeZone: timeZone }));\n  const diff = targetDate.getTime() - invDate.getTime();\n  return new Date(utcDate.getTime() - diff);\n}\n\nfunction getWeekdayFromDate(dateObj, timeZone) {\n  const dayStr = new Intl.DateTimeFormat('en-US', { timeZone, weekday: 'short' }).format(dateObj);\n  const map = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };\n  return map[dayStr];\n}\n\nfunction formatInTimezone(dateObj, timeZone, options) {\n  return new Intl.DateTimeFormat('en-US', { timeZone, ...options }).format(dateObj);\n}\n\nfunction isValidDate(dateStr) {\n  if (!dateStr || typeof dateStr !== 'string') return false;\n  const match = dateStr.match(/^(\\d{4})-(\\d{2})-(\\d{2})$/);\n  if (!match) return false;\n  const [_, yStr, mStr, dStr] = match;\n  const y = Number(yStr), m = Number(mStr), d = Number(dStr);\n  if (m < 1 || m > 12 || d < 1 || d > 31) return false;\n  const testDate = new Date(Date.UTC(y, m - 1, d));\n  return testDate.getUTCFullYear() === y && testDate.getUTCMonth() === (m - 1) && testDate.getUTCDate() === d;\n}\n\nfunction isValidTime(timeStr) {\n  if (!timeStr || typeof timeStr !== 'string') return false;\n  return /^([01]\\d|2[0-3]):([0-5]\\d)$/.test(timeStr);\n}\n\nconst prev = $input.item.json;\nconst active = prev.active_confirmed;\nconst doc = prev.doctor || {};\nconst tz = doc.timezone || 'Asia/Kolkata';\nconst wh = doc.working_hours || { start: \"09:00\", end: \"17:00\" };\nconst workingDays = doc.working_days || [1, 2, 3, 4, 5, 6];\n\n// Authoritative duration preservation (Requirement #7)\nconst existingDuration = active?.slot_duration_minutes || \n  (active?.start_time && active?.end_time ? Math.round((new Date(active.end_time).getTime() - new Date(active.start_time).getTime()) / 60000) : null);\nconst slotDuration = existingDuration || doc.slot_duration_minutes || 30;\nconst cutoffMin = doc.booking_cutoff_minutes || 60;\nconst unavailList = prev.active_unavailability || [];\n\nif (!active) {\n  return [{\n    json: {\n      ...prev,\n      can_reschedule: false,\n      error_msg: \"You do not have an active confirmed appointment to reschedule. Reply with a date and time to book a new appointment.\"\n    }\n  }];\n}\n\nif (!isValidDate(prev.requested_date) || !isValidTime(prev.requested_time)) {\n  const currentStart = formatInTimezone(new Date(active.start_time), tz, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });\n  return [{\n    json: {\n      ...prev,\n      can_reschedule: false,\n      error_msg: `Your current appointment (#${active.appointment_id}) is scheduled for ${currentStart}.\\n\\nPlease reply with your new requested date (YYYY-MM-DD) and time (e.g. 'Reschedule to 2026-09-09 at 14:00').`\n    }\n  }];\n}\n\nconst newStartUtc = getUtcFromLocal(prev.requested_date, prev.requested_time, tz);\nconst newEndUtc = new Date(newStartUtc.getTime() + slotDuration * 60000);\n\nlet canResched = true;\nlet errorMsg = '';\n\nconst localDayOfWeek = getWeekdayFromDate(newStartUtc, tz);\nif (!workingDays.includes(localDayOfWeek)) {\n  canResched = false;\n  errorMsg = `Sorry, ${doc.doctor_name || 'the doctor'} is closed on that day.`;\n} else {\n  const [startH, startM] = wh.start.split(':').map(Number);\n  const [endH, endM] = wh.end.split(':').map(Number);\n  const [reqH, reqM] = prev.requested_time.split(':').map(Number);\n  const reqMin = reqH * 60 + reqM;\n  if (reqMin < startH * 60 + startM || reqMin + slotDuration > endH * 60 + endM) {\n    canResched = false;\n    errorMsg = `Operating hours are ${wh.start} to ${wh.end}. The requested time is outside working hours.`;\n  }\n}\n\nconst now = new Date();\nif (newStartUtc.getTime() < now.getTime() + cutoffMin * 60000) {\n  canResched = false;\n  errorMsg = `Rescheduling must be done at least ${cutoffMin} minutes in advance.`;\n}\n\n// Doctor leave check\nfor (const u of unavailList) {\n  if (u.doctor_id === doc.doctor_id) {\n    const uStart = new Date(u.start_time);\n    const uEnd = new Date(u.end_time);\n    if (newStartUtc < uEnd && newEndUtc > uStart) {\n      canResched = false;\n      errorMsg = `Doctor is unavailable on that date (${u.reason || 'Leave'}).`;\n      break;\n    }\n  }\n}\n\nreturn [{\n  json: {\n    ...prev,\n    can_reschedule: canResched,\n    error_msg: errorMsg,\n    appointment_id: active.appointment_id,\n    calendar_event_id: active.calendar_event_id,\n    calendar_id: doc.calendar_id || active.calendar_id,\n    slot_duration_minutes: slotDuration,\n    old_start_iso: active.start_time,\n    old_end_iso: active.end_time,\n    new_start_iso: newStartUtc.toISOString(),\n    new_end_iso: newEndUtc.toISOString()\n  }\n}];\n"
       }
     },
     {
@@ -1160,7 +1179,7 @@
       ],
       "parameters": {
         "language": "javascript",
-        "jsCode": "\nconst prev = $('Validate_Reschedule_Request').first().json;\nconst allInputs = $input.all();\n\n// Explicit Google Calendar failure detection (Bug #4)\nconst gcalError = allInputs.some(i => i.json?.error || i.error);\nif (gcalError) {\n  return [{ json: { ...prev, is_reschedule_slot_free: false, calendar_error: true } }];\n}\n\nconst gcalItems = allInputs.map(i => i.json).filter(j => j && (j.id || j.start));\nconst reqStart = new Date(prev.new_start_iso);\nconst reqEnd = new Date(prev.new_end_iso);\n\nlet isFree = true;\nfor (const ev of gcalItems) {\n  if (prev.calendar_event_id && ev.id === prev.calendar_event_id) continue;\n  const evStart = new Date(ev.start?.dateTime || ev.start?.date);\n  const evEnd = new Date(ev.end?.dateTime || ev.end?.date);\n  if (reqStart < evEnd && reqEnd > evStart) {\n    isFree = false;\n    break;\n  }\n}\n\nreturn [{ json: { ...prev, is_reschedule_slot_free: isFree, calendar_error: false } }];\n"
+        "jsCode": "\nconst prev = $('Validate_Reschedule_Request').first().json;\nconst allInputs = $input.all();\n\n// Explicit Google Calendar failure detection (Requirement #19)\nconst gcalError = allInputs.some(i => i.json?.error || i.error);\nif (gcalError) {\n  return [{ json: { ...prev, is_reschedule_slot_free: false, calendar_check_failed: true, calendar_error: true } }];\n}\n\nconst gcalItems = allInputs.map(i => i.json).filter(j => j && (j.id || j.start));\nconst reqStart = new Date(prev.new_start_iso);\nconst reqEnd = new Date(prev.new_end_iso);\n\nlet isFree = true;\nfor (const ev of gcalItems) {\n  if (prev.calendar_event_id && ev.id === prev.calendar_event_id) continue;\n  const evStart = new Date(ev.start?.dateTime || ev.start?.date);\n  const evEnd = new Date(ev.end?.dateTime || ev.end?.date);\n  if (reqStart < evEnd && reqEnd > evStart) {\n    isFree = false;\n    break;\n  }\n}\n\nreturn [{ json: { ...prev, is_reschedule_slot_free: isFree, calendar_check_failed: false, calendar_error: false } }];\n"
       }
     },
     {
@@ -1284,14 +1303,15 @@
       "parameters": {
         "operation": "executeQuery",
         "query": "\n    UPDATE appointments\n    SET start_time = $1,\n        end_time = $2,\n        status = 'CONFIRMED',\n        updated_at = NOW(),\n        reminder_3d_sent = FALSE,\n        reminder_1d_sent = FALSE,\n        reminder_4h_sent = FALSE,\n        reminder_1h_sent = FALSE,\n        reminder_3d_claimed_at = NULL,\n        reminder_1d_claimed_at = NULL,\n        reminder_4h_claimed_at = NULL,\n        reminder_1h_claimed_at = NULL\n    WHERE appointment_id = $3\n    RETURNING *;\n    ",
-        "queryParameters": "={{ [$json.new_start_iso, $json.new_end_iso, $json.appointment_id] }}"
+        "queryParameters": "={{ [$('Validate_Reschedule_Request').item.json.new_start_iso, $('Validate_Reschedule_Request').item.json.new_end_iso, $('Validate_Reschedule_Request').item.json.appointment_id] }}"
       },
       "credentials": {
         "postgres": {
           "id": "postgres_credentials_id",
           "name": "PostgreSQL Account"
         }
-      }
+      },
+      "continueOnFail": true
     },
     {
       "id": "0685b1f0-15d2-43fe-822b-e8b56210c9a8",
@@ -1854,6 +1874,145 @@
           "name": "WhatsApp Cloud API"
         }
       }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://graph.facebook.com/v20.0/FROM_PHONE_NUMBER_ID/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n{\n  \"messaging_product\": \"whatsapp\",\n  \"recipient_type\": \"individual\",\n  \"to\": $json.phone,\n  \"type\": \"text\",\n  \"text\": {\n    \"preview_url\": false,\n    \"body\": \"\u26a0\ufe0f Sorry, I had trouble understanding that message. You can reply with a date and time to book an appointment (e.g. 'Book tomorrow at 10 AM'), or say CONFIRM, RESCHEDULE, or CANCEL.\"\n  }\n}\n}"
+      },
+      "id": "w1-send-ai-error",
+      "name": "Send_WhatsApp_AI_Error",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1800,
+        950
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "whatsapp_cloud_api_credentials",
+          "name": "WhatsApp Cloud API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'ai_error_handled' }) }}"
+      },
+      "id": "w1-respond-ai-error",
+      "name": "Respond_AI_Error",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        2000,
+        950
+      ]
+    },
+    {
+      "id": "w1-if-resched-gcal-failed",
+      "name": "If_Reschedule_GCal_Failed",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        2840,
+        1380
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.calendar_check_failed }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "w1-if-resched-db-success",
+      "name": "If_Reschedule_DB_Success",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        3280,
+        1180
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ Boolean($json.appointment_id && $json.status === 'CONFIRMED') }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "w1-gcal-rollback-rescheduled-event",
+      "name": "GCal_Rollback_Rescheduled_Event",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1.2,
+      "position": [
+        3500,
+        1300
+      ],
+      "parameters": {
+        "operation": "update",
+        "calendar": {
+          "__rl": true,
+          "value": "={{ $('Validate_Reschedule_Request').item.json.calendar_id }}",
+          "mode": "id"
+        },
+        "eventId": "={{ $('Validate_Reschedule_Request').item.json.calendar_event_id }}",
+        "start": "={{ $('Validate_Reschedule_Request').item.json.old_start_iso }}",
+        "end": "={{ $('Validate_Reschedule_Request').item.json.old_end_iso }}",
+        "updateFields": {
+          "summary": "={{ 'Appointment: ' + $('Validate_Reschedule_Request').item.json.customer_name + ' (' + $('Validate_Reschedule_Request').item.json.doctor_id + ')' }}"
+        }
+      },
+      "credentials": {
+        "googleCalendarOAuth2": {
+          "id": "google_calendar_credentials_id",
+          "name": "Google Calendar Account"
+        }
+      },
+      "continueOnFail": true
     }
   ],
   "connections": {
@@ -1980,7 +2139,7 @@
         ],
         [
           {
-            "node": "Format_General_Reply",
+            "node": "Send_WhatsApp_AI_Error",
             "type": "main",
             "index": 0
           }
@@ -2370,7 +2529,7 @@
         ],
         [
           {
-            "node": "Send_WhatsApp_Reschedule_Busy",
+            "node": "If_Reschedule_GCal_Failed",
             "type": "main",
             "index": 0
           }
@@ -2403,7 +2562,7 @@
       "main": [
         [
           {
-            "node": "Send_WhatsApp_Reschedule_Success",
+            "node": "If_Reschedule_DB_Success",
             "type": "main",
             "index": 0
           }
@@ -2608,6 +2767,64 @@
         [
           {
             "node": "Respond_Confirmed_Failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send_WhatsApp_AI_Error": {
+      "main": [
+        [
+          {
+            "node": "Respond_AI_Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If_Reschedule_GCal_Failed": {
+      "main": [
+        [
+          {
+            "node": "Send_WhatsApp_GCal_Error",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send_WhatsApp_Reschedule_Busy",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If_Reschedule_DB_Success": {
+      "main": [
+        [
+          {
+            "node": "Send_WhatsApp_Reschedule_Success",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "GCal_Rollback_Rescheduled_Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GCal_Rollback_Rescheduled_Event": {
+      "main": [
+        [
+          {
+            "node": "Send_WhatsApp_Interim_Conflict",
             "type": "main",
             "index": 0
           }
