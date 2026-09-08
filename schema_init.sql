@@ -96,6 +96,14 @@ CREATE TABLE IF NOT EXISTS audit_logs (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
+-- Inbound Message Deduplication Table for Idempotency (wamid tracking)
+CREATE TABLE IF NOT EXISTS processed_messages (
+    message_id VARCHAR(255) PRIMARY KEY,
+    channel VARCHAR(50) NOT NULL DEFAULT 'whatsapp',
+    sender VARCHAR(50),
+    processed_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
 -- Indices for high performance & concurrency lookups
 CREATE INDEX IF NOT EXISTS idx_doctors_active ON doctors(doctor_id) WHERE is_active = TRUE;
 CREATE INDEX IF NOT EXISTS idx_appointments_doc_time ON appointments(doctor_id, start_time, end_time);
@@ -103,6 +111,7 @@ CREATE INDEX IF NOT EXISTS idx_appointments_phone_status ON appointments(phone, 
 CREATE INDEX IF NOT EXISTS idx_appointments_status_start ON appointments(status, start_time);
 CREATE INDEX IF NOT EXISTS idx_appointments_expires ON appointments(expires_at) WHERE status = 'PENDING';
 CREATE INDEX IF NOT EXISTS idx_doctor_unavailability_lookup ON doctor_unavailability(doctor_id, start_time, end_time);
+CREATE INDEX IF NOT EXISTS idx_processed_messages_time ON processed_messages(processed_at);
 
 -- Seed initial doctors if empty (IDEMPOTENT - does not overwrite existing configuration)
 INSERT INTO doctors (doctor_id, doctor_name, specialty, calendar_id, timezone, working_days, working_hours, slot_duration_minutes, buffer_minutes, booking_cutoff_minutes, is_active)

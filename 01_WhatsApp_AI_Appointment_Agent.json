@@ -25,7 +25,7 @@
       ],
       "parameters": {
         "operation": "executeQuery",
-        "query": "-- Enable btree_gist for exclusion constraints if available\nCREATE EXTENSION IF NOT EXISTS btree_gist;\n\nCREATE TABLE IF NOT EXISTS doctors (\n    doctor_id VARCHAR(100) PRIMARY KEY,\n    doctor_name VARCHAR(255) NOT NULL,\n    specialty VARCHAR(255) NOT NULL,\n    calendar_id VARCHAR(255) NOT NULL,\n    timezone VARCHAR(100) NOT NULL DEFAULT 'Asia/Kolkata',\n    working_days JSONB NOT NULL DEFAULT '[1,2,3,4,5,6]'::jsonb, -- 1=Mon, 6=Sat\n    working_hours JSONB NOT NULL DEFAULT '{\"start\": \"09:00\", \"end\": \"17:00\"}'::jsonb,\n    slot_duration_minutes INT NOT NULL DEFAULT 30,\n    buffer_minutes INT NOT NULL DEFAULT 0,\n    booking_cutoff_minutes INT NOT NULL DEFAULT 60,\n    is_active BOOLEAN NOT NULL DEFAULT TRUE,\n    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),\n    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()\n);\n\nCREATE TABLE IF NOT EXISTS appointments (\n    appointment_id SERIAL PRIMARY KEY,\n    customer_name VARCHAR(255) NOT NULL,\n    phone VARCHAR(50) NOT NULL,\n    doctor_id VARCHAR(100) NOT NULL REFERENCES doctors(doctor_id) ON UPDATE CASCADE,\n    service VARCHAR(255) NOT NULL,\n    start_time TIMESTAMP WITH TIME ZONE NOT NULL,\n    end_time TIMESTAMP WITH TIME ZONE NOT NULL,\n    status VARCHAR(50) NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'CONFIRMED', 'CANCELLED', 'RESCHEDULED', 'ARRIVED', 'COMPLETED', 'NO_SHOW')),\n    calendar_event_id VARCHAR(255),\n    expires_at TIMESTAMP WITH TIME ZONE,\n    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),\n    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),\n    reminder_3d_sent BOOLEAN DEFAULT FALSE,\n    reminder_1d_sent BOOLEAN DEFAULT FALSE,\n    reminder_4h_sent BOOLEAN DEFAULT FALSE,\n    reminder_1h_sent BOOLEAN DEFAULT FALSE,\n    reminder_3d_claimed_at TIMESTAMP WITH TIME ZONE,\n    reminder_1d_claimed_at TIMESTAMP WITH TIME ZONE,\n    reminder_4h_claimed_at TIMESTAMP WITH TIME ZONE,\n    reminder_1h_claimed_at TIMESTAMP WITH TIME ZONE,\n    CONSTRAINT chk_start_end CHECK (start_time < end_time),\n    CONSTRAINT no_overlapping_appointments EXCLUDE USING gist (\n        doctor_id WITH =,\n        tstzrange(start_time, end_time) WITH &&\n    ) WHERE (status IN ('PENDING', 'CONFIRMED', 'RESCHEDULED', 'ARRIVED', 'COMPLETED'))\n);\n\n-- Hardened idempotent exclusion-constraint migration\nDO $$\nDECLARE\n    curr_def TEXT;\nBEGIN\n    SELECT pg_get_constraintdef(c.oid) INTO curr_def\n    FROM pg_constraint c\n    JOIN pg_class t ON c.conrelid = t.oid\n    WHERE t.relname = 'appointments' AND c.conname = 'no_overlapping_appointments';\n\n    IF curr_def IS NOT NULL THEN\n        -- Revalidate definition contains all 5 required statuses and gist range\n        IF curr_def NOT LIKE '%PENDING%' OR curr_def NOT LIKE '%CONFIRMED%' OR curr_def NOT LIKE '%RESCHEDULED%' OR curr_def NOT LIKE '%ARRIVED%' OR curr_def NOT LIKE '%COMPLETED%' THEN\n            ALTER TABLE appointments DROP CONSTRAINT no_overlapping_appointments;\n            ALTER TABLE appointments ADD CONSTRAINT no_overlapping_appointments\n            EXCLUDE USING gist (\n                doctor_id WITH =,\n                tstzrange(start_time, end_time) WITH &&\n            ) WHERE (status IN ('PENDING', 'CONFIRMED', 'RESCHEDULED', 'ARRIVED', 'COMPLETED'));\n        END IF;\n    ELSE\n        ALTER TABLE appointments ADD CONSTRAINT no_overlapping_appointments\n        EXCLUDE USING gist (\n            doctor_id WITH =,\n            tstzrange(start_time, end_time) WITH &&\n        ) WHERE (status IN ('PENDING', 'CONFIRMED', 'RESCHEDULED', 'ARRIVED', 'COMPLETED'));\n    END IF;\nEND $$;\n\nCREATE TABLE IF NOT EXISTS doctor_unavailability (\n    id SERIAL PRIMARY KEY,\n    doctor_id VARCHAR(100) NOT NULL REFERENCES doctors(doctor_id) ON UPDATE CASCADE,\n    start_time TIMESTAMP WITH TIME ZONE NOT NULL,\n    end_time TIMESTAMP WITH TIME ZONE NOT NULL,\n    reason VARCHAR(255),\n    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),\n    CONSTRAINT chk_unavail_start_end CHECK (start_time < end_time)\n);\n\nCREATE TABLE IF NOT EXISTS audit_logs (\n    id SERIAL PRIMARY KEY,\n    correlation_id VARCHAR(100) NOT NULL,\n    operation VARCHAR(100) NOT NULL,\n    appointment_id INT,\n    doctor_id VARCHAR(100),\n    result VARCHAR(50) NOT NULL,\n    error_code VARCHAR(100),\n    details JSONB,\n    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()\n);\n\n-- Indices for high performance & concurrency lookups\nCREATE INDEX IF NOT EXISTS idx_doctors_active ON doctors(doctor_id) WHERE is_active = TRUE;\nCREATE INDEX IF NOT EXISTS idx_appointments_doc_time ON appointments(doctor_id, start_time, end_time);\nCREATE INDEX IF NOT EXISTS idx_appointments_phone_status ON appointments(phone, status);\nCREATE INDEX IF NOT EXISTS idx_appointments_status_start ON appointments(status, start_time);\nCREATE INDEX IF NOT EXISTS idx_appointments_expires ON appointments(expires_at) WHERE status = 'PENDING';\nCREATE INDEX IF NOT EXISTS idx_doctor_unavailability_lookup ON doctor_unavailability(doctor_id, start_time, end_time);\n\n-- Seed initial doctors if empty (IDEMPOTENT - does not overwrite existing configuration)\nINSERT INTO doctors (doctor_id, doctor_name, specialty, calendar_id, timezone, working_days, working_hours, slot_duration_minutes, buffer_minutes, booking_cutoff_minutes, is_active)\nVALUES \n('dr_smith', 'Dr. John Smith', 'General Physician', 'dr_smith@clinic.com', 'Asia/Kolkata', '[1,2,3,4,5,6]'::jsonb, '{\"start\": \"09:00\", \"end\": \"17:00\"}'::jsonb, 30, 0, 60, true),\n('dr_emily', 'Dr. Emily Davis', 'Dental Specialist', 'dr_emily@clinic.com', 'Asia/Kolkata', '[1,2,3,4,5,6]'::jsonb, '{\"start\": \"09:00\", \"end\": \"17:00\"}'::jsonb, 30, 0, 60, true),\n('dr_robert', 'Dr. Robert Wilson', 'Cardiologist', 'dr_robert@clinic.com', 'Asia/Kolkata', '[1,2,3,4,5,6]'::jsonb, '{\"start\": \"09:00\", \"end\": \"17:00\"}'::jsonb, 30, 0, 60, true)\nON CONFLICT (doctor_id) DO NOTHING;\n"
+        "query": "-- Enable btree_gist for exclusion constraints if available\nCREATE EXTENSION IF NOT EXISTS btree_gist;\n\nCREATE TABLE IF NOT EXISTS doctors (\n    doctor_id VARCHAR(100) PRIMARY KEY,\n    doctor_name VARCHAR(255) NOT NULL,\n    specialty VARCHAR(255) NOT NULL,\n    calendar_id VARCHAR(255) NOT NULL,\n    timezone VARCHAR(100) NOT NULL DEFAULT 'Asia/Kolkata',\n    working_days JSONB NOT NULL DEFAULT '[1,2,3,4,5,6]'::jsonb, -- 1=Mon, 6=Sat\n    working_hours JSONB NOT NULL DEFAULT '{\"start\": \"09:00\", \"end\": \"17:00\"}'::jsonb,\n    slot_duration_minutes INT NOT NULL DEFAULT 30,\n    buffer_minutes INT NOT NULL DEFAULT 0,\n    booking_cutoff_minutes INT NOT NULL DEFAULT 60,\n    is_active BOOLEAN NOT NULL DEFAULT TRUE,\n    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),\n    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()\n);\n\nCREATE TABLE IF NOT EXISTS appointments (\n    appointment_id SERIAL PRIMARY KEY,\n    customer_name VARCHAR(255) NOT NULL,\n    phone VARCHAR(50) NOT NULL,\n    doctor_id VARCHAR(100) NOT NULL REFERENCES doctors(doctor_id) ON UPDATE CASCADE,\n    service VARCHAR(255) NOT NULL,\n    start_time TIMESTAMP WITH TIME ZONE NOT NULL,\n    end_time TIMESTAMP WITH TIME ZONE NOT NULL,\n    status VARCHAR(50) NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'CONFIRMED', 'CANCELLED', 'RESCHEDULED', 'ARRIVED', 'COMPLETED', 'NO_SHOW')),\n    calendar_event_id VARCHAR(255),\n    expires_at TIMESTAMP WITH TIME ZONE,\n    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),\n    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),\n    reminder_3d_sent BOOLEAN DEFAULT FALSE,\n    reminder_1d_sent BOOLEAN DEFAULT FALSE,\n    reminder_4h_sent BOOLEAN DEFAULT FALSE,\n    reminder_1h_sent BOOLEAN DEFAULT FALSE,\n    reminder_3d_claimed_at TIMESTAMP WITH TIME ZONE,\n    reminder_1d_claimed_at TIMESTAMP WITH TIME ZONE,\n    reminder_4h_claimed_at TIMESTAMP WITH TIME ZONE,\n    reminder_1h_claimed_at TIMESTAMP WITH TIME ZONE,\n    CONSTRAINT chk_start_end CHECK (start_time < end_time),\n    CONSTRAINT no_overlapping_appointments EXCLUDE USING gist (\n        doctor_id WITH =,\n        tstzrange(start_time, end_time) WITH &&\n    ) WHERE (status IN ('PENDING', 'CONFIRMED', 'RESCHEDULED', 'ARRIVED', 'COMPLETED'))\n);\n\n-- Hardened idempotent exclusion-constraint migration\nDO $$\nDECLARE\n    curr_def TEXT;\nBEGIN\n    SELECT pg_get_constraintdef(c.oid) INTO curr_def\n    FROM pg_constraint c\n    JOIN pg_class t ON c.conrelid = t.oid\n    WHERE t.relname = 'appointments' AND c.conname = 'no_overlapping_appointments';\n\n    IF curr_def IS NOT NULL THEN\n        -- Revalidate definition contains all 5 required statuses and gist range\n        IF curr_def NOT LIKE '%PENDING%' OR curr_def NOT LIKE '%CONFIRMED%' OR curr_def NOT LIKE '%RESCHEDULED%' OR curr_def NOT LIKE '%ARRIVED%' OR curr_def NOT LIKE '%COMPLETED%' THEN\n            ALTER TABLE appointments DROP CONSTRAINT no_overlapping_appointments;\n            ALTER TABLE appointments ADD CONSTRAINT no_overlapping_appointments\n            EXCLUDE USING gist (\n                doctor_id WITH =,\n                tstzrange(start_time, end_time) WITH &&\n            ) WHERE (status IN ('PENDING', 'CONFIRMED', 'RESCHEDULED', 'ARRIVED', 'COMPLETED'));\n        END IF;\n    ELSE\n        ALTER TABLE appointments ADD CONSTRAINT no_overlapping_appointments\n        EXCLUDE USING gist (\n            doctor_id WITH =,\n            tstzrange(start_time, end_time) WITH &&\n        ) WHERE (status IN ('PENDING', 'CONFIRMED', 'RESCHEDULED', 'ARRIVED', 'COMPLETED'));\n    END IF;\nEND $$;\n\nCREATE TABLE IF NOT EXISTS doctor_unavailability (\n    id SERIAL PRIMARY KEY,\n    doctor_id VARCHAR(100) NOT NULL REFERENCES doctors(doctor_id) ON UPDATE CASCADE,\n    start_time TIMESTAMP WITH TIME ZONE NOT NULL,\n    end_time TIMESTAMP WITH TIME ZONE NOT NULL,\n    reason VARCHAR(255),\n    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),\n    CONSTRAINT chk_unavail_start_end CHECK (start_time < end_time)\n);\n\nCREATE TABLE IF NOT EXISTS audit_logs (\n    id SERIAL PRIMARY KEY,\n    correlation_id VARCHAR(100) NOT NULL,\n    operation VARCHAR(100) NOT NULL,\n    appointment_id INT,\n    doctor_id VARCHAR(100),\n    result VARCHAR(50) NOT NULL,\n    error_code VARCHAR(100),\n    details JSONB,\n    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()\n);\n\n-- Inbound Message Deduplication Table for Idempotency (wamid tracking)\nCREATE TABLE IF NOT EXISTS processed_messages (\n    message_id VARCHAR(255) PRIMARY KEY,\n    channel VARCHAR(50) NOT NULL DEFAULT 'whatsapp',\n    sender VARCHAR(50),\n    processed_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()\n);\n\n-- Indices for high performance & concurrency lookups\nCREATE INDEX IF NOT EXISTS idx_doctors_active ON doctors(doctor_id) WHERE is_active = TRUE;\nCREATE INDEX IF NOT EXISTS idx_appointments_doc_time ON appointments(doctor_id, start_time, end_time);\nCREATE INDEX IF NOT EXISTS idx_appointments_phone_status ON appointments(phone, status);\nCREATE INDEX IF NOT EXISTS idx_appointments_status_start ON appointments(status, start_time);\nCREATE INDEX IF NOT EXISTS idx_appointments_expires ON appointments(expires_at) WHERE status = 'PENDING';\nCREATE INDEX IF NOT EXISTS idx_doctor_unavailability_lookup ON doctor_unavailability(doctor_id, start_time, end_time);\nCREATE INDEX IF NOT EXISTS idx_processed_messages_time ON processed_messages(processed_at);\n\n-- Seed initial doctors if empty (IDEMPOTENT - does not overwrite existing configuration)\nINSERT INTO doctors (doctor_id, doctor_name, specialty, calendar_id, timezone, working_days, working_hours, slot_duration_minutes, buffer_minutes, booking_cutoff_minutes, is_active)\nVALUES \n('dr_smith', 'Dr. John Smith', 'General Physician', 'dr_smith@clinic.com', 'Asia/Kolkata', '[1,2,3,4,5,6]'::jsonb, '{\"start\": \"09:00\", \"end\": \"17:00\"}'::jsonb, 30, 0, 60, true),\n('dr_emily', 'Dr. Emily Davis', 'Dental Specialist', 'dr_emily@clinic.com', 'Asia/Kolkata', '[1,2,3,4,5,6]'::jsonb, '{\"start\": \"09:00\", \"end\": \"17:00\"}'::jsonb, 30, 0, 60, true),\n('dr_robert', 'Dr. Robert Wilson', 'Cardiologist', 'dr_robert@clinic.com', 'Asia/Kolkata', '[1,2,3,4,5,6]'::jsonb, '{\"start\": \"09:00\", \"end\": \"17:00\"}'::jsonb, 30, 0, 60, true)\nON CONFLICT (doctor_id) DO NOTHING;\n"
       },
       "credentials": {
         "postgres": {
@@ -63,7 +63,8 @@
       ],
       "parameters": {
         "language": "javascript",
-        "jsCode": "const body = $input.item.json.body || $input.item.json;\nlet rawPhone = '';\nlet customerName = 'Customer';\nlet message = '';\nlet channel = 'whatsapp';\nconst correlationId = 'corr_' + Math.random().toString(36).substring(2, 10) + '_' + Date.now();\n\nif (body.entry && body.entry[0]?.changes && body.entry[0].changes[0]?.value) {\n  const val = body.entry[0].changes[0].value;\n  if (val.contacts && val.contacts[0]) {\n    customerName = val.contacts[0].profile?.name || customerName;\n  }\n  if (val.messages && val.messages[0]) {\n    const msgObj = val.messages[0];\n    rawPhone = msgObj.from || '';\n    if (msgObj.type === 'text') {\n      message = msgObj.text?.body || '';\n    } else if (msgObj.type === 'interactive') {\n      message = msgObj.interactive?.button_reply?.title || msgObj.interactive?.list_reply?.title || '';\n    } else if (msgObj.type === 'button') {\n      message = msgObj.button?.text || '';\n    }\n  }\n} else if (body.From || body.Body) {\n  rawPhone = (body.From || '').replace('whatsapp:', '').trim();\n  customerName = body.ProfileName || customerName;\n  message = body.Body || '';\n  channel = 'twilio';\n} else {\n  rawPhone = String(body.phone || body.from || body.sender || '').trim();\n  customerName = body.name || body.customer_name || body.customerName || customerName;\n  message = body.message || body.text || body.body || '';\n}\n\n// Canonical phone number normalization (+91 default for 10-digit numbers) (Finding 11)\nlet cleanPhone = rawPhone.replace(/[^0-9]/g, '');\nif (cleanPhone.length === 10) {\n  cleanPhone = '91' + cleanPhone;\n}\n\nreturn [{\n  json: {\n    correlation_id: correlationId,\n    phone: cleanPhone,\n    customer_name: customerName,\n    message: (message || '').trim(),\n    channel: channel,\n    received_at: new Date().toISOString()\n  }\n}];\n"
+        "jsCode": "\nconst crypto = require('crypto');\nconst inputItem = $input.first()?.json || {};\nconst headers = inputItem.headers || {};\nconst query = inputItem.query || {};\nconst body = inputItem.body || {};\n\n// 1. Meta Webhook GET Challenge Verification\nif (query['hub.mode'] === 'subscribe' && query['hub.challenge']) {\n  const configuredVerifyToken = $env.META_VERIFY_TOKEN || 'apex_clinic_verify_token';\n  const providedToken = query['hub.verify_token'];\n  if (providedToken === configuredVerifyToken) {\n    return [{\n      json: {\n        is_verification: true,\n        verification_passed: true,\n        challenge: query['hub.challenge']\n      }\n    }];\n  } else {\n    return [{\n      json: {\n        is_verification: true,\n        verification_passed: false,\n        error: 'Invalid verification token'\n      }\n    }];\n  }\n}\n\n// 2. Meta Webhook HMAC-SHA256 Signature Verification\nconst appSecret = $env.META_APP_SECRET || '';\nconst signatureHeader = headers['x-hub-signature-256'] || headers['X-Hub-Signature-256'] || '';\nlet isSignatureValid = true;\n\nif (appSecret && signatureHeader) {\n  try {\n    const rawBody = typeof body === 'string' ? body : JSON.stringify(body);\n    const expectedSig = 'sha256=' + crypto.createHmac('sha256', appSecret).update(rawBody).digest('hex');\n    const sigBuffer = Buffer.from(signatureHeader);\n    const expectedBuffer = Buffer.from(expectedSig);\n    if (sigBuffer.length !== expectedBuffer.length || !crypto.timingSafeEqual(sigBuffer, expectedBuffer)) {\n      isSignatureValid = false;\n    }\n  } catch (e) {\n    isSignatureValid = false;\n  }\n}\n\nif (!isSignatureValid) {\n  return [{\n    json: {\n      is_signature_invalid: true,\n      error: 'Invalid HMAC signature'\n    }\n  }];\n}\n\n// 3. Inbound Payload Normalization & Status Event Filtering\nlet entry = (body.entry && body.entry[0]) || {};\nlet change = (entry.changes && entry.changes[0]) || {};\nlet val = change.value || {};\n\n// Ignore delivery/read status updates immediately\nif (val.statuses && Array.isArray(val.statuses) && val.statuses.length > 0) {\n  return [{\n    json: {\n      is_status_callback: true,\n      status_detail: val.statuses[0]?.status,\n      message_id: val.statuses[0]?.id\n    }\n  }];\n}\n\nconst rawMessages = (val.messages && Array.isArray(val.messages)) ? val.messages : [];\nif (rawMessages.length === 0 && !body.From && !body.phone && !body.message) {\n  return [{\n    json: {\n      is_status_callback: true,\n      reason: 'No message content in webhook payload'\n    }\n  }];\n}\n\n// Support Meta WhatsApp Cloud API & Twilio formats\nconst results = [];\nconst contact = (val.contacts && val.contacts[0]) || {};\nconst defaultCustomerName = contact.profile?.name || body.ProfileName || body.name || body.customer_name || 'Valued Patient';\n\nconst messagesToProcess = rawMessages.length > 0 ? rawMessages : [body];\n\nfor (const msgObj of messagesToProcess) {\n  let rawPhone = '';\n  let customerName = defaultCustomerName;\n  let message = '';\n  let channel = 'whatsapp_cloud';\n  let messageId = msgObj.id || body.MessageSid || ('wamid_mock_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6));\n\n  if (msgObj.from) {\n    rawPhone = msgObj.from;\n    message = msgObj.text?.body || msgObj.button?.text || msgObj.interactive?.button_reply?.title || msgObj.interactive?.list_reply?.title || '';\n  } else if (body.From) {\n    rawPhone = (body.From || '').replace('whatsapp:', '').trim();\n    message = body.Body || '';\n    channel = 'twilio';\n  } else {\n    rawPhone = String(body.phone || body.from || body.sender || '').trim();\n    message = body.message || body.text || body.body || '';\n  }\n\n  // Canonical phone normalization (+91 default for 10-digit Indian numbers)\n  let cleanPhone = String(rawPhone || '').replace(/[^0-9]/g, '');\n  if (cleanPhone.length === 10) {\n    cleanPhone = '91' + cleanPhone;\n  }\n\n  const correlationId = 'corr_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6);\n\n  results.push({\n    json: {\n      is_verification: false,\n      is_status_callback: false,\n      is_signature_invalid: false,\n      message_id: messageId,\n      correlation_id: correlationId,\n      phone: cleanPhone,\n      customer_name: customerName,\n      message: (message || '').trim(),\n      channel: channel,\n      received_at: new Date().toISOString()\n    }\n  });\n}\n\nreturn results;\n",
+        "mode": "runOnceForAllItems"
       }
     },
     {
@@ -359,7 +360,7 @@
       ],
       "parameters": {
         "method": "POST",
-        "url": "https://graph.facebook.com/v20.0/FROM_PHONE_NUMBER_ID/messages",
+        "url": "https://graph.facebook.com/v20.0/{{ $env.WHATSAPP_PHONE_NUMBER_ID || 'FROM_PHONE_NUMBER_ID' }}/messages",
         "authentication": "genericCredentialType",
         "genericAuthType": "httpHeaderAuth",
         "sendHeaders": true,
@@ -439,7 +440,8 @@
       ],
       "parameters": {
         "language": "javascript",
-        "jsCode": "\nfunction getUtcFromLocal(dateStr, timeStr, timeZone) {\n  const [yyyy, mm, dd] = dateStr.split('-').map(Number);\n  const [hh, min] = timeStr.split(':').map(Number);\n  const utcDate = new Date(Date.UTC(yyyy, mm - 1, dd, hh, min, 0));\n  const invDate = new Date(utcDate.toLocaleString('en-US', { timeZone: 'UTC' }));\n  const targetDate = new Date(utcDate.toLocaleString('en-US', { timeZone: timeZone }));\n  const diff = targetDate.getTime() - invDate.getTime();\n  return new Date(utcDate.getTime() - diff);\n}\n\nfunction formatInTimezone(dateObj, timeZone, options) {\n  return new Intl.DateTimeFormat('en-US', { timeZone, ...options }).format(dateObj);\n}\n\nfunction getLocalWeekday(dateStr, timeStr, timeZone) {\n  const d = getUtcFromLocal(dateStr, timeStr || '12:00', timeZone);\n  const dayStr = new Intl.DateTimeFormat('en-US', { timeZone, weekday: 'short' }).format(d);\n  const map = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };\n  return map[dayStr];\n}\n\nconst prev = $('Validate_Booking_Input').first().json;\nconst allInputs = $input.all();\n\n// Explicit Google Calendar failure detection (Bug #4)\nconst gcalError = allInputs.some(i => i.json?.error || i.error);\nif (gcalError) {\n  return [{\n    json: {\n      ...prev,\n      is_slot_available: false,\n      calendar_error: true,\n      available_alternatives: [],\n      error_msg: \"We are temporarily unable to verify calendar availability. Please try again shortly.\"\n    }\n  }];\n}\n\nconst gcalItems = allInputs.map(i => i.json).filter(j => j && (j.id || j.start));\n\nconst doc = prev.doctor || {};\nconst tz = doc.timezone || 'Asia/Kolkata';\nconst wh = doc.working_hours || { start: \"09:00\", end: \"17:00\" };\nconst slotDuration = doc.slot_duration_minutes || 30;\nconst bufferMin = doc.buffer_minutes || 0;\nconst cutoffMin = doc.booking_cutoff_minutes || 60;\nconst unavailList = prev.active_unavailability || [];\n\nconst reqStart = new Date(prev.start_time_iso);\nconst reqEnd = new Date(prev.end_time_iso);\n\nfunction isGCalOverlap(startA, endA, events) {\n  for (const ev of events) {\n    const evStartStr = ev.start?.dateTime || ev.start?.date;\n    const evEndStr = ev.end?.dateTime || ev.end?.date;\n    if (!evStartStr || !evEndStr) continue;\n    const evStart = new Date(evStartStr);\n    const evEnd = new Date(evEndStr);\n    const evStartBuffered = new Date(evStart.getTime() - bufferMin * 60000);\n    const evEndBuffered = new Date(evEnd.getTime() + bufferMin * 60000);\n    if (startA < evEndBuffered && endA > evStartBuffered) {\n      return true;\n    }\n  }\n  return false;\n}\n\nfunction isDoctorLeaveOverlap(startA, endA, leaveList) {\n  for (const u of leaveList) {\n    if (u.doctor_id === doc.doctor_id) {\n      const uStart = new Date(u.start_time);\n      const uEnd = new Date(u.end_time);\n      if (startA < uEnd && endA > uStart) return true;\n    }\n  }\n  return false;\n}\n\nconst isRequestedFree = !isGCalOverlap(reqStart, reqEnd, gcalItems) && !isDoctorLeaveOverlap(reqStart, reqEnd, unavailList);\n\nconst [startH, startM] = wh.start.split(':').map(Number);\nconst [endH, endM] = wh.end.split(':').map(Number);\nconst allAlternatives = [];\nconst now = new Date();\n\nfor (let h = startH; h < endH; h++) {\n  for (let m = 0; m < 60; m += slotDuration) {\n    const hhStr = String(h).padStart(2, '0');\n    const mmStr = String(m).padStart(2, '0');\n    const timeStr = `${hhStr}:${mmStr}`;\n    \n    const slotStart = getUtcFromLocal(prev.requested_date, timeStr, tz);\n    const slotEnd = new Date(slotStart.getTime() + slotDuration * 60000);\n\n    if (slotStart.getTime() < now.getTime() + cutoffMin * 60000) continue;\n\n    if (!isGCalOverlap(slotStart, slotEnd, gcalItems) && !isDoctorLeaveOverlap(slotStart, slotEnd, unavailList)) {\n      allAlternatives.push(timeStr);\n    }\n  }\n}\n\nreturn [{\n  json: {\n    ...prev,\n    is_slot_available: isRequestedFree,\n    calendar_error: false,\n    available_alternatives: allAlternatives.slice(0, 4),\n    existing_events_count: gcalItems.length\n  }\n}];\n"
+        "jsCode": "\nfunction getUtcFromLocal(dateStr, timeStr, timeZone) {\n  const [yyyy, mm, dd] = dateStr.split('-').map(Number);\n  const [hh, min] = timeStr.split(':').map(Number);\n  const utcDate = new Date(Date.UTC(yyyy, mm - 1, dd, hh, min, 0));\n  const invDate = new Date(utcDate.toLocaleString('en-US', { timeZone: 'UTC' }));\n  const targetDate = new Date(utcDate.toLocaleString('en-US', { timeZone: timeZone }));\n  const diff = targetDate.getTime() - invDate.getTime();\n  return new Date(utcDate.getTime() - diff);\n}\n\nconst prev = $('Validate_Booking_Input').first().json;\nconst allInputs = $input.all();\n\n// Explicit Google Calendar failure detection\nconst gcalError = allInputs.some(i => i.json?.error || i.error);\nif (gcalError) {\n  return [{\n    json: {\n      ...prev,\n      is_slot_available: false,\n      calendar_error: true,\n      available_alternatives: [],\n      error_msg: \"We are temporarily unable to verify calendar availability. Please try again shortly.\"\n    }\n  }];\n}\n\n// Safely collect events (handles 0 events, 1 event, N events)\nconst gcalItems = allInputs.map(i => i.json).filter(j => j && (j.id || j.start));\n\nconst doc = prev.doctor || {};\nconst tz = doc.timezone || 'Asia/Kolkata';\nconst wh = doc.working_hours || { start: \"09:00\", end: \"17:00\" };\nconst slotDuration = doc.slot_duration_minutes || 30;\nconst bufferMin = doc.buffer_minutes || 0;\nconst cutoffMin = doc.booking_cutoff_minutes || 60;\nconst unavailList = prev.active_unavailability || [];\n\nconst reqStart = new Date(prev.start_time_iso);\nconst reqEnd = new Date(prev.end_time_iso);\n\nfunction isGCalOverlap(startA, endA, events) {\n  for (const ev of events) {\n    const evStartStr = ev.start?.dateTime || ev.start?.date;\n    const evEndStr = ev.end?.dateTime || ev.end?.date;\n    if (!evStartStr || !evEndStr) continue;\n    const evStart = new Date(evStartStr);\n    const evEnd = new Date(evEndStr);\n    const evStartBuffered = new Date(evStart.getTime() - bufferMin * 60000);\n    const evEndBuffered = new Date(evEnd.getTime() + bufferMin * 60000);\n    if (startA < evEndBuffered && endA > evStartBuffered) {\n      return true;\n    }\n  }\n  return false;\n}\n\nfunction isDoctorLeaveOverlap(startA, endA, leaveList) {\n  for (const u of leaveList) {\n    if (u.doctor_id === doc.doctor_id) {\n      const uStart = new Date(u.start_time);\n      const uEnd = new Date(u.end_time);\n      if (startA < uEnd && endA > uStart) return true;\n    }\n  }\n  return false;\n}\n\nconst isRequestedFree = !isGCalOverlap(reqStart, reqEnd, gcalItems) && !isDoctorLeaveOverlap(reqStart, reqEnd, unavailList);\n\nconst [startH, startM] = wh.start.split(':').map(Number);\nconst [endH, endM] = wh.end.split(':').map(Number);\nconst allAlternatives = [];\nconst now = new Date();\n\nfor (let h = startH; h < endH; h++) {\n  for (let m = 0; m < 60; m += slotDuration) {\n    const hhStr = String(h).padStart(2, '0');\n    const mmStr = String(m).padStart(2, '0');\n    const timeStr = `${hhStr}:${mmStr}`;\n    \n    const slotStart = getUtcFromLocal(prev.requested_date, timeStr, tz);\n    const slotEnd = new Date(slotStart.getTime() + slotDuration * 60000);\n\n    if (slotStart.getTime() < now.getTime() + cutoffMin * 60000) continue;\n\n    if (!isGCalOverlap(slotStart, slotEnd, gcalItems) && !isDoctorLeaveOverlap(slotStart, slotEnd, unavailList)) {\n      allAlternatives.push(timeStr);\n    }\n  }\n}\n\nreturn [{\n  json: {\n    ...prev,\n    is_slot_available: isRequestedFree,\n    calendar_error: false,\n    available_alternatives: allAlternatives.slice(0, 4),\n    existing_events_count: gcalItems.length\n  }\n}];\n",
+        "mode": "runOnceForAllItems"
       }
     },
     {
@@ -496,7 +498,7 @@
       ],
       "parameters": {
         "method": "POST",
-        "url": "https://graph.facebook.com/v20.0/FROM_PHONE_NUMBER_ID/messages",
+        "url": "https://graph.facebook.com/v20.0/{{ $env.WHATSAPP_PHONE_NUMBER_ID || 'FROM_PHONE_NUMBER_ID' }}/messages",
         "authentication": "genericCredentialType",
         "genericAuthType": "httpHeaderAuth",
         "sendHeaders": true,
@@ -574,7 +576,7 @@
       ],
       "parameters": {
         "method": "POST",
-        "url": "https://graph.facebook.com/v20.0/FROM_PHONE_NUMBER_ID/messages",
+        "url": "https://graph.facebook.com/v20.0/{{ $env.WHATSAPP_PHONE_NUMBER_ID || 'FROM_PHONE_NUMBER_ID' }}/messages",
         "authentication": "genericCredentialType",
         "genericAuthType": "httpHeaderAuth",
         "sendHeaders": true,
@@ -659,7 +661,7 @@
       ],
       "parameters": {
         "method": "POST",
-        "url": "https://graph.facebook.com/v20.0/FROM_PHONE_NUMBER_ID/messages",
+        "url": "https://graph.facebook.com/v20.0/{{ $env.WHATSAPP_PHONE_NUMBER_ID || 'FROM_PHONE_NUMBER_ID' }}/messages",
         "authentication": "genericCredentialType",
         "genericAuthType": "httpHeaderAuth",
         "sendHeaders": true,
@@ -751,7 +753,7 @@
       ],
       "parameters": {
         "method": "POST",
-        "url": "https://graph.facebook.com/v20.0/FROM_PHONE_NUMBER_ID/messages",
+        "url": "https://graph.facebook.com/v20.0/{{ $env.WHATSAPP_PHONE_NUMBER_ID || 'FROM_PHONE_NUMBER_ID' }}/messages",
         "authentication": "genericCredentialType",
         "genericAuthType": "httpHeaderAuth",
         "sendHeaders": true,
@@ -830,7 +832,8 @@
       ],
       "parameters": {
         "language": "javascript",
-        "jsCode": "\nfunction getWeekdayFromDate(dateObj, timeZone) {\n  const dayStr = new Intl.DateTimeFormat('en-US', { timeZone, weekday: 'short' }).format(dateObj);\n  const map = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };\n  return map[dayStr];\n}\n\nconst prev = $('Validate_Pending_For_Confirm').first().json;\nconst allInputs = $input.all();\n\n// Explicit Google Calendar failure detection\nconst gcalError = allInputs.some(i => i.json?.error || i.error);\nif (gcalError) {\n  return [{\n    json: {\n      ...prev,\n      is_final_slot_free: false,\n      calendar_check_failed: true,\n      error_msg: \"We are temporarily unable to verify calendar availability. Your booking hold is still saved. Please try confirming again in a moment by replying YES.\"\n    }\n  }];\n}\n\nconst gcalItems = allInputs.map(i => i.json).filter(j => j && (j.id || j.start));\nconst reqStart = new Date(prev.start_time_iso);\nconst reqEnd = new Date(prev.end_time_iso);\nconst now = new Date();\n\nlet isFree = true;\nlet reason = \"\";\n\n// 1. Check pending expiration and status\nif (!prev.active_pending || prev.active_pending.status !== 'PENDING') {\n  isFree = false;\n  reason = \"Appointment is no longer in PENDING state.\";\n} else if (prev.active_pending.expires_at && new Date(prev.active_pending.expires_at) <= now) {\n  isFree = false;\n  reason = \"Appointment hold has expired.\";\n}\n\n// 2. Validate Doctor exists and is active\nconst doc = (prev.active_doctors || []).find(d => d.doctor_id === prev.doctor_id) || prev.doctor;\nif (!doc) {\n  isFree = false;\n  reason = \"Doctor not found or inactive.\";\n}\n\n// 3. Validate working days and working hours (Timezone Safe)\nif (isFree && doc) {\n  const tz = doc.timezone || 'Asia/Kolkata';\n  const weekdayNum = getWeekdayFromDate(reqStart, tz);\n  const workingDays = doc.working_days || [1, 2, 3, 4, 5, 6];\n  if (!workingDays.includes(weekdayNum)) {\n    isFree = false;\n    reason = \"Requested date is not a working day for this doctor.\";\n  }\n}\n\n// 4. Validate Doctor Leave / Unavailability\nif (isFree) {\n  const unavailList = prev.active_unavailability || [];\n  for (const u of unavailList) {\n    if (u.doctor_id === prev.doctor_id) {\n      const uStart = new Date(u.start_time);\n      const uEnd = new Date(u.end_time);\n      if (reqStart < uEnd && reqEnd > uStart) {\n        isFree = false;\n        reason = `Doctor is unavailable: ${u.reason || 'On Leave'}`;\n        break;\n      }\n    }\n  }\n}\n\n// 5. Check GCal events overlap\nif (isFree) {\n  for (const ev of gcalItems) {\n    const evStartStr = ev.start?.dateTime || ev.start?.date;\n    const evEndStr = ev.end?.dateTime || ev.end?.date;\n    if (!evStartStr || !evEndStr) continue;\n    const evStart = new Date(evStartStr);\n    const evEnd = new Date(evEndStr);\n    if (reqStart < evEnd && reqEnd > evStart) {\n      isFree = false;\n      reason = \"Slot is already booked on the doctor's calendar.\";\n      break;\n    }\n  }\n}\n\nreturn [{\n  json: {\n    ...prev,\n    is_final_slot_free: isFree,\n    calendar_check_failed: false,\n    conflict_reason: reason\n  }\n}];\n"
+        "jsCode": "\nfunction getWeekdayFromDate(dateObj, timeZone) {\n  const dayStr = new Intl.DateTimeFormat('en-US', { timeZone, weekday: 'short' }).format(dateObj);\n  const map = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };\n  return map[dayStr];\n}\n\nconst prev = $('Validate_Pending_For_Confirm').first().json;\nconst allInputs = $input.all();\n\n// Explicit Google Calendar failure detection\nconst gcalError = allInputs.some(i => i.json?.error || i.error);\nif (gcalError) {\n  return [{\n    json: {\n      ...prev,\n      is_final_slot_free: false,\n      calendar_check_failed: true,\n      error_msg: \"We are temporarily unable to verify calendar availability. Your booking hold is still saved. Please try confirming again in a moment by replying YES.\"\n    }\n  }];\n}\n\n// Handles 0 events (clean free slot), 1 event, N events\nconst gcalItems = allInputs.map(i => i.json).filter(j => j && (j.id || j.start));\nconst reqStart = new Date(prev.start_time_iso);\nconst reqEnd = new Date(prev.end_time_iso);\nconst now = new Date();\n\nlet isFree = true;\nlet reason = \"\";\n\n// 1. Check pending expiration and status\nif (!prev.active_pending || prev.active_pending.status !== 'PENDING') {\n  isFree = false;\n  reason = \"Appointment is no longer in PENDING state.\";\n} else if (prev.active_pending.expires_at && new Date(prev.active_pending.expires_at) <= now) {\n  isFree = false;\n  reason = \"Appointment hold has expired.\";\n}\n\n// 2. Validate Doctor exists and is active\nconst doc = (prev.active_doctors || []).find(d => d.doctor_id === prev.doctor_id) || prev.doctor;\nif (!doc) {\n  isFree = false;\n  reason = \"Doctor not found or inactive.\";\n}\n\n// 3. Validate working days and working hours\nif (isFree && doc) {\n  const tz = doc.timezone || 'Asia/Kolkata';\n  const weekdayNum = getWeekdayFromDate(reqStart, tz);\n  const workingDays = doc.working_days || [1, 2, 3, 4, 5, 6];\n  if (!workingDays.includes(weekdayNum)) {\n    isFree = false;\n    reason = \"Requested date is not a working day for this doctor.\";\n  }\n}\n\n// 4. Validate Doctor Leave / Unavailability\nif (isFree) {\n  const unavailList = prev.active_unavailability || [];\n  for (const u of unavailList) {\n    if (u.doctor_id === prev.doctor_id) {\n      const uStart = new Date(u.start_time);\n      const uEnd = new Date(u.end_time);\n      if (reqStart < uEnd && reqEnd > uStart) {\n        isFree = false;\n        reason = `Doctor is unavailable: ${u.reason || 'On Leave'}`;\n        break;\n      }\n    }\n  }\n}\n\n// 5. Check GCal events overlap with doctor buffer minutes\nif (isFree) {\n  const bufferMin = doc?.buffer_minutes || 0;\n  for (const ev of gcalItems) {\n    const evStartStr = ev.start?.dateTime || ev.start?.date;\n    const evEndStr = ev.end?.dateTime || ev.end?.date;\n    if (!evStartStr || !evEndStr) continue;\n    const evStart = new Date(evStartStr);\n    const evEnd = new Date(evEndStr);\n    const evStartBuffered = new Date(evStart.getTime() - bufferMin * 60000);\n    const evEndBuffered = new Date(evEnd.getTime() + bufferMin * 60000);\n    if (reqStart < evEndBuffered && reqEnd > evStartBuffered) {\n      isFree = false;\n      reason = \"Slot is already booked on the doctor's calendar.\";\n      break;\n    }\n  }\n}\n\nreturn [{\n  json: {\n    ...prev,\n    is_final_slot_free: isFree,\n    calendar_check_failed: false,\n    conflict_reason: reason\n  }\n}];\n",
+        "mode": "runOnceForAllItems"
       }
     },
     {
@@ -895,7 +898,7 @@
       ],
       "parameters": {
         "method": "POST",
-        "url": "https://graph.facebook.com/v20.0/FROM_PHONE_NUMBER_ID/messages",
+        "url": "https://graph.facebook.com/v20.0/{{ $env.WHATSAPP_PHONE_NUMBER_ID || 'FROM_PHONE_NUMBER_ID' }}/messages",
         "authentication": "genericCredentialType",
         "genericAuthType": "httpHeaderAuth",
         "sendHeaders": true,
@@ -909,7 +912,7 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{\n{\n  \"messaging_product\": \"whatsapp\",\n  \"recipient_type\": \"individual\",\n  \"to\": $json.phone || $('Validate_Reschedule_Request').item.json.phone || $('Verify_Final_Availability').item.json.phone || $('Parse_WhatsApp_Inbound').item.json.phone,\n  \"type\": \"text\",\n  \"text\": {\n    \"preview_url\": false,\n    \"body\": \"\u26a0\ufe0f We are sorry! That time slot was just booked or expired. Please reply with another date or time to book.\"\n  }\n}\n}}"
+        "jsonBody": "={{\n{\n  \"messaging_product\": \"whatsapp\",\n  \"recipient_type\": \"individual\",\n  \"to\": $('Parse_WhatsApp_Inbound').first().json.phone,\n  \"type\": \"text\",\n  \"text\": {\n    \"preview_url\": false,\n    \"body\": \"\u26a0\ufe0f We are sorry! That time slot was just booked or expired. Please reply with another date or time to book.\"\n  }\n}\n}}"
       },
       "credentials": {
         "httpHeaderAuth": {
@@ -1009,7 +1012,7 @@
       ],
       "parameters": {
         "method": "POST",
-        "url": "https://graph.facebook.com/v20.0/FROM_PHONE_NUMBER_ID/messages",
+        "url": "https://graph.facebook.com/v20.0/{{ $env.WHATSAPP_PHONE_NUMBER_ID || 'FROM_PHONE_NUMBER_ID' }}/messages",
         "authentication": "genericCredentialType",
         "genericAuthType": "httpHeaderAuth",
         "sendHeaders": true,
@@ -1101,7 +1104,7 @@
       ],
       "parameters": {
         "method": "POST",
-        "url": "https://graph.facebook.com/v20.0/FROM_PHONE_NUMBER_ID/messages",
+        "url": "https://graph.facebook.com/v20.0/{{ $env.WHATSAPP_PHONE_NUMBER_ID || 'FROM_PHONE_NUMBER_ID' }}/messages",
         "authentication": "genericCredentialType",
         "genericAuthType": "httpHeaderAuth",
         "sendHeaders": true,
@@ -1180,7 +1183,8 @@
       ],
       "parameters": {
         "language": "javascript",
-        "jsCode": "\nconst prev = $('Validate_Reschedule_Request').first().json;\nconst allInputs = $input.all();\n\n// Explicit Google Calendar failure detection (Requirement #19)\nconst gcalError = allInputs.some(i => i.json?.error || i.error);\nif (gcalError) {\n  return [{ json: { ...prev, is_reschedule_slot_free: false, calendar_check_failed: true, calendar_error: true } }];\n}\n\nconst gcalItems = allInputs.map(i => i.json).filter(j => j && (j.id || j.start));\nconst reqStart = new Date(prev.new_start_iso);\nconst reqEnd = new Date(prev.new_end_iso);\n\nlet isFree = true;\nfor (const ev of gcalItems) {\n  if (prev.calendar_event_id && ev.id === prev.calendar_event_id) continue;\n  const evStart = new Date(ev.start?.dateTime || ev.start?.date);\n  const evEnd = new Date(ev.end?.dateTime || ev.end?.date);\n  if (reqStart < evEnd && reqEnd > evStart) {\n    isFree = false;\n    break;\n  }\n}\n\nreturn [{ json: { ...prev, is_reschedule_slot_free: isFree, calendar_check_failed: false, calendar_error: false } }];\n"
+        "jsCode": "\nconst prev = $('Validate_Reschedule_Request').first().json;\nconst allInputs = $input.all();\n\n// Explicit Google Calendar failure detection\nconst gcalError = allInputs.some(i => i.json?.error || i.error);\nif (gcalError) {\n  return [{ json: { ...prev, is_reschedule_slot_free: false, calendar_check_failed: true, calendar_error: true } }];\n}\n\n// Handles 0 events (clean free slot), 1 event, N events\nconst gcalItems = allInputs.map(i => i.json).filter(j => j && (j.id || j.start));\nconst reqStart = new Date(prev.new_start_iso);\nconst reqEnd = new Date(prev.new_end_iso);\nconst bufferMin = prev.doctor?.buffer_minutes || 0;\n\nlet isFree = true;\nfor (const ev of gcalItems) {\n  if (prev.calendar_event_id && ev.id === prev.calendar_event_id) continue;\n  const evStartStr = ev.start?.dateTime || ev.start?.date;\n  const evEndStr = ev.end?.dateTime || ev.end?.date;\n  if (!evStartStr || !evEndStr) continue;\n  const evStart = new Date(evStartStr);\n  const evEnd = new Date(evEndStr);\n  const evStartBuffered = new Date(evStart.getTime() - bufferMin * 60000);\n  const evEndBuffered = new Date(evEnd.getTime() + bufferMin * 60000);\n  if (reqStart < evEndBuffered && reqEnd > evStartBuffered) {\n    isFree = false;\n    break;\n  }\n}\n\nreturn [{ json: { ...prev, is_reschedule_slot_free: isFree, calendar_check_failed: false, calendar_error: false } }];\n",
+        "mode": "runOnceForAllItems"
       }
     },
     {
@@ -1223,7 +1227,7 @@
       ],
       "parameters": {
         "method": "POST",
-        "url": "https://graph.facebook.com/v20.0/FROM_PHONE_NUMBER_ID/messages",
+        "url": "https://graph.facebook.com/v20.0/{{ $env.WHATSAPP_PHONE_NUMBER_ID || 'FROM_PHONE_NUMBER_ID' }}/messages",
         "authentication": "genericCredentialType",
         "genericAuthType": "httpHeaderAuth",
         "sendHeaders": true,
@@ -1325,7 +1329,7 @@
       ],
       "parameters": {
         "method": "POST",
-        "url": "https://graph.facebook.com/v20.0/FROM_PHONE_NUMBER_ID/messages",
+        "url": "https://graph.facebook.com/v20.0/{{ $env.WHATSAPP_PHONE_NUMBER_ID || 'FROM_PHONE_NUMBER_ID' }}/messages",
         "authentication": "genericCredentialType",
         "genericAuthType": "httpHeaderAuth",
         "sendHeaders": true,
@@ -1417,7 +1421,7 @@
       ],
       "parameters": {
         "method": "POST",
-        "url": "https://graph.facebook.com/v20.0/FROM_PHONE_NUMBER_ID/messages",
+        "url": "https://graph.facebook.com/v20.0/{{ $env.WHATSAPP_PHONE_NUMBER_ID || 'FROM_PHONE_NUMBER_ID' }}/messages",
         "authentication": "genericCredentialType",
         "genericAuthType": "httpHeaderAuth",
         "sendHeaders": true,
@@ -1494,7 +1498,7 @@
       ],
       "parameters": {
         "operation": "executeQuery",
-        "query": "\n    UPDATE appointments\n    SET status = 'CANCELLED',\n        updated_at = NOW(),\n        reminder_3d_sent = TRUE,\n        reminder_1d_sent = TRUE,\n        reminder_4h_sent = TRUE,\n        reminder_1h_sent = TRUE\n    WHERE appointment_id = \n      AND status IN ('PENDING', 'CONFIRMED', 'RESCHEDULED')\n    RETURNING *;\n    ",
+        "query": "\nUPDATE appointments\nSET status = 'CANCELLED',\n    updated_at = NOW(),\n    reminder_3d_sent = TRUE,\n    reminder_1d_sent = TRUE,\n    reminder_4h_sent = TRUE,\n    reminder_1h_sent = TRUE\nWHERE appointment_id = $1\n  AND status IN ('PENDING', 'CONFIRMED', 'RESCHEDULED')\nRETURNING *;\n",
         "queryParameters": "={{ [$('Validate_Cancel_Request').item.json.appointment_id] }}"
       },
       "credentials": {
@@ -1515,7 +1519,7 @@
       ],
       "parameters": {
         "method": "POST",
-        "url": "https://graph.facebook.com/v20.0/FROM_PHONE_NUMBER_ID/messages",
+        "url": "https://graph.facebook.com/v20.0/{{ $env.WHATSAPP_PHONE_NUMBER_ID || 'FROM_PHONE_NUMBER_ID' }}/messages",
         "authentication": "genericCredentialType",
         "genericAuthType": "httpHeaderAuth",
         "sendHeaders": true,
@@ -1578,7 +1582,7 @@
       ],
       "parameters": {
         "method": "POST",
-        "url": "https://graph.facebook.com/v20.0/FROM_PHONE_NUMBER_ID/messages",
+        "url": "https://graph.facebook.com/v20.0/{{ $env.WHATSAPP_PHONE_NUMBER_ID || 'FROM_PHONE_NUMBER_ID' }}/messages",
         "authentication": "genericCredentialType",
         "genericAuthType": "httpHeaderAuth",
         "sendHeaders": true,
@@ -1649,7 +1653,7 @@
     {
       "parameters": {
         "method": "POST",
-        "url": "https://graph.facebook.com/v20.0/FROM_PHONE_NUMBER_ID/messages",
+        "url": "https://graph.facebook.com/v20.0/{{ $env.WHATSAPP_PHONE_NUMBER_ID || 'FROM_PHONE_NUMBER_ID' }}/messages",
         "authentication": "genericCredentialType",
         "genericAuthType": "httpHeaderAuth",
         "sendHeaders": true,
@@ -1663,7 +1667,7 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={\n{\n  \"messaging_product\": \"whatsapp\",\n  \"recipient_type\": \"individual\",\n  \"to\": $json.phone,\n  \"type\": \"text\",\n  \"text\": {\n    \"preview_url\": false,\n    \"body\": $json.error_msg || \"\u26a0\ufe0f We are temporarily unable to verify calendar availability. Your booking hold is still saved. Please try confirming again in a moment by replying YES.\"\n  }\n}\n}"
+        "jsonBody": "={{\n{\n  \"messaging_product\": \"whatsapp\",\n  \"recipient_type\": \"individual\",\n  \"to\": $('Parse_WhatsApp_Inbound').first().json.phone,\n  \"type\": \"text\",\n  \"text\": {\n    \"preview_url\": false,\n    \"body\": $json.error_msg || \"\u26a0\ufe0f We are temporarily unable to verify calendar availability. Your booking hold is still saved. Please try confirming again in a moment by replying YES.\"\n  }\n}\n}}"
       },
       "id": "w1-send-gcal-err",
       "name": "Send_WhatsApp_GCal_Error",
@@ -1727,7 +1731,7 @@
     {
       "parameters": {
         "method": "POST",
-        "url": "https://graph.facebook.com/v20.0/FROM_PHONE_NUMBER_ID/messages",
+        "url": "https://graph.facebook.com/v20.0/{{ $env.WHATSAPP_PHONE_NUMBER_ID || 'FROM_PHONE_NUMBER_ID' }}/messages",
         "authentication": "genericCredentialType",
         "genericAuthType": "httpHeaderAuth",
         "sendHeaders": true,
@@ -1741,7 +1745,7 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={\n{\n  \"messaging_product\": \"whatsapp\",\n  \"recipient_type\": \"individual\",\n  \"to\": $json.phone,\n  \"type\": \"text\",\n  \"text\": {\n    \"preview_url\": false,\n    \"body\": \"\u26a0\ufe0f Our clinic database service is temporarily unavailable. Please try again in a few moments.\"\n  }\n}\n}"
+        "jsonBody": "={{\n{\n  \"messaging_product\": \"whatsapp\",\n  \"recipient_type\": \"individual\",\n  \"to\": $('Parse_WhatsApp_Inbound').first().json.phone,\n  \"type\": \"text\",\n  \"text\": {\n    \"preview_url\": false,\n    \"body\": \"\u26a0\ufe0f Our clinic database service is temporarily unavailable. Please try again in a few moments.\"\n  }\n}\n}}"
       },
       "id": "w1-send-db-err",
       "name": "Send_WhatsApp_DB_Error",
@@ -1845,7 +1849,7 @@
     {
       "parameters": {
         "method": "POST",
-        "url": "https://graph.facebook.com/v20.0/FROM_PHONE_NUMBER_ID/messages",
+        "url": "https://graph.facebook.com/v20.0/{{ $env.WHATSAPP_PHONE_NUMBER_ID || 'FROM_PHONE_NUMBER_ID' }}/messages",
         "authentication": "genericCredentialType",
         "genericAuthType": "httpHeaderAuth",
         "sendHeaders": true,
@@ -1859,7 +1863,7 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={\n{\n  \"messaging_product\": \"whatsapp\",\n  \"recipient_type\": \"individual\",\n  \"to\": $('Verify_Final_Availability').item.json.phone,\n  \"type\": \"text\",\n  \"text\": {\n    \"preview_url\": false,\n    \"body\": \"\u26a0\ufe0f *Confirmation Failed*\\n\\nWe were unable to confirm your booking because the hold expired or was already updated. Please reply with a new date and time to rebook.\"\n  }\n}\n}"
+        "jsonBody": "={{\n{\n  \"messaging_product\": \"whatsapp\",\n  \"recipient_type\": \"individual\",\n  \"to\": $('Parse_WhatsApp_Inbound').first().json.phone,\n  \"type\": \"text\",\n  \"text\": {\n    \"preview_url\": false,\n    \"body\": \"\u26a0\ufe0f *Confirmation Failed*\\n\\nWe were unable to confirm your booking because the hold expired or was already updated. Please reply with a new date and time to rebook.\"\n  }\n}\n}}"
       },
       "id": "w1-send-confirm-failed",
       "name": "Send_WhatsApp_Confirmation_Failed",
@@ -1879,7 +1883,7 @@
     {
       "parameters": {
         "method": "POST",
-        "url": "https://graph.facebook.com/v20.0/FROM_PHONE_NUMBER_ID/messages",
+        "url": "https://graph.facebook.com/v20.0/{{ $env.WHATSAPP_PHONE_NUMBER_ID || 'FROM_PHONE_NUMBER_ID' }}/messages",
         "authentication": "genericCredentialType",
         "genericAuthType": "httpHeaderAuth",
         "sendHeaders": true,
@@ -1893,7 +1897,7 @@
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={\n{\n  \"messaging_product\": \"whatsapp\",\n  \"recipient_type\": \"individual\",\n  \"to\": $json.phone,\n  \"type\": \"text\",\n  \"text\": {\n    \"preview_url\": false,\n    \"body\": \"\u26a0\ufe0f Sorry, I had trouble understanding that message. You can reply with a date and time to book an appointment (e.g. 'Book tomorrow at 10 AM'), or say CONFIRM, RESCHEDULE, or CANCEL.\"\n  }\n}\n}"
+        "jsonBody": "={{\n{\n  \"messaging_product\": \"whatsapp\",\n  \"recipient_type\": \"individual\",\n  \"to\": $('Parse_WhatsApp_Inbound').first().json.phone,\n  \"type\": \"text\",\n  \"text\": {\n    \"preview_url\": false,\n    \"body\": \"\u26a0\ufe0f Sorry, I had trouble understanding that message. You can reply with a date and time to book an appointment (e.g. 'Book tomorrow at 10 AM'), or say CONFIRM, RESCHEDULE, or CANCEL.\"\n  }\n}\n}}"
       },
       "id": "w1-send-ai-error",
       "name": "Send_WhatsApp_AI_Error",
@@ -2044,6 +2048,164 @@
           "combinator": "and"
         }
       }
+    },
+    {
+      "id": "w1-inbound-router",
+      "name": "Route_Inbound_Webhook",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [
+        320,
+        450
+      ],
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.is_verification }}",
+                    "rightValue": true,
+                    "operator": {
+                      "type": "boolean",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.is_status_callback || $json.is_signature_invalid }}",
+                    "rightValue": true,
+                    "operator": {
+                      "type": "boolean",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "fallbackOutput": 2
+      }
+    },
+    {
+      "id": "w1-respond-verification",
+      "name": "Respond_Meta_Verification",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        540,
+        260
+      ],
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ $json.verification_passed ? $json.challenge : 'Forbidden' }}",
+        "options": {
+          "responseCode": "={{ $json.verification_passed ? 200 : 403 }}"
+        }
+      }
+    },
+    {
+      "id": "w1-respond-status-ack",
+      "name": "Respond_Status_Ack",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        540,
+        360
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ success: !$json.is_signature_invalid, status: $json.is_signature_invalid ? 'invalid_signature' : 'acknowledged' }) }}",
+        "options": {
+          "responseCode": "={{ $json.is_signature_invalid ? 401 : 200 }}"
+        }
+      }
+    },
+    {
+      "id": "w1-check-wamid-idempotency",
+      "name": "Postgres_Check_And_Record_Wamid",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        540,
+        520
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO processed_messages (message_id, channel, sender, processed_at) VALUES ($1, 'whatsapp', $2, NOW()) ON CONFLICT (message_id) DO NOTHING RETURNING message_id;",
+        "queryParameters": "={{ [$json.message_id, $json.phone] }}"
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres_credentials_id",
+          "name": "PostgreSQL Account"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "id": "w1-if-message-is-new",
+      "name": "If_Message_Is_New",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        700,
+        520
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ Boolean($json.message_id) }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "w1-respond-duplicate-ack",
+      "name": "Respond_Duplicate_Ack",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        860,
+        620
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ success: true, status: 'duplicate_ignored' }) }}",
+        "options": {
+          "responseCode": 200
+        }
+      }
     }
   ],
   "connections": {
@@ -2073,7 +2235,7 @@
       "main": [
         [
           {
-            "node": "Get_Customer_Context_Postgres",
+            "node": "Route_Inbound_Webhook",
             "type": "main",
             "index": 0
           }
@@ -2874,6 +3036,60 @@
         [
           {
             "node": "Send_WhatsApp_GCal_Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route_Inbound_Webhook": {
+      "main": [
+        [
+          {
+            "node": "Respond_Meta_Verification",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond_Status_Ack",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Postgres_Check_And_Record_Wamid",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres_Check_And_Record_Wamid": {
+      "main": [
+        [
+          {
+            "node": "If_Message_Is_New",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If_Message_Is_New": {
+      "main": [
+        [
+          {
+            "node": "Get_Customer_Context_Postgres",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond_Duplicate_Ack",
             "type": "main",
             "index": 0
           }

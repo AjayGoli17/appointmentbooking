@@ -44,7 +44,7 @@
       ],
       "parameters": {
         "language": "javascript",
-        "jsCode": "const item = $input.item.json;\nconst headers = item.headers || {};\nconst query = item.query || {};\nconst body = item.body || {};\n\n// Server-side authentication check (fail-closed, header-only) (Requirement #14 & #15)\nconst configuredSecret = $env.DASHBOARD_SECRET || '';\nconst rawAuthHeader = headers['authorization'] || headers['Authorization'] || '';\nconst bearerSecret = rawAuthHeader ? rawAuthHeader.replace(/^Bearer\\s+/i, '').trim() : '';\nconst customHeaderSecret = headers['x-dashboard-secret'] || headers['X-Dashboard-Secret'] || '';\n\nconst clientSecret = customHeaderSecret || bearerSecret;\n\n// Fail-closed: must have non-empty configured secret and matching header secret\nconst isAuthorized = Boolean(configuredSecret) && Boolean(clientSecret) && clientSecret === configuredSecret;\n\n// Whitelisted API actions\nconst allowedActions = [\n  'SERVE_HTML',\n  'GET_APPOINTMENTS',\n  'CREATE_APPOINTMENT',\n  'UPDATE_STATUS',\n  'RESCHEDULE_APPOINTMENT',\n  'CANCEL_APPOINTMENT',\n  'SET_DOCTOR_LEAVE'\n];\n\nlet action = 'SERVE_HTML';\nif (body.action) {\n  action = body.action;\n} else if (query.action) {\n  action = query.action;\n}\n\nlet error = null;\n\nif (!isAuthorized) {\n  action = 'UNAUTHORIZED';\n  error = 'Unauthorized: invalid or missing dashboard secret in headers';\n} else if (!allowedActions.includes(action)) {\n  action = 'INVALID_ACTION';\n  error = 'Invalid action requested';\n}\n\nreturn [{\n  json: {\n    action: action,\n    payload: body,\n    query: query,\n    error: error,\n    is_authorized: isAuthorized,\n    received_at: new Date().toISOString()\n  }\n}];\n"
+        "jsCode": "\nconst item = $input.item.json;\nconst headers = item.headers || {};\nconst query = item.query || {};\nconst body = item.body || {};\n\n// Server-side authentication check (fail-closed for mutations)\nconst configuredSecret = $env.DASHBOARD_SECRET || '';\nconst rawAuthHeader = headers['authorization'] || headers['Authorization'] || '';\nconst bearerSecret = rawAuthHeader ? rawAuthHeader.replace(/^Bearer\\s+/i, '').trim() : '';\nconst customHeaderSecret = headers['x-dashboard-secret'] || headers['X-Dashboard-Secret'] || query['secret'] || '';\n\nconst clientSecret = customHeaderSecret || bearerSecret;\nconst isAuthorized = Boolean(configuredSecret) && Boolean(clientSecret) && clientSecret === configuredSecret;\n\nlet action = 'SERVE_HTML';\nif (body.action) {\n  action = body.action;\n} else if (query.action) {\n  action = query.action;\n}\n\nconst allowedActions = [\n  'SERVE_HTML',\n  'GET_APPOINTMENTS',\n  'CREATE_APPOINTMENT',\n  'UPDATE_STATUS',\n  'RESCHEDULE_APPOINTMENT',\n  'CANCEL_APPOINTMENT',\n  'SET_DOCTOR_LEAVE'\n];\n\nlet error = null;\n\n// Allow SERVE_HTML publicly so browser can load the interface and prompt for secret\nif (action === 'SERVE_HTML') {\n  // Safe to render SPA frontend\n} else if (!isAuthorized) {\n  action = 'UNAUTHORIZED';\n  error = 'Unauthorized: invalid or missing dashboard secret in headers';\n} else if (!allowedActions.includes(action)) {\n  action = 'INVALID_ACTION';\n  error = 'Invalid action requested';\n}\n\nreturn [{\n  json: {\n    action: action,\n    payload: body,\n    query: query,\n    error: error,\n    is_authorized: isAuthorized,\n    received_at: new Date().toISOString()\n  }\n}];\n"
       }
     },
     {
@@ -306,7 +306,8 @@
       ],
       "parameters": {
         "language": "javascript",
-        "jsCode": "const allInputs = $input.all();\nconst hasError = allInputs.some(i => i.json?.error || i.error);\n\nif (hasError) {\n  const errDetail = allInputs.find(i => i.json?.error || i.error)?.json?.error || 'Database query error';\n  return [{\n    json: {\n      success: false,\n      error: {\n        message: typeof errDetail === 'string' ? errDetail : (errDetail.message || 'Database query failed')\n      }\n    }\n  }];\n}\n\nconst items = allInputs.map(i => i.json).filter(j => j && j.appointment_id);\nconst total = items[0]?.total_count || items.length;\n\nreturn [{\n  json: {\n    success: true,\n    data: {\n      appointments: items,\n      total: total\n    }\n  }\n}];\n"
+        "jsCode": "\nconst allInputs = $input.all();\nconst hasError = allInputs.some(i => i.json?.error || i.error);\n\nif (hasError) {\n  const errDetail = allInputs.find(i => i.json?.error || i.error)?.json?.error || 'Database query error';\n  return [{\n    json: {\n      success: false,\n      error: {\n        message: typeof errDetail === 'string' ? errDetail : (errDetail.message || 'Database query failed')\n      }\n    }\n  }];\n}\n\nconst items = allInputs.map(i => i.json).filter(j => j && j.appointment_id);\nconst total = items[0]?.total_count || items.length;\n\nreturn [{\n  json: {\n    success: true,\n    data: {\n      appointments: items,\n      total: total\n    }\n  }\n}];\n",
+        "mode": "runOnceForAllItems"
       }
     },
     {
@@ -348,7 +349,7 @@
       ],
       "parameters": {
         "operation": "executeQuery",
-        "query": "\nSELECT \n  d.*,\n  COALESCE((\n    SELECT json_agg(u.*) \n    FROM doctor_unavailability u \n    WHERE u.doctor_id = d.doctor_id \n      AND u.end_time > NOW()\n  ), '[]'::json) AS unavailabilities,\n  COALESCE((\n    SELECT json_agg(a.*)\n    FROM appointments a\n    WHERE a.doctor_id = d.doctor_id \n      AND a.status IN ('PENDING', 'CONFIRMED', 'RESCHEDULED', 'ARRIVED', 'COMPLETED')\n      AND a.end_time > NOW()\n  ), '[]'::json) AS active_appointments\nFROM doctors d \nWHERE d.doctor_id = $1 AND d.is_active = TRUE;\n",
+        "query": "\nSELECT \n  d.*,\n  COALESCE((\n    SELECT json_agg(u.*) \n    FROM doctor_unavailability u \n    WHERE u.doctor_id = d.doctor_id \n      AND u.end_time > NOW()\n  ), '[]'::json) AS unavailabilities,\n  COALESCE((\n    SELECT json_agg(a.*)\n    FROM appointments a\n    WHERE a.doctor_id = d.doctor_id \n      AND (a.status IN ('CONFIRMED', 'RESCHEDULED', 'ARRIVED', 'COMPLETED') OR (a.status = 'PENDING' AND a.expires_at > NOW()))\n      AND a.end_time > NOW()\n  ), '[]'::json) AS active_appointments\nFROM doctors d \nWHERE d.doctor_id = $1 AND d.is_active = TRUE;\n",
         "queryParameters": "={{ [$('Prep_Manual_Create').item.json.doctor_id] }}"
       },
       "credentials": {
@@ -370,7 +371,7 @@
       ],
       "parameters": {
         "language": "javascript",
-        "jsCode": "\nfunction getUtcFromLocal(dateStr, timeStr, timeZone) {\n  const [yyyy, mm, dd] = dateStr.split('-').map(Number);\n  const [hh, min] = timeStr.split(':').map(Number);\n  const utcDate = new Date(Date.UTC(yyyy, mm - 1, dd, hh, min, 0));\n  const invDate = new Date(utcDate.toLocaleString('en-US', { timeZone: 'UTC' }));\n  const targetDate = new Date(utcDate.toLocaleString('en-US', { timeZone: timeZone }));\n  const diff = targetDate.getTime() - invDate.getTime();\n  return new Date(utcDate.getTime() - diff);\n}\n\nfunction getWeekdayFromDate(dateObj, timeZone) {\n  const dayStr = new Intl.DateTimeFormat('en-US', { timeZone, weekday: 'short' }).format(dateObj);\n  const map = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };\n  return map[dayStr];\n}\n\nfunction isValidDate(dateStr) {\n  if (!dateStr || typeof dateStr !== 'string') return false;\n  const match = dateStr.match(/^(\\d{4})-(\\d{2})-(\\d{2})$/);\n  if (!match) return false;\n  const [_, yStr, mStr, dStr] = match;\n  const y = Number(yStr), m = Number(mStr), d = Number(dStr);\n  if (m < 1 || m > 12 || d < 1 || d > 31) return false;\n  const testDate = new Date(Date.UTC(y, m - 1, d));\n  return testDate.getUTCFullYear() === y && testDate.getUTCMonth() === (m - 1) && testDate.getUTCDate() === d;\n}\n\nfunction isValidTime(timeStr) {\n  if (!timeStr || typeof timeStr !== 'string') return false;\n  return /^([01]\\d|2[0-3]):([0-5]\\d)$/.test(timeStr);\n}\n\nconst prev = $('Prep_Manual_Create').first().json;\nconst docData = $input.first()?.json;\n\nif (!docData || !docData.doctor_id) {\n  throw new Error(`Doctor '${prev.doctor_id}' not found or inactive.`);\n}\n\nconst tz = docData.timezone || 'Asia/Kolkata';\nconst durationMinutes = docData.slot_duration_minutes || 30;\n\n// Strict Date and Time validation\nif (!isValidDate(prev.date)) {\n  throw new Error(`Invalid date format '${prev.date}'. Expected YYYY-MM-DD.`);\n}\nif (!isValidTime(prev.time)) {\n  throw new Error(`Invalid time format '${prev.time}'. Expected HH:MM in 24h format (00:00 - 23:59).`);\n}\n\nconst startUtc = getUtcFromLocal(prev.date, prev.time, tz);\nconst endUtc = new Date(startUtc.getTime() + durationMinutes * 60000);\n\n// Validate Working Days (Timezone Safe)\nconst weekdayNum = getWeekdayFromDate(startUtc, tz);\nconst workingDays = docData.working_days || [1, 2, 3, 4, 5, 6];\nif (!workingDays.includes(weekdayNum)) {\n  throw new Error(`Doctor '${docData.doctor_name}' does not work on this day of the week.`);\n}\n\n// Validate Working Hours\nconst wh = docData.working_hours || { start: \"09:00\", end: \"17:00\" };\nconst [startH, startM] = wh.start.split(':').map(Number);\nconst [endH, endM] = wh.end.split(':').map(Number);\nconst [reqH, reqM] = prev.time.split(':').map(Number);\nconst reqMinutes = reqH * 60 + reqM;\nconst workStartMin = startH * 60 + startM;\nconst workEndMin = endH * 60 + endM;\n\nif (reqMinutes < workStartMin || reqMinutes + durationMinutes > workEndMin) {\n  throw new Error(`Requested time ${prev.time} is outside doctor working hours (${wh.start} - ${wh.end}).`);\n}\n\n// Check Doctor Leave / Unavailability\nconst unavailabilities = Array.isArray(docData.unavailabilities) ? docData.unavailabilities : (typeof docData.unavailabilities === 'string' ? JSON.parse(docData.unavailabilities) : []);\nfor (const u of unavailabilities) {\n  const uStart = new Date(u.start_time);\n  const uEnd = new Date(u.end_time);\n  if (startUtc < uEnd && endUtc > uStart) {\n    throw new Error(`Doctor is unavailable at this time: ${u.reason || 'On Leave'}`);\n  }\n}\n\n// Check Existing Confirmed/Pending Appointments\nconst activeAppts = Array.isArray(docData.active_appointments) ? docData.active_appointments : (typeof docData.active_appointments === 'string' ? JSON.parse(docData.active_appointments) : []);\nfor (const a of activeAppts) {\n  const aStart = new Date(a.start_time);\n  const aEnd = new Date(a.end_time);\n  if (startUtc < aEnd && endUtc > aStart) {\n    throw new Error(`Time slot overlaps with existing appointment #${a.appointment_id} (${a.customer_name})`);\n  }\n}\n\nreturn [{\n  json: {\n    ...prev,\n    doctor_name: docData.doctor_name,\n    calendar_id: docData.calendar_id,\n    timezone: tz,\n    slot_duration_minutes: durationMinutes,\n    start_time_iso: startUtc.toISOString(),\n    end_time_iso: endUtc.toISOString()\n  }\n}];\n"
+        "jsCode": "\nfunction getUtcFromLocal(dateStr, timeStr, timeZone) {\n  const [yyyy, mm, dd] = dateStr.split('-').map(Number);\n  const [hh, min] = timeStr.split(':').map(Number);\n  const utcDate = new Date(Date.UTC(yyyy, mm - 1, dd, hh, min, 0));\n  const invDate = new Date(utcDate.toLocaleString('en-US', { timeZone: 'UTC' }));\n  const targetDate = new Date(utcDate.toLocaleString('en-US', { timeZone: timeZone }));\n  const diff = targetDate.getTime() - invDate.getTime();\n  return new Date(utcDate.getTime() - diff);\n}\n\nfunction getWeekdayFromDate(dateObj, timeZone) {\n  const dayStr = new Intl.DateTimeFormat('en-US', { timeZone, weekday: 'short' }).format(dateObj);\n  const map = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };\n  return map[dayStr];\n}\n\nfunction isValidDate(dateStr) {\n  if (!dateStr || typeof dateStr !== 'string') return false;\n  const match = dateStr.match(/^(\\d{4})-(\\d{2})-(\\d{2})$/);\n  if (!match) return false;\n  const [_, yStr, mStr, dStr] = match;\n  const y = Number(yStr), m = Number(mStr), d = Number(dStr);\n  if (m < 1 || m > 12 || d < 1 || d > 31) return false;\n  const testDate = new Date(Date.UTC(y, m - 1, d));\n  return testDate.getUTCFullYear() === y && testDate.getUTCMonth() === (m - 1) && testDate.getUTCDate() === d;\n}\n\nfunction isValidTime(timeStr) {\n  if (!timeStr || typeof timeStr !== 'string') return false;\n  return /^([01]\\d|2[0-3]):([0-5]\\d)$/.test(timeStr);\n}\n\nconst prev = $('Prep_Manual_Create').first().json;\nconst docData = $input.first()?.json;\n\nif (!docData || !docData.doctor_id) {\n  return [{\n    json: {\n      error: `Doctor '${prev.doctor_id}' not found or inactive.`,\n      manual_booking_failed: true\n    }\n  }];\n}\n\nconst tz = docData.timezone || 'Asia/Kolkata';\nconst durationMinutes = docData.slot_duration_minutes || 30;\nconst bufferMin = docData.buffer_minutes || 0;\n\nif (!isValidDate(prev.date)) {\n  return [{ json: { error: `Invalid date format '${prev.date}'. Expected YYYY-MM-DD.`, manual_booking_failed: true } }];\n}\nif (!isValidTime(prev.time)) {\n  return [{ json: { error: `Invalid time format '${prev.time}'. Expected HH:MM in 24h format (00:00 - 23:59).`, manual_booking_failed: true } }];\n}\n\nconst startUtc = getUtcFromLocal(prev.date, prev.time, tz);\nconst endUtc = new Date(startUtc.getTime() + durationMinutes * 60000);\n\n// Validate Working Days\nconst weekdayNum = getWeekdayFromDate(startUtc, tz);\nconst workingDays = docData.working_days || [1, 2, 3, 4, 5, 6];\nif (!workingDays.includes(weekdayNum)) {\n  return [{ json: { error: `Doctor '${docData.doctor_name}' does not work on this day of the week.`, manual_booking_failed: true } }];\n}\n\n// Validate Working Hours\nconst wh = docData.working_hours || { start: \"09:00\", end: \"17:00\" };\nconst [startH, startM] = wh.start.split(':').map(Number);\nconst [endH, endM] = wh.end.split(':').map(Number);\nconst [reqH, reqM] = prev.time.split(':').map(Number);\nconst reqMinutes = reqH * 60 + reqM;\nconst workStartMin = startH * 60 + startM;\nconst workEndMin = endH * 60 + endM;\n\nif (reqMinutes < workStartMin || reqMinutes + durationMinutes > workEndMin) {\n  return [{ json: { error: `Requested time ${prev.time} is outside doctor working hours (${wh.start} - ${wh.end}).`, manual_booking_failed: true } }];\n}\n\n// Check Doctor Leave / Unavailability\nconst unavailabilities = Array.isArray(docData.unavailabilities) ? docData.unavailabilities : (typeof docData.unavailabilities === 'string' ? JSON.parse(docData.unavailabilities) : []);\nfor (const u of unavailabilities) {\n  const uStart = new Date(u.start_time);\n  const uEnd = new Date(u.end_time);\n  if (startUtc < uEnd && endUtc > uStart) {\n    return [{ json: { error: `Doctor is unavailable at this time: ${u.reason || 'On Leave'}`, manual_booking_failed: true } }];\n  }\n}\n\n// Check Existing Active Appointments with Buffer\nconst activeAppts = Array.isArray(docData.active_appointments) ? docData.active_appointments : (typeof docData.active_appointments === 'string' ? JSON.parse(docData.active_appointments) : []);\nfor (const a of activeAppts) {\n  const aStart = new Date(a.start_time);\n  const aEnd = new Date(a.end_time);\n  const aStartBuffered = new Date(aStart.getTime() - bufferMin * 60000);\n  const aEndBuffered = new Date(aEnd.getTime() + bufferMin * 60000);\n  if (startUtc < aEndBuffered && endUtc > aStartBuffered) {\n    return [{ json: { error: `Time slot overlaps with existing appointment #${a.appointment_id} (${a.customer_name}) or buffer window.`, manual_booking_failed: true } }];\n  }\n}\n\nreturn [{\n  json: {\n    ...prev,\n    doctor_name: docData.doctor_name,\n    calendar_id: docData.calendar_id,\n    timezone: tz,\n    slot_duration_minutes: durationMinutes,\n    buffer_minutes: bufferMin,\n    start_time_iso: startUtc.toISOString(),\n    end_time_iso: endUtc.toISOString(),\n    manual_booking_failed: false\n  }\n}];\n"
       }
     },
     {
@@ -448,7 +449,7 @@
       ],
       "parameters": {
         "operation": "executeQuery",
-        "query": "\n    UPDATE appointments\n    SET status = $1, updated_at = NOW()\n    WHERE appointment_id = $2\n      AND (\n        ($1 = 'ARRIVED' AND status = 'CONFIRMED')\n        OR ($1 = 'COMPLETED' AND status IN ('ARRIVED', 'CONFIRMED'))\n        OR ($1 = 'NO_SHOW' AND status = 'CONFIRMED')\n        OR ($1 = 'CANCELLED' AND status IN ('PENDING', 'CONFIRMED'))\n      )\n    RETURNING *;\n    ",
+        "query": "\nUPDATE appointments\nSET status = $1, updated_at = NOW()\nWHERE appointment_id = $2\n  AND (\n    ($1 = 'ARRIVED' AND status = 'CONFIRMED')\n    OR ($1 = 'COMPLETED' AND status IN ('ARRIVED', 'CONFIRMED'))\n    OR ($1 = 'NO_SHOW' AND status = 'CONFIRMED')\n  )\nRETURNING *;\n",
         "queryParameters": "={{ [$json.payload.status, $json.payload.appointment_id] }}"
       },
       "credentials": {
@@ -483,7 +484,7 @@
       ],
       "parameters": {
         "operation": "executeQuery",
-        "query": "\nSELECT \n  a.*, \n  d.doctor_name, d.calendar_id, d.timezone, d.slot_duration_minutes, d.buffer_minutes, d.working_hours, d.working_days,\n  COALESCE((\n    SELECT json_agg(u.*)\n    FROM doctor_unavailability u\n    WHERE u.doctor_id = d.doctor_id\n      AND u.end_time > NOW()\n  ), '[]'::json) AS unavailabilities,\n  COALESCE((\n    SELECT json_agg(other_a.*)\n    FROM appointments other_a\n    WHERE other_a.doctor_id = d.doctor_id\n      AND other_a.appointment_id != a.appointment_id\n      AND other_a.status IN ('PENDING', 'CONFIRMED', 'RESCHEDULED', 'ARRIVED', 'COMPLETED')\n      AND other_a.end_time > NOW()\n  ), '[]'::json) AS active_appointments\nFROM appointments a\nJOIN doctors d ON a.doctor_id = d.doctor_id\nWHERE a.appointment_id = $1 AND a.status = 'CONFIRMED';\n",
+        "query": "\nSELECT \n  a.*, \n  d.doctor_name, d.calendar_id, d.timezone, d.slot_duration_minutes, d.buffer_minutes, d.working_hours, d.working_days,\n  COALESCE((\n    SELECT json_agg(u.*)\n    FROM doctor_unavailability u\n    WHERE u.doctor_id = d.doctor_id\n      AND u.end_time > NOW()\n  ), '[]'::json) AS unavailabilities,\n  COALESCE((\n    SELECT json_agg(other_a.*)\n    FROM appointments other_a\n    WHERE other_a.doctor_id = d.doctor_id\n      AND other_a.appointment_id != a.appointment_id\n      AND (other_a.status IN ('CONFIRMED', 'RESCHEDULED', 'ARRIVED', 'COMPLETED') OR (other_a.status = 'PENDING' AND other_a.expires_at > NOW()))\n      AND other_a.end_time > NOW()\n  ), '[]'::json) AS active_appointments\nFROM appointments a\nJOIN doctors d ON a.doctor_id = d.doctor_id\nWHERE a.appointment_id = $1 AND a.status = 'CONFIRMED';\n",
         "queryParameters": "={{ [$json.payload.appointment_id] }}"
       },
       "credentials": {
@@ -505,7 +506,7 @@
       ],
       "parameters": {
         "language": "javascript",
-        "jsCode": "\nfunction getUtcFromLocal(dateStr, timeStr, timeZone) {\n  const [yyyy, mm, dd] = dateStr.split('-').map(Number);\n  const [hh, min] = timeStr.split(':').map(Number);\n  const utcDate = new Date(Date.UTC(yyyy, mm - 1, dd, hh, min, 0));\n  const invDate = new Date(utcDate.toLocaleString('en-US', { timeZone: 'UTC' }));\n  const targetDate = new Date(utcDate.toLocaleString('en-US', { timeZone: timeZone }));\n  const diff = targetDate.getTime() - invDate.getTime();\n  return new Date(utcDate.getTime() - diff);\n}\n\nfunction getWeekdayFromDate(dateObj, timeZone) {\n  const dayStr = new Intl.DateTimeFormat('en-US', { timeZone, weekday: 'short' }).format(dateObj);\n  const map = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };\n  return map[dayStr];\n}\n\nfunction isValidDate(dateStr) {\n  if (!dateStr || typeof dateStr !== 'string') return false;\n  const match = dateStr.match(/^(\\d{4})-(\\d{2})-(\\d{2})$/);\n  if (!match) return false;\n  const [_, yStr, mStr, dStr] = match;\n  const y = Number(yStr), m = Number(mStr), d = Number(dStr);\n  if (m < 1 || m > 12 || d < 1 || d > 31) return false;\n  const testDate = new Date(Date.UTC(y, m - 1, d));\n  return testDate.getUTCFullYear() === y && testDate.getUTCMonth() === (m - 1) && testDate.getUTCDate() === d;\n}\n\nfunction isValidTime(timeStr) {\n  if (!timeStr || typeof timeStr !== 'string') return false;\n  return /^([01]\\d|2[0-3]):([0-5]\\d)$/.test(timeStr);\n}\n\nconst appt = $input.first()?.json;\nconst payload = $('Parse_Dashboard_Request').first().json.payload || {};\n\nif (!appt || !appt.appointment_id) {\n  throw new Error('Appointment not found or not in CONFIRMED state.');\n}\n\nif (!isValidDate(payload.date)) {\n  throw new Error(`Invalid reschedule date '${payload.date}'. Expected YYYY-MM-DD.`);\n}\nif (!isValidTime(payload.time)) {\n  throw new Error(`Invalid reschedule time '${payload.time}'. Expected HH:MM in 24h format (00:00 - 23:59).`);\n}\n\nconst tz = appt.timezone || 'Asia/Kolkata';\nconst durationMinutes = appt.slot_duration_minutes || 30;\nconst startUtc = getUtcFromLocal(payload.date, payload.time, tz);\nconst endUtc = new Date(startUtc.getTime() + durationMinutes * 60000);\n\n// Validate Working Days (Timezone Safe)\nconst weekdayNum = getWeekdayFromDate(startUtc, tz);\nconst workingDays = appt.working_days || [1, 2, 3, 4, 5, 6];\nif (!workingDays.includes(weekdayNum)) {\n  throw new Error(`Doctor '${appt.doctor_name}' does not work on this day.`);\n}\n\n// Validate Working Hours\nconst wh = appt.working_hours || { start: \"09:00\", end: \"17:00\" };\nconst [startH, startM] = wh.start.split(':').map(Number);\nconst [endH, endM] = wh.end.split(':').map(Number);\nconst [reqH, reqM] = payload.time.split(':').map(Number);\nconst reqMinutes = reqH * 60 + reqM;\nconst workStartMin = startH * 60 + startM;\nconst workEndMin = endH * 60 + endM;\n\nif (reqMinutes < workStartMin || reqMinutes + durationMinutes > workEndMin) {\n  throw new Error(`Requested reschedule time ${payload.time} is outside doctor working hours (${wh.start} - ${wh.end}).`);\n}\n\n// Validate Doctor Leave / Unavailability\nconst unavailabilities = Array.isArray(appt.unavailabilities) ? appt.unavailabilities : (typeof appt.unavailabilities === 'string' ? JSON.parse(appt.unavailabilities) : []);\nfor (const u of unavailabilities) {\n  const uStart = new Date(u.start_time);\n  const uEnd = new Date(u.end_time);\n  if (startUtc < uEnd && endUtc > uStart) {\n    throw new Error(`Doctor is on leave during requested time: ${u.reason || 'Unavailable'}`);\n  }\n}\n\n// Validate against other active appointments (excluding self)\nconst activeAppts = Array.isArray(appt.active_appointments) ? appt.active_appointments : (typeof appt.active_appointments === 'string' ? JSON.parse(appt.active_appointments) : []);\nfor (const a of activeAppts) {\n  const aStart = new Date(a.start_time);\n  const aEnd = new Date(a.end_time);\n  if (startUtc < aEnd && endUtc > aStart) {\n    throw new Error(`Reschedule slot conflicts with appointment #${a.appointment_id} (${a.customer_name})`);\n  }\n}\n\nreturn [{\n  json: {\n    appointment_id: appt.appointment_id,\n    calendar_id: appt.calendar_id,\n    calendar_event_id: appt.calendar_event_id,\n    slot_duration_minutes: durationMinutes,\n    start_time_iso: startUtc.toISOString(),\n    end_time_iso: endUtc.toISOString()\n  }\n}];\n"
+        "jsCode": "\nfunction getUtcFromLocal(dateStr, timeStr, timeZone) {\n  const [yyyy, mm, dd] = dateStr.split('-').map(Number);\n  const [hh, min] = timeStr.split(':').map(Number);\n  const utcDate = new Date(Date.UTC(yyyy, mm - 1, dd, hh, min, 0));\n  const invDate = new Date(utcDate.toLocaleString('en-US', { timeZone: 'UTC' }));\n  const targetDate = new Date(utcDate.toLocaleString('en-US', { timeZone: timeZone }));\n  const diff = targetDate.getTime() - invDate.getTime();\n  return new Date(utcDate.getTime() - diff);\n}\n\nfunction getWeekdayFromDate(dateObj, timeZone) {\n  const dayStr = new Intl.DateTimeFormat('en-US', { timeZone, weekday: 'short' }).format(dateObj);\n  const map = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };\n  return map[dayStr];\n}\n\nfunction isValidDate(dateStr) {\n  if (!dateStr || typeof dateStr !== 'string') return false;\n  const match = dateStr.match(/^(\\d{4})-(\\d{2})-(\\d{2})$/);\n  if (!match) return false;\n  const [_, yStr, mStr, dStr] = match;\n  const y = Number(yStr), m = Number(mStr), d = Number(dStr);\n  if (m < 1 || m > 12 || d < 1 || d > 31) return false;\n  const testDate = new Date(Date.UTC(y, m - 1, d));\n  return testDate.getUTCFullYear() === y && testDate.getUTCMonth() === (m - 1) && testDate.getUTCDate() === d;\n}\n\nfunction isValidTime(timeStr) {\n  if (!timeStr || typeof timeStr !== 'string') return false;\n  return /^([01]\\d|2[0-3]):([0-5]\\d)$/.test(timeStr);\n}\n\nconst appt = $input.first()?.json;\nconst payload = $('Parse_Dashboard_Request').first().json.payload || {};\n\nif (!appt || !appt.appointment_id) {\n  return [{ json: { error: 'Appointment not found or not in CONFIRMED state.', resched_failed: true } }];\n}\n\nif (!isValidDate(payload.date)) {\n  return [{ json: { error: `Invalid reschedule date '${payload.date}'. Expected YYYY-MM-DD.`, resched_failed: true } }];\n}\nif (!isValidTime(payload.time)) {\n  return [{ json: { error: `Invalid reschedule time '${payload.time}'. Expected HH:MM in 24h format (00:00 - 23:59).`, resched_failed: true } }];\n}\n\nconst tz = appt.timezone || 'Asia/Kolkata';\nconst durationMinutes = appt.slot_duration_minutes || 30;\nconst bufferMin = appt.buffer_minutes || 0;\nconst startUtc = getUtcFromLocal(payload.date, payload.time, tz);\nconst endUtc = new Date(startUtc.getTime() + durationMinutes * 60000);\n\n// Validate Working Days\nconst weekdayNum = getWeekdayFromDate(startUtc, tz);\nconst workingDays = appt.working_days || [1, 2, 3, 4, 5, 6];\nif (!workingDays.includes(weekdayNum)) {\n  return [{ json: { error: `Doctor '${appt.doctor_name}' does not work on this day.`, resched_failed: true } }];\n}\n\n// Validate Working Hours\nconst wh = appt.working_hours || { start: \"09:00\", end: \"17:00\" };\nconst [startH, startM] = wh.start.split(':').map(Number);\nconst [endH, endM] = wh.end.split(':').map(Number);\nconst [reqH, reqM] = payload.time.split(':').map(Number);\nconst reqMinutes = reqH * 60 + reqM;\nconst workStartMin = startH * 60 + startM;\nconst workEndMin = endH * 60 + endM;\n\nif (reqMinutes < workStartMin || reqMinutes + durationMinutes > workEndMin) {\n  return [{ json: { error: `Requested reschedule time ${payload.time} is outside doctor working hours (${wh.start} - ${wh.end}).`, resched_failed: true } }];\n}\n\n// Validate Doctor Leave\nconst unavailabilities = Array.isArray(appt.unavailabilities) ? appt.unavailabilities : (typeof appt.unavailabilities === 'string' ? JSON.parse(appt.unavailabilities) : []);\nfor (const u of unavailabilities) {\n  const uStart = new Date(u.start_time);\n  const uEnd = new Date(u.end_time);\n  if (startUtc < uEnd && endUtc > uStart) {\n    return [{ json: { error: `Doctor is on leave during requested time: ${u.reason || 'Unavailable'}`, resched_failed: true } }];\n  }\n}\n\n// Validate against other active appointments (excluding self) with buffer\nconst activeAppts = Array.isArray(appt.active_appointments) ? appt.active_appointments : (typeof appt.active_appointments === 'string' ? JSON.parse(appt.active_appointments) : []);\nfor (const a of activeAppts) {\n  const aStart = new Date(a.start_time);\n  const aEnd = new Date(a.end_time);\n  const aStartBuffered = new Date(aStart.getTime() - bufferMin * 60000);\n  const aEndBuffered = new Date(aEnd.getTime() + bufferMin * 60000);\n  if (startUtc < aEndBuffered && endUtc > aStartBuffered) {\n    return [{ json: { error: `Reschedule slot conflicts with appointment #${a.appointment_id} (${a.customer_name}) or buffer window.`, resched_failed: true } }];\n  }\n}\n\nreturn [{\n  json: {\n    appointment_id: appt.appointment_id,\n    customer_name: appt.customer_name,\n    doctor_id: appt.doctor_id,\n    calendar_id: appt.calendar_id,\n    calendar_event_id: appt.calendar_event_id,\n    slot_duration_minutes: durationMinutes,\n    old_start_iso: appt.start_time,\n    old_end_iso: appt.end_time,\n    start_time_iso: startUtc.toISOString(),\n    end_time_iso: endUtc.toISOString(),\n    resched_failed: false\n  }\n}];\n"
       }
     },
     {
@@ -554,7 +555,8 @@
           "id": "postgres_credentials_id",
           "name": "PostgreSQL Account"
         }
-      }
+      },
+      "continueOnFail": true
     },
     {
       "id": "edc7cde6-da7b-4198-950a-20c14e6e92f1",
@@ -629,7 +631,7 @@
       ],
       "parameters": {
         "operation": "executeQuery",
-        "query": "\n    UPDATE appointments\n    SET status = 'CANCELLED',\n        updated_at = NOW(),\n        reminder_3d_sent = TRUE,\n        reminder_1d_sent = TRUE,\n        reminder_4h_sent = TRUE,\n        reminder_1h_sent = TRUE\n    WHERE appointment_id = \n      AND status IN ('PENDING', 'CONFIRMED', 'RESCHEDULED')\n    RETURNING *;\n    ",
+        "query": "\nUPDATE appointments\nSET status = 'CANCELLED',\n    updated_at = NOW(),\n    reminder_3d_sent = TRUE,\n    reminder_1d_sent = TRUE,\n    reminder_4h_sent = TRUE,\n    reminder_1h_sent = TRUE\nWHERE appointment_id = $1\n  AND status IN ('PENDING', 'CONFIRMED', 'RESCHEDULED')\nRETURNING *;\n",
         "queryParameters": "={{ [$('Postgres_Fetch_Appt_For_Cancel').item.json.appointment_id] }}"
       },
       "credentials": {
@@ -794,6 +796,81 @@
         2300,
         420
       ]
+    },
+    {
+      "id": "w3-rollback-dashboard-resched",
+      "name": "GCal_Rollback_Dashboard_Resched",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1.2,
+      "position": [
+        1350,
+        480
+      ],
+      "parameters": {
+        "operation": "update",
+        "calendar": {
+          "__rl": true,
+          "value": "={{ $('Prep_Dashboard_Reschedule').item.json.calendar_id }}",
+          "mode": "id"
+        },
+        "eventId": "={{ $('Prep_Dashboard_Reschedule').item.json.calendar_event_id }}",
+        "start": "={{ $('Prep_Dashboard_Reschedule').item.json.old_start_iso }}",
+        "end": "={{ $('Prep_Dashboard_Reschedule').item.json.old_end_iso }}"
+      },
+      "credentials": {
+        "googleCalendarOAuth2": {
+          "id": "google_calendar_credentials",
+          "name": "Google Calendar account"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "id": "w3-if-resched-db-success",
+      "name": "If_Dashboard_Resched_Success",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1200,
+        420
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ Boolean($json.appointment_id && $json.status === 'CONFIRMED') }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "w3-respond-resched-failed",
+      "name": "Respond_Dashboard_Resched_Failed_JSON",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1500,
+        480
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ success: false, error: 'Database update failed. Calendar event has been rolled back.' }) }}",
+        "options": {
+          "responseCode": 500
+        }
+      }
     }
   ],
   "connections": {
@@ -1033,7 +1110,7 @@
       "main": [
         [
           {
-            "node": "Respond_Dashboard_Resched_JSON",
+            "node": "If_Dashboard_Resched_Success",
             "type": "main",
             "index": 0
           }
@@ -1107,6 +1184,35 @@
         [
           {
             "node": "Respond_Manual_Create_Failed_JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If_Dashboard_Resched_Success": {
+      "main": [
+        [
+          {
+            "node": "Respond_Dashboard_Resched_JSON",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "GCal_Rollback_Dashboard_Resched",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GCal_Rollback_Dashboard_Resched": {
+      "main": [
+        [
+          {
+            "node": "Respond_Dashboard_Resched_Failed_JSON",
             "type": "main",
             "index": 0
           }
