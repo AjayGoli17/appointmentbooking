@@ -45,11 +45,27 @@ CREATE TABLE IF NOT EXISTS appointments (
     ) WHERE (status IN ('PENDING', 'CONFIRMED', 'RESCHEDULED', 'ARRIVED', 'COMPLETED'))
 );
 
+-- Hardened idempotent exclusion-constraint migration (Bug #4)
 DO $$
+DECLARE
+    curr_def TEXT;
 BEGIN
-    IF NOT EXISTS (
-        SELECT 1 FROM pg_constraint WHERE conname = 'no_overlapping_appointments'
-    ) THEN
+    SELECT pg_get_constraintdef(c.oid) INTO curr_def
+    FROM pg_constraint c
+    JOIN pg_class t ON c.conrelid = t.oid
+    WHERE t.relname = 'appointments' AND c.conname = 'no_overlapping_appointments';
+
+    IF curr_def IS NOT NULL THEN
+        -- Revalidate definition contains all 5 required statuses and gist range
+        IF curr_def NOT LIKE '%PENDING%' OR curr_def NOT LIKE '%CONFIRMED%' OR curr_def NOT LIKE '%RESCHEDULED%' OR curr_def NOT LIKE '%ARRIVED%' OR curr_def NOT LIKE '%COMPLETED%' THEN
+            ALTER TABLE appointments DROP CONSTRAINT no_overlapping_appointments;
+            ALTER TABLE appointments ADD CONSTRAINT no_overlapping_appointments
+            EXCLUDE USING gist (
+                doctor_id WITH =,
+                tstzrange(start_time, end_time) WITH &&
+            ) WHERE (status IN ('PENDING', 'CONFIRMED', 'RESCHEDULED', 'ARRIVED', 'COMPLETED'));
+        END IF;
+    ELSE
         ALTER TABLE appointments ADD CONSTRAINT no_overlapping_appointments
         EXCLUDE USING gist (
             doctor_id WITH =,
