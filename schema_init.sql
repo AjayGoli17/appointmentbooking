@@ -37,9 +37,25 @@ CREATE TABLE IF NOT EXISTS appointments (
     reminder_3d_claimed_at TIMESTAMP WITH TIME ZONE,
     reminder_1d_claimed_at TIMESTAMP WITH TIME ZONE,
     reminder_4h_claimed_at TIMESTAMP WITH TIME ZONE,
-    reminder_1h_claimed_at TIMESTAMP WITH TIME ZONE,
-    CONSTRAINT chk_start_end CHECK (start_time < end_time)
+    CONSTRAINT chk_start_end CHECK (start_time < end_time),
+    CONSTRAINT no_overlapping_confirmed_appointments EXCLUDE USING gist (
+        doctor_id WITH =,
+        tstzrange(start_time, end_time) WITH &&
+    ) WHERE (status IN ('CONFIRMED', 'RESCHEDULED', 'ARRIVED', 'COMPLETED'))
 );
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'no_overlapping_confirmed_appointments'
+    ) THEN
+        ALTER TABLE appointments ADD CONSTRAINT no_overlapping_confirmed_appointments
+        EXCLUDE USING gist (
+            doctor_id WITH =,
+            tstzrange(start_time, end_time) WITH &&
+        ) WHERE (status IN ('CONFIRMED', 'RESCHEDULED', 'ARRIVED', 'COMPLETED'));
+    END IF;
+END $$;
 
 CREATE TABLE IF NOT EXISTS doctor_unavailability (
     id SERIAL PRIMARY KEY,
