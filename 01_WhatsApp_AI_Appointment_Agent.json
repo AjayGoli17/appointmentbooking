@@ -47,7 +47,9 @@
         "httpMethod": "POST",
         "path": "whatsapp-webhook",
         "responseMode": "responseNode",
-        "options": {}
+        "options": {
+          "rawBody": true
+        }
       },
       "notesInFlow": true,
       "notes": "WhatsApp Inbound Webhook endpoint (/webhook/whatsapp-webhook)"
@@ -63,7 +65,7 @@
       ],
       "parameters": {
         "language": "javascript",
-        "jsCode": "\nconst crypto = require('crypto');\nconst inputItem = $input.first()?.json || {};\nconst headers = inputItem.headers || {};\nconst query = inputItem.query || {};\nconst body = inputItem.body || {};\n\n// 1. Meta Webhook GET Challenge Verification\nif (query['hub.mode'] === 'subscribe' && query['hub.challenge']) {\n  const configuredVerifyToken = $env.META_VERIFY_TOKEN || '';\n  const providedToken = query['hub.verify_token'] || '';\n  \n  let isVerifyValid = false;\n  if (configuredVerifyToken && providedToken) {\n    const bufA = Buffer.from(configuredVerifyToken, 'utf8');\n    const bufB = Buffer.from(providedToken, 'utf8');\n    if (bufA.length === bufB.length && crypto.timingSafeEqual(bufA, bufB)) {\n      isVerifyValid = true;\n    }\n  }\n  \n  if (isVerifyValid) {\n    return [{\n      json: {\n        is_verification: true,\n        verification_passed: true,\n        challenge: query['hub.challenge']\n      }\n    }];\n  } else {\n    return [{\n      json: {\n        is_verification: true,\n        verification_passed: false,\n        error: 'Invalid or unconfigured verification token'\n      }\n    }];\n  }\n}\n\n// 2. Meta Webhook HMAC-SHA256 Signature Verification (FAIL-CLOSED)\nconst appSecret = $env.META_APP_SECRET || '';\nconst signatureHeader = headers['x-hub-signature-256'] || headers['X-Hub-Signature-256'] || '';\nlet isSignatureValid = false;\n\nif (appSecret && signatureHeader) {\n  try {\n    const rawPayload = inputItem.rawBody || (typeof body === 'string' ? body : JSON.stringify(body));\n    const expectedSig = 'sha256=' + crypto.createHmac('sha256', appSecret).update(rawPayload).digest('hex');\n    const sigBuffer = Buffer.from(signatureHeader, 'utf8');\n    const expectedBuffer = Buffer.from(expectedSig, 'utf8');\n    if (sigBuffer.length === expectedBuffer.length && crypto.timingSafeEqual(sigBuffer, expectedBuffer)) {\n      isSignatureValid = true;\n    }\n  } catch (e) {\n    isSignatureValid = false;\n  }\n} else if (!appSecret) {\n  // If META_APP_SECRET is not configured in production, fail-closed\n  isSignatureValid = false;\n}\n\nif (!isSignatureValid) {\n  return [{\n    json: {\n      is_signature_invalid: true,\n      error: 'Invalid or missing HMAC-SHA256 signature'\n    }\n  }];\n}\n\n// 3. Inbound Payload Normalization & Status Event Filtering\nlet entry = (body.entry && body.entry[0]) || {};\nlet change = (entry.changes && entry.changes[0]) || {};\nlet val = change.value || {};\n\n// Ignore delivery/read status updates immediately\nif (val.statuses && Array.isArray(val.statuses) && val.statuses.length > 0) {\n  return [{\n    json: {\n      is_status_callback: true,\n      status_detail: val.statuses[0]?.status,\n      message_id: val.statuses[0]?.id\n    }\n  }];\n}\n\nconst rawMessages = (val.messages && Array.isArray(val.messages)) ? val.messages : [];\nif (rawMessages.length === 0 && !body.From && !body.phone && !body.message) {\n  return [{\n    json: {\n      is_status_callback: true,\n      reason: 'No message content in webhook payload'\n    }\n  }];\n}\n\n// Support Meta WhatsApp Cloud API & Twilio formats\nconst results = [];\nconst contact = (val.contacts && val.contacts[0]) || {};\nconst defaultCustomerName = contact.profile?.name || body.ProfileName || body.name || body.customer_name || 'Valued Patient';\n\nconst messagesToProcess = rawMessages.length > 0 ? rawMessages : [body];\n\nfor (const msgObj of messagesToProcess) {\n  let rawPhone = '';\n  let customerName = defaultCustomerName;\n  let message = '';\n  let channel = 'whatsapp_cloud';\n  let messageId = msgObj.id || body.MessageSid || ('wamid_mock_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6));\n\n  if (msgObj.from) {\n    rawPhone = msgObj.from;\n    message = msgObj.text?.body || msgObj.button?.text || msgObj.interactive?.button_reply?.title || msgObj.interactive?.list_reply?.title || '';\n  } else if (body.From) {\n    rawPhone = (body.From || '').replace('whatsapp:', '').trim();\n    message = body.Body || '';\n    channel = 'twilio';\n  } else {\n    rawPhone = String(body.phone || body.from || body.sender || '').trim();\n    message = body.message || body.text || body.body || '';\n  }\n\n  // Canonical phone normalization (+91 default for 10-digit Indian numbers)\n  let cleanPhone = String(rawPhone || '').replace(/[^0-9]/g, '');\n  if (cleanPhone.length === 10) {\n    cleanPhone = '91' + cleanPhone;\n  }\n\n  const correlationId = 'corr_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6);\n\n  results.push({\n    json: {\n      is_verification: false,\n      is_status_callback: false,\n      is_signature_invalid: false,\n      message_id: messageId,\n      correlation_id: correlationId,\n      phone: cleanPhone,\n      customer_name: customerName,\n      message: (message || '').trim(),\n      channel: channel,\n      received_at: new Date().toISOString()\n    }\n  });\n}\n\nreturn results;\n",
+        "jsCode": "\nconst crypto = require('crypto');\nconst inputItem = $input.first()?.json || {};\nconst headers = inputItem.headers || {};\nconst query = inputItem.query || {};\nconst body = inputItem.body || {};\n\n// 1. Meta Webhook GET Challenge Verification (Issue 3)\nif (query['hub.mode'] === 'subscribe' && query['hub.challenge']) {\n  const configuredVerifyToken = $env.META_VERIFY_TOKEN || '';\n  const providedToken = query['hub.verify_token'] || '';\n  \n  let isVerifyValid = false;\n  if (configuredVerifyToken && providedToken) {\n    const bufA = Buffer.from(configuredVerifyToken, 'utf8');\n    const bufB = Buffer.from(providedToken, 'utf8');\n    if (bufA.length === bufB.length && crypto.timingSafeEqual(bufA, bufB)) {\n      isVerifyValid = true;\n    }\n  }\n  \n  if (isVerifyValid) {\n    return [{\n      json: {\n        is_verification: true,\n        verification_passed: true,\n        challenge: query['hub.challenge']\n      }\n    }];\n  } else {\n    return [{\n      json: {\n        is_verification: true,\n        verification_passed: false,\n        error: 'Invalid or unconfigured verification token'\n      }\n    }];\n  }\n}\n\n// 2. Meta Webhook HMAC-SHA256 Signature Verification (Fail-Closed, Issues 1 & 2)\nconst appSecret = $env.META_APP_SECRET || '';\nconst signatureHeader = headers['x-hub-signature-256'] || headers['X-Hub-Signature-256'] || '';\nlet isSignatureValid = false;\n\nif (appSecret && signatureHeader) {\n  try {\n    const rawPayload = inputItem.rawBody || (typeof body === 'string' ? body : JSON.stringify(body));\n    const expectedSig = 'sha256=' + crypto.createHmac('sha256', appSecret).update(rawPayload).digest('hex');\n    const sigBuffer = Buffer.from(signatureHeader, 'utf8');\n    const expectedBuffer = Buffer.from(expectedSig, 'utf8');\n    if (sigBuffer.length === expectedBuffer.length && crypto.timingSafeEqual(sigBuffer, expectedBuffer)) {\n      isSignatureValid = true;\n    }\n  } catch (e) {\n    isSignatureValid = false;\n  }\n} else {\n  // Fail-closed when secret or signature header is missing\n  isSignatureValid = false;\n}\n\nif (!isSignatureValid) {\n  return [{\n    json: {\n      is_signature_invalid: true,\n      error: 'Invalid or missing HMAC-SHA256 signature'\n    }\n  }];\n}\n\n// 3. Inbound Payload Normalization & Status Event Filtering\nlet entry = (body.entry && body.entry[0]) || {};\nlet change = (entry.changes && entry.changes[0]) || {};\nlet val = change.value || {};\n\n// Ignore delivery/read status updates immediately\nif (val.statuses && Array.isArray(val.statuses) && val.statuses.length > 0) {\n  return [{\n    json: {\n      is_status_callback: true,\n      status_detail: val.statuses[0]?.status,\n      message_id: val.statuses[0]?.id\n    }\n  }];\n}\n\nconst rawMessages = (val.messages && Array.isArray(val.messages)) ? val.messages : [];\nif (rawMessages.length === 0 && !body.From && !body.phone && !body.message) {\n  return [{\n    json: {\n      is_status_callback: true,\n      reason: 'No message content in webhook payload'\n    }\n  }];\n}\n\nconst results = [];\nconst contact = (val.contacts && val.contacts[0]) || {};\nconst defaultCustomerName = contact.profile?.name || body.ProfileName || body.name || body.customer_name || 'Valued Patient';\nconst messagesToProcess = rawMessages.length > 0 ? rawMessages : [body];\n\nfor (const msgObj of messagesToProcess) {\n  let rawPhone = '';\n  let customerName = defaultCustomerName;\n  let message = '';\n  let channel = 'whatsapp_cloud';\n  let messageId = msgObj.id || body.MessageSid || ('wamid_mock_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6));\n\n  if (msgObj.from) {\n    rawPhone = msgObj.from;\n    message = msgObj.text?.body || msgObj.button?.text || msgObj.interactive?.button_reply?.title || msgObj.interactive?.list_reply?.title || '';\n  } else if (body.From) {\n    rawPhone = (body.From || '').replace('whatsapp:', '').trim();\n    message = body.Body || '';\n    channel = 'twilio';\n  } else {\n    rawPhone = String(body.phone || body.from || body.sender || '').trim();\n    message = body.message || body.text || body.body || '';\n  }\n\n  let cleanPhone = String(rawPhone || '').replace(/[^0-9]/g, '');\n  if (cleanPhone.length === 10) {\n    cleanPhone = '91' + cleanPhone;\n  }\n\n  const correlationId = 'corr_' + Date.now() + '_' + Math.random().toString(36).substr(2, 6);\n\n  results.push({\n    json: {\n      is_verification: false,\n      is_status_callback: false,\n      is_signature_invalid: false,\n      message_id: messageId,\n      correlation_id: correlationId,\n      phone: cleanPhone,\n      customer_name: customerName,\n      message: (message || '').trim(),\n      channel: channel,\n      received_at: new Date().toISOString()\n    }\n  });\n}\n\nreturn results;\n",
         "mode": "runOnceForAllItems"
       }
     },
@@ -2149,8 +2151,8 @@
       ],
       "parameters": {
         "operation": "executeQuery",
-        "query": "WITH ins AS (\n  INSERT INTO processed_messages (message_id, channel, sender, processed_at)\n  VALUES ($1, 'whatsapp', $2, NOW())\n  ON CONFLICT (message_id) DO NOTHING\n  RETURNING message_id\n)\nSELECT \n  $1 AS message_id,\n  $2 AS phone,\n  (CASE WHEN (SELECT message_id FROM ins) IS NOT NULL THEN false ELSE true END) AS is_duplicate;",
-        "queryParameters": "={{ [$json.message_id, $json.phone] }}"
+        "query": "WITH ins AS (\n  INSERT INTO processed_messages (message_id, channel, sender, processed_at)\n  VALUES ($1, $5, $2, NOW())\n  ON CONFLICT (message_id) DO NOTHING\n  RETURNING message_id\n)\nSELECT \n  $1 AS message_id,\n  $2 AS phone,\n  $3 AS customer_name,\n  $4 AS message,\n  $5 AS channel,\n  $6 AS correlation_id,\n  (CASE WHEN (SELECT message_id FROM ins) IS NOT NULL THEN true ELSE false END) AS is_new,\n  (CASE WHEN (SELECT message_id FROM ins) IS NOT NULL THEN false ELSE true END) AS is_duplicate;",
+        "queryParameters": "={{ [$json.message_id, $json.phone, $json.customer_name, $json.message, $json.channel, $json.correlation_id] }}"
       },
       "credentials": {
         "postgres": {
@@ -2178,8 +2180,8 @@
           },
           "conditions": [
             {
-              "leftValue": "={{ $json.is_duplicate }}",
-              "rightValue": false,
+              "leftValue": "={{ $json.is_new }}",
+              "rightValue": true,
               "operator": {
                 "type": "boolean",
                 "operation": "equals"
@@ -2206,6 +2208,26 @@
           "responseCode": 200
         }
       }
+    },
+    {
+      "id": "w1-webhook-get-trigger",
+      "name": "WhatsApp_Webhook_GET",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        100,
+        300
+      ],
+      "parameters": {
+        "httpMethod": "GET",
+        "path": "whatsapp-webhook",
+        "responseMode": "responseNode",
+        "options": {
+          "rawBody": true
+        }
+      },
+      "notesInFlow": true,
+      "notes": "Meta GET Webhook Verification endpoint (/webhook/whatsapp-webhook)"
     }
   ],
   "connections": {
@@ -3090,6 +3112,17 @@
         [
           {
             "node": "Respond_Duplicate_Ack",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "WhatsApp_Webhook_GET": {
+      "main": [
+        [
+          {
+            "node": "Parse_WhatsApp_Inbound",
             "type": "main",
             "index": 0
           }
