@@ -1,0 +1,11 @@
+{
+  "name": "AI_WhatsApp_Appointment_System (ARCHIVED / DEPRECATED)",
+  "nodes": [],
+  "connections": {},
+  "active": false,
+  "settings": {},
+  "versionId": "legacy-archived",
+  "meta": {
+    "description": "DEPRECATED: This monolithic legacy workflow has been split and superseded by the 3 modular production workflows: 01_WhatsApp_AI_Appointment_Agent.json, 02_Appointment_Reminder_Engine.json, and 03_Reception_Dashboard.json."
+  }
+}

@@ -871,6 +871,53 @@
           "responseCode": 500
         }
       }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ Boolean(!$json.error) }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "w3-if-cancel-gcal-success",
+      "name": "If_Dashboard_Cancel_GCal_Success",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1140,
+        900
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ success: false, error: 'Google Calendar event deletion failed. Database cancellation aborted to prevent system desynchronization.', calendar_error: $json.error || 'Unknown calendar error' }) }}",
+        "options": {
+          "responseCode": 502
+        }
+      },
+      "id": "w3-respond-cancel-failed",
+      "name": "Respond_Dashboard_Cancel_Failed_JSON",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1360,
+        1040
+      ]
     }
   ],
   "connections": {
@@ -1132,7 +1179,7 @@
       "main": [
         [
           {
-            "node": "Postgres_Dashboard_Update_Cancel",
+            "node": "If_Dashboard_Cancel_GCal_Success",
             "type": "main",
             "index": 0
           }
@@ -1213,6 +1260,24 @@
         [
           {
             "node": "Respond_Dashboard_Resched_Failed_JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If_Dashboard_Cancel_GCal_Success": {
+      "main": [
+        [
+          {
+            "node": "Postgres_Dashboard_Update_Cancel",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond_Dashboard_Cancel_Failed_JSON",
             "type": "main",
             "index": 0
           }
