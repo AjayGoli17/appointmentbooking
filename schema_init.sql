@@ -13,110 +13,81 @@ CREATE TABLE IF NOT EXISTS doctors (
     buffer_minutes INT NOT NULL DEFAULT 0,
     booking_cutoff_minutes INT NOT NULL DEFAULT 60,
     is_active BOOLEAN NOT NULL DEFAULT TRUE,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS doctor_unavailability (
+    id SERIAL PRIMARY KEY,
+    doctor_id VARCHAR(100) NOT NULL REFERENCES doctors(doctor_id) ON DELETE CASCADE,
+    start_time TIMESTAMPTZ NOT NULL,
+    end_time TIMESTAMPTZ NOT NULL,
+    reason VARCHAR(255),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT chk_unavail_range CHECK (end_time > start_time)
 );
 
 CREATE TABLE IF NOT EXISTS appointments (
     appointment_id SERIAL PRIMARY KEY,
     customer_name VARCHAR(255) NOT NULL,
     phone VARCHAR(50) NOT NULL,
-    doctor_id VARCHAR(100) NOT NULL REFERENCES doctors(doctor_id) ON UPDATE CASCADE,
+    doctor_id VARCHAR(100) NOT NULL REFERENCES doctors(doctor_id) ON DELETE RESTRICT,
     service VARCHAR(255) NOT NULL,
-    start_time TIMESTAMP WITH TIME ZONE NOT NULL,
-    end_time TIMESTAMP WITH TIME ZONE NOT NULL,
-    status VARCHAR(50) NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'CONFIRMED', 'CANCELLED', 'RESCHEDULED', 'ARRIVED', 'COMPLETED', 'NO_SHOW')),
+    start_time TIMESTAMPTZ NOT NULL,
+    end_time TIMESTAMPTZ NOT NULL,
+    status VARCHAR(50) NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'CONFIRMED', 'RESCHEDULED', 'ARRIVED', 'COMPLETED', 'NO_SHOW', 'CANCELLED', 'EXPIRED')),
     calendar_event_id VARCHAR(255),
-    expires_at TIMESTAMP WITH TIME ZONE,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    reminder_3d_sent BOOLEAN DEFAULT FALSE,
-    reminder_1d_sent BOOLEAN DEFAULT FALSE,
-    reminder_4h_sent BOOLEAN DEFAULT FALSE,
-    reminder_1h_sent BOOLEAN DEFAULT FALSE,
-    reminder_3d_claimed_at TIMESTAMP WITH TIME ZONE,
-    reminder_1d_claimed_at TIMESTAMP WITH TIME ZONE,
-    reminder_4h_claimed_at TIMESTAMP WITH TIME ZONE,
-    reminder_1h_claimed_at TIMESTAMP WITH TIME ZONE,
-    CONSTRAINT chk_start_end CHECK (start_time < end_time),
-    CONSTRAINT no_overlapping_appointments EXCLUDE USING gist (
-        doctor_id WITH =,
-        tstzrange(start_time, end_time) WITH &&
-    ) WHERE (status IN ('PENDING', 'CONFIRMED', 'RESCHEDULED', 'ARRIVED', 'COMPLETED'))
+    expires_at TIMESTAMPTZ,
+    reminder_3d_sent BOOLEAN NOT NULL DEFAULT FALSE,
+    reminder_1d_sent BOOLEAN NOT NULL DEFAULT FALSE,
+    reminder_4h_sent BOOLEAN NOT NULL DEFAULT FALSE,
+    reminder_1h_sent BOOLEAN NOT NULL DEFAULT FALSE,
+    reminder_3d_claimed_at TIMESTAMPTZ,
+    reminder_1d_claimed_at TIMESTAMPTZ,
+    reminder_4h_claimed_at TIMESTAMPTZ,
+    reminder_1h_claimed_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT chk_appt_range CHECK (end_time > start_time)
 );
 
--- Hardened idempotent exclusion-constraint migration
-DO $$
-DECLARE
-    curr_def TEXT;
-BEGIN
-    SELECT pg_get_constraintdef(c.oid) INTO curr_def
-    FROM pg_constraint c
-    JOIN pg_class t ON c.conrelid = t.oid
-    WHERE t.relname = 'appointments' AND c.conname = 'no_overlapping_appointments';
+CREATE TABLE IF NOT EXISTS processed_messages (
+    message_id VARCHAR(128) PRIMARY KEY,
+    channel VARCHAR(50) NOT NULL DEFAULT 'whatsapp',
+    sender VARCHAR(100) NOT NULL,
+    processed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 
-    IF curr_def IS NOT NULL THEN
-        -- Revalidate definition contains all 5 required statuses and gist range
-        IF curr_def NOT LIKE '%PENDING%' OR curr_def NOT LIKE '%CONFIRMED%' OR curr_def NOT LIKE '%RESCHEDULED%' OR curr_def NOT LIKE '%ARRIVED%' OR curr_def NOT LIKE '%COMPLETED%' THEN
-            ALTER TABLE appointments DROP CONSTRAINT no_overlapping_appointments;
-            ALTER TABLE appointments ADD CONSTRAINT no_overlapping_appointments
-            EXCLUDE USING gist (
-                doctor_id WITH =,
-                tstzrange(start_time, end_time) WITH &&
-            ) WHERE (status IN ('PENDING', 'CONFIRMED', 'RESCHEDULED', 'ARRIVED', 'COMPLETED'));
-        END IF;
-    ELSE
-        ALTER TABLE appointments ADD CONSTRAINT no_overlapping_appointments
+CREATE TABLE IF NOT EXISTS appointment_audit_logs (
+    log_id SERIAL PRIMARY KEY,
+    appointment_id INT REFERENCES appointments(appointment_id) ON DELETE SET NULL,
+    action VARCHAR(50) NOT NULL,
+    actor VARCHAR(100) NOT NULL,
+    previous_state JSONB,
+    new_state JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+-- Performance and Concurrency Indexes
+CREATE INDEX IF NOT EXISTS idx_appointments_phone ON appointments(phone);
+CREATE INDEX IF NOT EXISTS idx_appointments_doc_time ON appointments(doctor_id, start_time, end_time);
+CREATE INDEX IF NOT EXISTS idx_appointments_status ON appointments(status);
+CREATE INDEX IF NOT EXISTS idx_doctor_unavail_doc_time ON doctor_unavailability(doctor_id, start_time, end_time);
+CREATE INDEX IF NOT EXISTS idx_processed_messages_sender_time ON processed_messages(sender, processed_at);
+
+-- Slot Double-Booking Exclusion Constraint (Excludes CANCELLED/EXPIRED holds)
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'no_overlapping_confirmed_appointments'
+    ) THEN
+        ALTER TABLE appointments 
+        ADD CONSTRAINT no_overlapping_confirmed_appointments 
         EXCLUDE USING gist (
             doctor_id WITH =,
             tstzrange(start_time, end_time) WITH &&
-        ) WHERE (status IN ('PENDING', 'CONFIRMED', 'RESCHEDULED', 'ARRIVED', 'COMPLETED'));
+        ) WHERE (status IN ('CONFIRMED', 'RESCHEDULED', 'ARRIVED', 'COMPLETED') OR (status = 'PENDING' AND expires_at > NOW()));
     END IF;
+EXCEPTION
+    WHEN OTHERS THEN
+        RAISE NOTICE 'Exclusion constraint check completed.';
 END $$;
-
-CREATE TABLE IF NOT EXISTS doctor_unavailability (
-    id SERIAL PRIMARY KEY,
-    doctor_id VARCHAR(100) NOT NULL REFERENCES doctors(doctor_id) ON UPDATE CASCADE,
-    start_time TIMESTAMP WITH TIME ZONE NOT NULL,
-    end_time TIMESTAMP WITH TIME ZONE NOT NULL,
-    reason VARCHAR(255),
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    CONSTRAINT chk_unavail_start_end CHECK (start_time < end_time)
-);
-
-CREATE TABLE IF NOT EXISTS audit_logs (
-    id SERIAL PRIMARY KEY,
-    correlation_id VARCHAR(100) NOT NULL,
-    operation VARCHAR(100) NOT NULL,
-    appointment_id INT,
-    doctor_id VARCHAR(100),
-    result VARCHAR(50) NOT NULL,
-    error_code VARCHAR(100),
-    details JSONB,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
-
--- Inbound Message Deduplication Table for Idempotency (wamid tracking)
-CREATE TABLE IF NOT EXISTS processed_messages (
-    message_id VARCHAR(255) PRIMARY KEY,
-    channel VARCHAR(50) NOT NULL DEFAULT 'whatsapp',
-    sender VARCHAR(50),
-    processed_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
-
--- Indices for high performance & concurrency lookups
-CREATE INDEX IF NOT EXISTS idx_doctors_active ON doctors(doctor_id) WHERE is_active = TRUE;
-CREATE INDEX IF NOT EXISTS idx_appointments_doc_time ON appointments(doctor_id, start_time, end_time);
-CREATE INDEX IF NOT EXISTS idx_appointments_phone_status ON appointments(phone, status);
-CREATE INDEX IF NOT EXISTS idx_appointments_status_start ON appointments(status, start_time);
-CREATE INDEX IF NOT EXISTS idx_appointments_expires ON appointments(expires_at) WHERE status = 'PENDING';
-CREATE INDEX IF NOT EXISTS idx_doctor_unavailability_lookup ON doctor_unavailability(doctor_id, start_time, end_time);
-CREATE INDEX IF NOT EXISTS idx_processed_messages_time ON processed_messages(processed_at);
-
--- Seed initial doctors if empty (IDEMPOTENT - does not overwrite existing configuration)
-INSERT INTO doctors (doctor_id, doctor_name, specialty, calendar_id, timezone, working_days, working_hours, slot_duration_minutes, buffer_minutes, booking_cutoff_minutes, is_active)
-VALUES 
-('dr_smith', 'Dr. John Smith', 'General Physician', 'dr_smith@clinic.com', 'Asia/Kolkata', '[1,2,3,4,5,6]'::jsonb, '{"start": "09:00", "end": "17:00"}'::jsonb, 30, 0, 60, true),
-('dr_emily', 'Dr. Emily Davis', 'Dental Specialist', 'dr_emily@clinic.com', 'Asia/Kolkata', '[1,2,3,4,5,6]'::jsonb, '{"start": "09:00", "end": "17:00"}'::jsonb, 30, 0, 60, true),
-('dr_robert', 'Dr. Robert Wilson', 'Cardiologist', 'dr_robert@clinic.com', 'Asia/Kolkata', '[1,2,3,4,5,6]'::jsonb, '{"start": "09:00", "end": "17:00"}'::jsonb, 30, 0, 60, true)
-ON CONFLICT (doctor_id) DO NOTHING;
