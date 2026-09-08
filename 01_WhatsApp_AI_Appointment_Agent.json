@@ -63,7 +63,7 @@
       ],
       "parameters": {
         "language": "javascript",
-        "jsCode": "const body = $input.item.json.body || $input.item.json;\nlet rawPhone = '';\nlet customerName = 'Customer';\nlet message = '';\nlet channel = 'whatsapp';\nconst correlationId = 'corr_' + Math.random().toString(36).substring(2, 10) + '_' + Date.now();\n\nif (body.entry && body.entry[0]?.changes && body.entry[0].changes[0]?.value) {\n  const val = body.entry[0].changes[0].value;\n  if (val.contacts && val.contacts[0]) {\n    customerName = val.contacts[0].profile?.name || customerName;\n  }\n  if (val.messages && val.messages[0]) {\n    const msgObj = val.messages[0];\n    rawPhone = msgObj.from || '';\n    if (msgObj.type === 'text') {\n      message = msgObj.text?.body || '';\n    } else if (msgObj.type === 'interactive') {\n      message = msgObj.interactive?.button_reply?.title || msgObj.interactive?.list_reply?.title || '';\n    } else if (msgObj.type === 'button') {\n      message = msgObj.button?.text || '';\n    }\n  }\n} else if (body.From || body.Body) {\n  rawPhone = (body.From || '').replace('whatsapp:', '').trim();\n  customerName = body.ProfileName || customerName;\n  message = body.Body || '';\n  channel = 'twilio';\n} else {\n  rawPhone = String(body.phone || body.from || body.sender || '').trim();\n  customerName = body.name || body.customer_name || body.customerName || customerName;\n  message = body.message || body.text || body.body || '';\n}\n\n// Canonical phone number normalization (Bug #29)\nconst cleanPhone = rawPhone.replace(/[^0-9]/g, '');\n\nreturn [{\n  json: {\n    correlation_id: correlationId,\n    phone: cleanPhone,\n    customer_name: customerName,\n    message: (message || '').trim(),\n    channel: channel,\n    received_at: new Date().toISOString()\n  }\n}];\n"
+        "jsCode": "const body = $input.item.json.body || $input.item.json;\nlet rawPhone = '';\nlet customerName = 'Customer';\nlet message = '';\nlet channel = 'whatsapp';\nconst correlationId = 'corr_' + Math.random().toString(36).substring(2, 10) + '_' + Date.now();\n\nif (body.entry && body.entry[0]?.changes && body.entry[0].changes[0]?.value) {\n  const val = body.entry[0].changes[0].value;\n  if (val.contacts && val.contacts[0]) {\n    customerName = val.contacts[0].profile?.name || customerName;\n  }\n  if (val.messages && val.messages[0]) {\n    const msgObj = val.messages[0];\n    rawPhone = msgObj.from || '';\n    if (msgObj.type === 'text') {\n      message = msgObj.text?.body || '';\n    } else if (msgObj.type === 'interactive') {\n      message = msgObj.interactive?.button_reply?.title || msgObj.interactive?.list_reply?.title || '';\n    } else if (msgObj.type === 'button') {\n      message = msgObj.button?.text || '';\n    }\n  }\n} else if (body.From || body.Body) {\n  rawPhone = (body.From || '').replace('whatsapp:', '').trim();\n  customerName = body.ProfileName || customerName;\n  message = body.Body || '';\n  channel = 'twilio';\n} else {\n  rawPhone = String(body.phone || body.from || body.sender || '').trim();\n  customerName = body.name || body.customer_name || body.customerName || customerName;\n  message = body.message || body.text || body.body || '';\n}\n\n// Canonical phone number normalization (+91 default for 10-digit numbers) (Finding 11)\nlet cleanPhone = rawPhone.replace(/[^0-9]/g, '');\nif (cleanPhone.length === 10) {\n  cleanPhone = '91' + cleanPhone;\n}\n\nreturn [{\n  json: {\n    correlation_id: correlationId,\n    phone: cleanPhone,\n    customer_name: customerName,\n    message: (message || '').trim(),\n    channel: channel,\n    received_at: new Date().toISOString()\n  }\n}];\n"
       }
     },
     {
@@ -316,7 +316,7 @@
       ],
       "parameters": {
         "language": "javascript",
-        "jsCode": "\nfunction getUtcFromLocal(dateStr, timeStr, timeZone) {\n  const [yyyy, mm, dd] = dateStr.split('-').map(Number);\n  const [hh, min] = timeStr.split(':').map(Number);\n  const utcDate = new Date(Date.UTC(yyyy, mm - 1, dd, hh, min, 0));\n  const invDate = new Date(utcDate.toLocaleString('en-US', { timeZone: 'UTC' }));\n  const targetDate = new Date(utcDate.toLocaleString('en-US', { timeZone: timeZone }));\n  const diff = targetDate.getTime() - invDate.getTime();\n  return new Date(utcDate.getTime() - diff);\n}\n\nfunction getWeekdayFromDate(dateObj, timeZone) {\n  const dayStr = new Intl.DateTimeFormat('en-US', { timeZone, weekday: 'short' }).format(dateObj);\n  const map = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };\n  return map[dayStr];\n}\n\nfunction isValidDate(dateStr) {\n  if (!dateStr || typeof dateStr !== 'string') return false;\n  const match = dateStr.match(/^(\\d{4})-(\\d{2})-(\\d{2})$/);\n  if (!match) return false;\n  const [_, yStr, mStr, dStr] = match;\n  const y = Number(yStr), m = Number(mStr), d = Number(dStr);\n  if (m < 1 || m > 12 || d < 1 || d > 31) return false;\n  const testDate = new Date(Date.UTC(y, m - 1, d));\n  return testDate.getUTCFullYear() === y && testDate.getUTCMonth() === (m - 1) && testDate.getUTCDate() === d;\n}\n\nfunction isValidTime(timeStr) {\n  if (!timeStr || typeof timeStr !== 'string') return false;\n  return /^([01]\\d|2[0-3]):([0-5]\\d)$/.test(timeStr);\n}\n\nconst item = $input.item.json;\nconst doc = item.doctor || {};\nconst tz = doc.timezone || 'Asia/Kolkata';\nconst wh = doc.working_hours || { start: \"09:00\", end: \"17:00\" };\nconst workingDays = doc.working_days || [1, 2, 3, 4, 5, 6];\nconst slotDuration = doc.slot_duration_minutes || 30;\nconst bufferMin = doc.buffer_minutes || 0;\nconst cutoffMin = doc.booking_cutoff_minutes || 60;\nconst unavailList = item.active_unavailability || [];\n\nlet needsInfo = false;\nlet missingFields = [];\nlet replyMsg = '';\n\nif (!isValidDate(item.requested_date)) {\n  needsInfo = true;\n  missingFields.push('preferred date (YYYY-MM-DD)');\n}\nif (!isValidTime(item.requested_time)) {\n  needsInfo = true;\n  missingFields.push('preferred time in 24h format (e.g. 10:00 or 14:30)');\n}\n\nlet startUtc = null;\nlet endUtc = null;\n\nif (needsInfo) {\n  replyMsg = `Hello ${item.customer_name || 'there'}! To check availability with ${doc.doctor_name || 'the doctor'}, please provide a valid ${missingFields.join(' and ')}.`;\n} else {\n  startUtc = getUtcFromLocal(item.requested_date, item.requested_time, tz);\n  endUtc = new Date(startUtc.getTime() + slotDuration * 60000);\n\n  // 1. Working day check\n  const localDayOfWeek = getWeekdayFromDate(startUtc, tz);\n  if (!workingDays.includes(localDayOfWeek)) {\n    needsInfo = true;\n    replyMsg = `Sorry, ${doc.doctor_name} does not take appointments on that day of the week.`;\n  } else {\n    // 2. Working hours check\n    const [startH, startM] = wh.start.split(':').map(Number);\n    const [endH, endM] = wh.end.split(':').map(Number);\n    const [reqH, reqM] = item.requested_time.split(':').map(Number);\n    const reqMin = reqH * 60 + reqM;\n    const openMin = startH * 60 + startM;\n    const closeMin = endH * 60 + endM;\n\n    if (reqMin < openMin || reqMin + slotDuration > closeMin) {\n      needsInfo = true;\n      replyMsg = `Operating hours for ${doc.doctor_name} are ${wh.start} to ${wh.end}. The requested time (${item.requested_time}) is outside working hours.`;\n    }\n  }\n\n  // 3. Booking cutoff check\n  const now = new Date();\n  if (startUtc.getTime() < now.getTime() + cutoffMin * 60000) {\n    needsInfo = true;\n    replyMsg = `Appointments must be scheduled at least ${cutoffMin} minutes in advance. Please choose a later slot.`;\n  }\n\n  // 4. Doctor Leave / Unavailability check\n  for (const u of unavailList) {\n    if (u.doctor_id === doc.doctor_id) {\n      const uStart = new Date(u.start_time);\n      const uEnd = new Date(u.end_time);\n      if (startUtc < uEnd && endUtc > uStart) {\n        needsInfo = true;\n        replyMsg = `Sorry, ${doc.doctor_name} is unavailable on ${item.requested_date} (${u.reason || 'Leave'}). Please pick another date.`;\n        break;\n      }\n    }\n  }\n}\n\n// Search window for GCal: local midnight to next local midnight\nlet gcalMin = new Date().toISOString();\nlet gcalMax = new Date(Date.now() + 86400000).toISOString();\nif (item.requested_date && isValidDate(item.requested_date)) {\n  gcalMin = getUtcFromLocal(item.requested_date, '00:00', tz).toISOString();\n  gcalMax = getUtcFromLocal(item.requested_date, '23:59', tz).toISOString();\n}\n\nreturn [{\n  json: {\n    ...item,\n    needs_info: needsInfo,\n    missing_fields: missingFields,\n    missing_info_message: replyMsg,\n    start_time_iso: startUtc ? startUtc.toISOString() : null,\n    end_time_iso: endUtc ? endUtc.toISOString() : null,\n    gcal_time_min: gcalMin,\n    gcal_time_max: gcalMax\n  }\n}];\n"
+        "jsCode": "\nfunction getUtcFromLocal(dateStr, timeStr, timeZone) {\n  const [yyyy, mm, dd] = dateStr.split('-').map(Number);\n  const [hh, min] = timeStr.split(':').map(Number);\n  const utcDate = new Date(Date.UTC(yyyy, mm - 1, dd, hh, min, 0));\n  const invDate = new Date(utcDate.toLocaleString('en-US', { timeZone: 'UTC' }));\n  const targetDate = new Date(utcDate.toLocaleString('en-US', { timeZone: timeZone }));\n  const diff = targetDate.getTime() - invDate.getTime();\n  return new Date(utcDate.getTime() - diff);\n}\n\nfunction getWeekdayFromDate(dateObj, timeZone) {\n  const dayStr = new Intl.DateTimeFormat('en-US', { timeZone, weekday: 'short' }).format(dateObj);\n  const map = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };\n  return map[dayStr];\n}\n\nfunction isValidDate(dateStr) {\n  if (!dateStr || typeof dateStr !== 'string') return false;\n  const match = dateStr.match(/^(\\d{4})-(\\d{2})-(\\d{2})$/);\n  if (!match) return false;\n  const [_, yStr, mStr, dStr] = match;\n  const y = Number(yStr), m = Number(mStr), d = Number(dStr);\n  if (m < 1 || m > 12 || d < 1 || d > 31) return false;\n  const testDate = new Date(Date.UTC(y, m - 1, d));\n  return testDate.getUTCFullYear() === y && testDate.getUTCMonth() === (m - 1) && testDate.getUTCDate() === d;\n}\n\nfunction isValidTime(timeStr) {\n  if (!timeStr || typeof timeStr !== 'string') return false;\n  return /^([01]\\d|2[0-3]):([0-5]\\d)$/.test(timeStr);\n}\n\nconst item = $input.item.json;\nconst doc = item.doctor || {};\nconst tz = doc.timezone || 'Asia/Kolkata';\nconst wh = doc.working_hours || { start: \"09:00\", end: \"17:00\" };\nconst workingDays = doc.working_days || [1, 2, 3, 4, 5, 6];\nconst slotDuration = doc.slot_duration_minutes || 30;\nconst bufferMin = doc.buffer_minutes || 0;\nconst cutoffMin = doc.booking_cutoff_minutes || 60;\nconst unavailList = item.active_unavailability || [];\n\nlet needsInfo = false;\nlet missingFields = [];\nlet replyMsg = '';\n\nif (!isValidDate(item.requested_date)) {\n  needsInfo = true;\n  missingFields.push('preferred date (YYYY-MM-DD)');\n}\nif (!isValidTime(item.requested_time)) {\n  needsInfo = true;\n  missingFields.push('preferred time in 24h format (e.g. 10:00 or 14:30)');\n}\n\nlet startUtc = null;\nlet endUtc = null;\n\nif (needsInfo) {\n  replyMsg = `Hello ${item.customer_name || 'there'}! To check availability with ${doc.doctor_name || 'the doctor'}, please provide a valid ${missingFields.join(' and ')}.`;\n} else {\n  startUtc = getUtcFromLocal(item.requested_date, item.requested_time, tz);\n  endUtc = new Date(startUtc.getTime() + slotDuration * 60000);\n\n  // Deterministic validation checks with short-circuiting (Finding 10)\n  const localDayOfWeek = getWeekdayFromDate(startUtc, tz);\n  const [startH, startM] = wh.start.split(':').map(Number);\n  const [endH, endM] = wh.end.split(':').map(Number);\n  const [reqH, reqM] = item.requested_time.split(':').map(Number);\n  const reqMin = reqH * 60 + reqM;\n  const openMin = startH * 60 + startM;\n  const closeMin = endH * 60 + endM;\n  const now = new Date();\n\n  if (!workingDays.includes(localDayOfWeek)) {\n    needsInfo = true;\n    replyMsg = `Sorry, ${doc.doctor_name} does not take appointments on that day of the week.`;\n  } else if (reqMin < openMin || reqMin + slotDuration > closeMin) {\n    needsInfo = true;\n    replyMsg = `Operating hours for ${doc.doctor_name} are ${wh.start} to ${wh.end}. The requested time (${item.requested_time}) is outside working hours.`;\n  } else if (startUtc.getTime() < now.getTime() + cutoffMin * 60000) {\n    needsInfo = true;\n    replyMsg = `Appointments must be scheduled at least ${cutoffMin} minutes in advance. Please choose a later slot.`;\n  } else {\n    // Doctor Leave / Unavailability check\n    for (const u of unavailList) {\n      if (u.doctor_id === doc.doctor_id) {\n        const uStart = new Date(u.start_time);\n        const uEnd = new Date(u.end_time);\n        if (startUtc < uEnd && endUtc > uStart) {\n          needsInfo = true;\n          replyMsg = `Sorry, ${doc.doctor_name} is unavailable on ${item.requested_date} (${u.reason || 'Leave'}). Please pick another date.`;\n          break;\n        }\n      }\n    }\n  }\n}\n\n// Search window for GCal: local midnight to next local midnight\nlet gcalMin = new Date().toISOString();\nlet gcalMax = new Date(Date.now() + 86400000).toISOString();\nif (item.requested_date && isValidDate(item.requested_date)) {\n  gcalMin = getUtcFromLocal(item.requested_date, '00:00', tz).toISOString();\n  gcalMax = getUtcFromLocal(item.requested_date, '23:59', tz).toISOString();\n}\n\nreturn [{\n  json: {\n    ...item,\n    needs_info: needsInfo,\n    missing_fields: missingFields,\n    missing_info_message: replyMsg,\n    start_time_iso: startUtc ? startUtc.toISOString() : null,\n    end_time_iso: endUtc ? endUtc.toISOString() : null,\n    gcal_time_min: gcalMin,\n    gcal_time_max: gcalMax\n  }\n}];\n"
       }
     },
     {
@@ -959,7 +959,8 @@
           "id": "google_calendar_credentials_id",
           "name": "Google Calendar Account"
         }
-      }
+      },
+      "continueOnFail": true
     },
     {
       "id": "b27cb08a-0771-4851-af2a-10dccac5ebc1",
@@ -1493,7 +1494,7 @@
       ],
       "parameters": {
         "operation": "executeQuery",
-        "query": "\n    UPDATE appointments\n    SET status = 'CANCELLED',\n        updated_at = NOW(),\n        reminder_3d_sent = TRUE,\n        reminder_1d_sent = TRUE,\n        reminder_4h_sent = TRUE,\n        reminder_1h_sent = TRUE\n    WHERE appointment_id = $1\n    RETURNING *;\n    ",
+        "query": "\n    UPDATE appointments\n    SET status = 'CANCELLED',\n        updated_at = NOW(),\n        reminder_3d_sent = TRUE,\n        reminder_1d_sent = TRUE,\n        reminder_4h_sent = TRUE,\n        reminder_1h_sent = TRUE\n    WHERE appointment_id = \n      AND status IN ('PENDING', 'CONFIRMED', 'RESCHEDULED')\n    RETURNING *;\n    ",
         "queryParameters": "={{ [$('Validate_Cancel_Request').item.json.appointment_id] }}"
       },
       "credentials": {
@@ -2013,6 +2014,36 @@
         }
       },
       "continueOnFail": true
+    },
+    {
+      "id": "w1-if-gcal-create-success",
+      "name": "If_GCal_Create_Success",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        3720,
+        700
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ Boolean($json.id && typeof $json.id === 'string' && !$json.error) }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      }
     }
   ],
   "connections": {
@@ -2416,7 +2447,7 @@
       "main": [
         [
           {
-            "node": "Postgres_Update_To_Confirmed",
+            "node": "If_GCal_Create_Success",
             "type": "main",
             "index": 0
           }
@@ -2825,6 +2856,24 @@
         [
           {
             "node": "Send_WhatsApp_Interim_Conflict",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If_GCal_Create_Success": {
+      "main": [
+        [
+          {
+            "node": "Postgres_Update_To_Confirmed",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send_WhatsApp_GCal_Error",
             "type": "main",
             "index": 0
           }

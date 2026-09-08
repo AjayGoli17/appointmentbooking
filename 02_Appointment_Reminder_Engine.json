@@ -91,7 +91,8 @@
         }
       },
       "notesInFlow": true,
-      "notes": "Only flows to Mark_Sent upon verified HTTP 200 WhatsApp delivery"
+      "notes": "Only flows to Mark_Sent upon verified HTTP 200 WhatsApp delivery",
+      "continueOnFail": true
     },
     {
       "id": "a636ebd9-34f1-429f-87e1-ce1652d1f8e1",
@@ -111,6 +112,36 @@
         "postgres": {
           "id": "postgres_credentials_id",
           "name": "PostgreSQL Account"
+        }
+      }
+    },
+    {
+      "id": "w2-if-reminder-send-success",
+      "name": "If_Reminder_Send_Success",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        880,
+        100
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ Boolean(($json.messaging_product || $json.messages) && !$json.error) }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
         }
       }
     }
@@ -153,11 +184,23 @@
       "main": [
         [
           {
-            "node": "Postgres_Mark_Reminder_Sent",
+            "node": "If_Reminder_Send_Success",
             "type": "main",
             "index": 0
           }
         ]
+      ]
+    },
+    "If_Reminder_Send_Success": {
+      "main": [
+        [
+          {
+            "node": "Postgres_Mark_Reminder_Sent",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
       ]
     }
   },
