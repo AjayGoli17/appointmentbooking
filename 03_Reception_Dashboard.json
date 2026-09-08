@@ -1,0 +1,945 @@
+{
+  "name": "03 - Reception Dashboard",
+  "nodes": [
+    {
+      "id": "81867021-98c3-4ebc-a98e-0d87d1b9f321",
+      "name": "Reception_Dashboard_Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        100,
+        200
+      ],
+      "parameters": {
+        "httpMethod": "GET",
+        "path": "reception-dashboard",
+        "responseMode": "responseNode",
+        "options": {}
+      }
+    },
+    {
+      "id": "72e73e87-a43a-415a-a9c2-ce370339acc5",
+      "name": "Reception_Dashboard_API_Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        100,
+        400
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "reception-dashboard",
+        "responseMode": "responseNode",
+        "options": {}
+      }
+    },
+    {
+      "id": "a006997d-9cc5-4aaa-adb1-5f77396bed37",
+      "name": "Parse_Dashboard_Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        320,
+        300
+      ],
+      "parameters": {
+        "language": "javascript",
+        "jsCode": "const item = $input.item.json;\nconst headers = item.headers || {};\nconst query = item.query || {};\nconst body = item.body || {};\n\n// Server-side authentication check (Bug #14)\n// Allows x-dashboard-secret or Authorization Bearer header\nconst configuredSecret = $env.DASHBOARD_SECRET || '';\nconst clientSecret = headers['x-dashboard-secret'] || headers['authorization']?.replace('Bearer ', '').trim() || query.secret || body.secret || '';\n\n// Whitelisted API actions (Bug #15)\nconst allowedActions = [\n  'SERVE_HTML',\n  'GET_APPOINTMENTS',\n  'CREATE_APPOINTMENT',\n  'UPDATE_STATUS',\n  'RESCHEDULE_APPOINTMENT',\n  'CANCEL_APPOINTMENT',\n  'SET_DOCTOR_LEAVE'\n];\n\nlet action = 'SERVE_HTML';\nif (body.action) {\n  action = body.action;\n} else if (query.action) {\n  action = query.action;\n}\n\nif (!allowedActions.includes(action)) {\n  action = 'INVALID_ACTION';\n}\n\nreturn [{\n  json: {\n    action: action,\n    payload: body,\n    query: query,\n    received_at: new Date().toISOString()\n  }\n}];\n"
+      }
+    },
+    {
+      "id": "1ca7d355-66bc-45b8-9ff0-dbdf31946de6",
+      "name": "Route_Dashboard_Action",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [
+        540,
+        300
+      ],
+      "parameters": {
+        "mode": "rules",
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": false,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "SERVE_HTML",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": false,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "GET_APPOINTMENTS",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": false,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "CREATE_APPOINTMENT",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": false,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "UPDATE_STATUS",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": false,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "RESCHEDULE_APPOINTMENT",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": false,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "CANCEL_APPOINTMENT",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": false,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "SET_DOCTOR_LEAVE",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "fallbackOutput": 0
+      }
+    },
+    {
+      "id": "985b4db8-f47a-4d30-bea9-dca98c066186",
+      "name": "Generate_Dashboard_HTML",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        800,
+        100
+      ],
+      "parameters": {
+        "language": "javascript",
+        "jsCode": "const html = `<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n  <meta charset=\"UTF-8\">\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n  <title>Apex Healthcare - Reception Dashboard</title>\n  <link href=\"https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css\" rel=\"stylesheet\">\n  <link href=\"https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css\" rel=\"stylesheet\">\n  <style>\n    :root { --primary-color: #0d6efd; --sidebar-bg: #1e293b; }\n    body { background-color: #f8fafc; font-family: 'Segoe UI', system-ui, sans-serif; }\n    .navbar-custom { background-color: #0f172a; color: #fff; }\n    .card-stat { border-radius: 12px; border: none; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); }\n    .table-responsive { background: #fff; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05); padding: 16px; }\n    .badge-status { font-size: 0.85rem; padding: 6px 12px; border-radius: 20px; }\n    .status-CONFIRMED { background-color: #dbeafe; color: #1e40af; }\n    .status-PENDING { background-color: #fef3c7; color: #92400e; }\n    .status-ARRIVED { background-color: #e0e7ff; color: #3730a3; }\n    .status-COMPLETED { background-color: #d1fae5; color: #065f46; }\n    .status-CANCELLED { background-color: #fee2e2; color: #991b1b; }\n    .status-NO_SHOW { background-color: #f3f4f6; color: #4b5563; }\n  </style>\n</head>\n<body>\n  <nav class=\"navbar navbar-expand-lg navbar-custom px-4 py-3\">\n    <div class=\"container-fluid\">\n      <span class=\"navbar-brand text-white fw-bold\"><i class=\"fa-solid fa-hospital-user me-2 text-primary\"></i>Apex Healthcare Clinic - Reception Desk</span>\n      <div class=\"d-flex align-items-center gap-2\">\n        <button class=\"btn btn-primary btn-sm\" onclick=\"openNewModal()\"><i class=\"fa-solid fa-plus me-1\"></i> New Appointment</button>\n        <button class=\"btn btn-outline-light btn-sm\" onclick=\"openLeaveModal()\"><i class=\"fa-solid fa-user-clock me-1\"></i> Doctor Leave</button>\n        <button class=\"btn btn-secondary btn-sm\" onclick=\"loadAppointments()\"><i class=\"fa-solid fa-rotate me-1\"></i> Refresh</button>\n      </div>\n    </div>\n  </nav>\n\n  <div class=\"container-fluid px-4 py-4\">\n    <!-- Stat Cards -->\n    <div class=\"row g-3 mb-4\">\n      <div class=\"col-md-3\">\n        <div class=\"card card-stat bg-white p-3\">\n          <div class=\"d-flex justify-content-between align-items-center\">\n            <div>\n              <span class=\"text-muted small\">Today's Schedule</span>\n              <h3 class=\"fw-bold mt-1 mb-0\" id=\"stat-today\">0</h3>\n            </div>\n            <div class=\"bg-primary-subtle text-primary p-3 rounded-circle\"><i class=\"fa-solid fa-calendar-day fa-lg\"></i></div>\n          </div>\n        </div>\n      </div>\n      <div class=\"col-md-3\">\n        <div class=\"card card-stat bg-white p-3\">\n          <div class=\"d-flex justify-content-between align-items-center\">\n            <div>\n              <span class=\"text-muted small\">Confirmed</span>\n              <h3 class=\"fw-bold mt-1 mb-0 text-primary\" id=\"stat-confirmed\">0</h3>\n            </div>\n            <div class=\"bg-info-subtle text-info p-3 rounded-circle\"><i class=\"fa-solid fa-check fa-lg\"></i></div>\n          </div>\n        </div>\n      </div>\n      <div class=\"col-md-3\">\n        <div class=\"card card-stat bg-white p-3\">\n          <div class=\"d-flex justify-content-between align-items-center\">\n            <div>\n              <span class=\"text-muted small\">Arrived / In Clinic</span>\n              <h3 class=\"fw-bold mt-1 mb-0 text-indigo\" id=\"stat-arrived\">0</h3>\n            </div>\n            <div class=\"bg-warning-subtle text-warning p-3 rounded-circle\"><i class=\"fa-solid fa-door-open fa-lg\"></i></div>\n          </div>\n        </div>\n      </div>\n      <div class=\"col-md-3\">\n        <div class=\"card card-stat bg-white p-3\">\n          <div class=\"d-flex justify-content-between align-items-center\">\n            <div>\n              <span class=\"text-muted small\">Completed Today</span>\n              <h3 class=\"fw-bold mt-1 mb-0 text-success\" id=\"stat-completed\">0</h3>\n            </div>\n            <div class=\"bg-success-subtle text-success p-3 rounded-circle\"><i class=\"fa-solid fa-circle-check fa-lg\"></i></div>\n          </div>\n        </div>\n      </div>\n    </div>\n\n    <!-- Filters, Search, Pagination -->\n    <div class=\"d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2\">\n      <div class=\"btn-group\" role=\"group\">\n        <button type=\"button\" class=\"btn btn-outline-primary active\" id=\"filter-today\" onclick=\"setFilter('today')\">Today's Schedule</button>\n        <button type=\"button\" class=\"btn btn-outline-primary\" id=\"filter-upcoming\" onclick=\"setFilter('upcoming')\">Upcoming</button>\n        <button type=\"button\" class=\"btn btn-outline-primary\" id=\"filter-all\" onclick=\"setFilter('all')\">All Bookings</button>\n      </div>\n      <div class=\"d-flex gap-2\">\n        <select class=\"form-select form-select-sm\" id=\"doctor-filter\" onchange=\"applyFilters()\">\n          <option value=\"\">All Doctors</option>\n          <option value=\"dr_smith\">Dr. John Smith</option>\n          <option value=\"dr_emily\">Dr. Emily Davis</option>\n          <option value=\"dr_robert\">Dr. Robert Wilson</option>\n        </select>\n        <input type=\"text\" class=\"form-control form-control-sm\" id=\"search-box\" placeholder=\"Search patient or phone...\" oninput=\"applyFilters()\">\n      </div>\n    </div>\n\n    <!-- Table -->\n    <div class=\"table-responsive\">\n      <table class=\"table table-hover align-middle mb-0\">\n        <thead class=\"table-light\">\n          <tr>\n            <th>ID</th>\n            <th>Patient Name</th>\n            <th>Phone</th>\n            <th>Doctor</th>\n            <th>Service</th>\n            <th>Date & Time</th>\n            <th>Status</th>\n            <th class=\"text-end\">Reception Actions</th>\n          </tr>\n        </thead>\n        <tbody id=\"appointment-tbody\">\n          <tr><td colspan=\"8\" class=\"text-center py-4 text-muted\">Loading appointments...</td></tr>\n        </tbody>\n      </table>\n      <div class=\"d-flex justify-content-between align-items-center mt-3\" id=\"pagination-controls\">\n        <span class=\"text-muted small\" id=\"page-info\">Showing page 1</span>\n        <div class=\"btn-group btn-group-sm\">\n          <button class=\"btn btn-outline-secondary\" onclick=\"changePage(-1)\" id=\"btn-prev\">Previous</button>\n          <button class=\"btn btn-outline-secondary\" onclick=\"changePage(1)\" id=\"btn-next\">Next</button>\n        </div>\n      </div>\n    </div>\n  </div>\n\n  <!-- Modals -->\n  <div class=\"modal fade\" id=\"newApptModal\" tabindex=\"-1\">\n    <div class=\"modal-dialog\">\n      <div class=\"modal-content\">\n        <div class=\"modal-header\"><h5 class=\"modal-title fw-bold\">Create Appointment</h5><button type=\"button\" class=\"btn-close\" data-bs-dismiss=\"modal\"></button></div>\n        <div class=\"modal-body\">\n          <form id=\"newApptForm\">\n            <div class=\"mb-3\"><label class=\"form-label\">Patient Name</label><input type=\"text\" class=\"form-control\" id=\"m-name\" required></div>\n            <div class=\"mb-3\"><label class=\"form-label\">Phone Number</label><input type=\"tel\" class=\"form-control\" id=\"m-phone\" required placeholder=\"919876543210\"></div>\n            <div class=\"mb-3\"><label class=\"form-label\">Doctor</label><select class=\"form-select\" id=\"m-doctor\" required><option value=\"dr_smith\">Dr. John Smith</option><option value=\"dr_emily\">Dr. Emily Davis</option><option value=\"dr_robert\">Dr. Robert Wilson</option></select></div>\n            <div class=\"mb-3\"><label class=\"form-label\">Service</label><input type=\"text\" class=\"form-control\" id=\"m-service\" value=\"General Consultation\" required></div>\n            <div class=\"row g-2 mb-3\">\n              <div class=\"col-6\"><label class=\"form-label\">Date</label><input type=\"date\" class=\"form-control\" id=\"m-date\" required></div>\n              <div class=\"col-6\"><label class=\"form-label\">Time</label><input type=\"time\" class=\"form-control\" id=\"m-time\" required></div>\n            </div>\n          </form>\n        </div>\n        <div class=\"modal-footer\"><button type=\"button\" class=\"btn btn-secondary\" data-bs-dismiss=\"modal\">Cancel</button><button type=\"button\" class=\"btn btn-primary\" onclick=\"submitNewAppointment()\">Confirm & Book</button></div>\n      </div>\n    </div>\n  </div>\n\n  <div class=\"modal fade\" id=\"reschedModal\" tabindex=\"-1\">\n    <div class=\"modal-dialog\">\n      <div class=\"modal-content\">\n        <div class=\"modal-header\"><h5 class=\"modal-title fw-bold\">Reschedule Appointment</h5><button type=\"button\" class=\"btn-close\" data-bs-dismiss=\"modal\"></button></div>\n        <div class=\"modal-body\">\n          <input type=\"hidden\" id=\"r-id\">\n          <p class=\"text-muted\">Rescheduling appointment for <strong id=\"r-patient\"></strong></p>\n          <div class=\"row g-2 mb-3\">\n            <div class=\"col-6\"><label class=\"form-label\">New Date</label><input type=\"date\" class=\"form-control\" id=\"r-date\" required></div>\n            <div class=\"col-6\"><label class=\"form-label\">New Time</label><input type=\"time\" class=\"form-control\" id=\"r-time\" required></div>\n          </div>\n        </div>\n        <div class=\"modal-footer\"><button type=\"button\" class=\"btn btn-secondary\" data-bs-dismiss=\"modal\">Close</button><button type=\"button\" class=\"btn btn-primary\" onclick=\"submitReschedule()\">Update Appointment</button></div>\n      </div>\n    </div>\n  </div>\n\n  <div class=\"modal fade\" id=\"leaveModal\" tabindex=\"-1\">\n    <div class=\"modal-dialog\">\n      <div class=\"modal-content\">\n        <div class=\"modal-header\"><h5 class=\"modal-title fw-bold\">Mark Doctor Leave / Unavailability</h5><button type=\"button\" class=\"btn-close\" data-bs-dismiss=\"modal\"></button></div>\n        <div class=\"modal-body\">\n          <div class=\"mb-3\"><label class=\"form-label\">Doctor</label><select class=\"form-select\" id=\"l-doctor\"><option value=\"dr_smith\">Dr. John Smith</option><option value=\"dr_emily\">Dr. Emily Davis</option><option value=\"dr_robert\">Dr. Robert Wilson</option></select></div>\n          <div class=\"row g-2 mb-3\">\n            <div class=\"col-6\"><label class=\"form-label\">Start Time</label><input type=\"datetime-local\" class=\"form-control\" id=\"l-start\" required></div>\n            <div class=\"col-6\"><label class=\"form-label\">End Time</label><input type=\"datetime-local\" class=\"form-control\" id=\"l-end\" required></div>\n          </div>\n          <div class=\"mb-3\"><label class=\"form-label\">Reason / Notes</label><input type=\"text\" class=\"form-control\" id=\"l-reason\" placeholder=\"e.g. Medical Conference\"></div>\n        </div>\n        <div class=\"modal-footer\"><button type=\"button\" class=\"btn btn-secondary\" data-bs-dismiss=\"modal\">Close</button><button type=\"button\" class=\"btn btn-warning\" onclick=\"submitDoctorLeave()\">Save Unavailability</button></div>\n      </div>\n    </div>\n  </div>\n\n  <script src=\"https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js\"></script>\n  <script>\n    let allAppointments = [];\n    let currentFilter = 'today';\n    let currentPage = 1;\n    const pageSize = 50;\n    const apiUrl = window.location.pathname;\n\n    function escapeHtml(str) {\n      if (!str) return '';\n      return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\"/g, '&quot;').replace(/'/g, '&#039;');\n    }\n\n    async function loadAppointments() {\n      try {\n        const res = await fetch(apiUrl, {\n          method: 'POST',\n          headers: { 'Content-Type': 'application/json' },\n          body: JSON.stringify({ action: 'GET_APPOINTMENTS', page: currentPage, page_size: pageSize })\n        });\n        const result = await res.json();\n        allAppointments = result.data?.appointments || result.appointments || [];\n        applyFilters();\n      } catch (err) {\n        console.error('Failed to load appointments', err);\n      }\n    }\n\n    function setFilter(f) {\n      currentFilter = f;\n      document.querySelectorAll('.btn-group button').forEach(b => b.classList.remove('active'));\n      document.getElementById('filter-' + f).classList.add('active');\n      applyFilters();\n    }\n\n    function applyFilters() {\n      const search = document.getElementById('search-box').value.toLowerCase();\n      const doctor = document.getElementById('doctor-filter').value;\n      const now = new Date();\n\n      let filtered = allAppointments.filter(a => {\n        const aStart = new Date(a.start_time);\n        const aLocalDate = aStart.toLocaleDateString('en-CA');\n        const todayLocalDate = now.toLocaleDateString('en-CA');\n\n        if (currentFilter === 'today' && aLocalDate !== todayLocalDate) return false;\n        if (currentFilter === 'upcoming' && aStart <= now) return false; // Bug #22: start_time > NOW()\n        if (doctor && a.doctor_id !== doctor) return false;\n        if (search) {\n          const matchName = (a.customer_name || '').toLowerCase().includes(search);\n          const matchPhone = (a.phone || '').includes(search);\n          if (!matchName && !matchPhone) return false;\n        }\n        return true;\n      });\n\n      // Stats\n      const todayList = allAppointments.filter(a => new Date(a.start_time).toLocaleDateString('en-CA') === now.toLocaleDateString('en-CA'));\n      document.getElementById('stat-today').innerText = todayList.length;\n      document.getElementById('stat-confirmed').innerText = todayList.filter(a => a.status === 'CONFIRMED').length;\n      document.getElementById('stat-arrived').innerText = todayList.filter(a => a.status === 'ARRIVED').length;\n      document.getElementById('stat-completed').innerText = todayList.filter(a => a.status === 'COMPLETED').length;\n\n      renderTable(filtered);\n    }\n\n    function renderTable(list) {\n      const tbody = document.getElementById('appointment-tbody');\n      if (list.length === 0) {\n        tbody.innerHTML = '<tr><td colspan=\"8\" class=\"text-center py-4 text-muted\">No appointments found for this filter.</td></tr>';\n        return;\n      }\n\n      tbody.innerHTML = list.map(a => {\n        const dt = new Date(a.start_time);\n        const formattedDate = dt.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });\n        const formattedTime = dt.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });\n\n        return `\n          <tr>\n            <td><span class=\"text-muted fw-bold\">#\\${escapeHtml(a.appointment_id)}</span></td>\n            <td class=\"fw-semibold\">\\${escapeHtml(a.customer_name)}</td>\n            <td><a href=\"https://wa.me/\\${escapeHtml(a.phone)}\" target=\"_blank\" class=\"text-decoration-none\"><i class=\"fa-brands fa-whatsapp text-success me-1\"></i>\\${escapeHtml(a.phone)}</a></td>\n            <td><span class=\"badge bg-light text-dark border\">\\${escapeHtml(a.doctor_name || a.doctor_id)}</span></td>\n            <td>\\${escapeHtml(a.service)}</td>\n            <td><strong>\\${escapeHtml(formattedDate)}</strong> <span class=\"text-muted\">\\${escapeHtml(formattedTime)}</span></td>\n            <td><span class=\"badge badge-status status-\\${escapeHtml(a.status)}\">\\${escapeHtml(a.status)}</span></td>\n            <td class=\"text-end\">\n              <div class=\"dropdown d-inline-block\">\n                <button class=\"btn btn-sm btn-light border dropdown-toggle\" data-bs-toggle=\"dropdown\">Actions</button>\n                <ul class=\"dropdown-menu dropdown-menu-end\">\n                  <li><a class=\"dropdown-item text-primary\" href=\"#\" onclick=\"updateStatus(\\${a.appointment_id}, 'ARRIVED')\"><i class=\"fa-solid fa-door-open me-2\"></i>Mark Arrived</a></li>\n                  <li><a class=\"dropdown-item text-success\" href=\"#\" onclick=\"updateStatus(\\${a.appointment_id}, 'COMPLETED')\"><i class=\"fa-solid fa-check-double me-2\"></i>Mark Completed</a></li>\n                  <li><a class=\"dropdown-item text-secondary\" href=\"#\" onclick=\"updateStatus(\\${a.appointment_id}, 'NO_SHOW')\"><i class=\"fa-solid fa-user-slash me-2\"></i>Mark No-Show</a></li>\n                  <li><hr class=\"dropdown-divider\"></li>\n                  <li><a class=\"dropdown-item text-warning\" href=\"#\" onclick=\"openReschedModal(\\${a.appointment_id}, '\\${escapeHtml(a.customer_name)}')\"><i class=\"fa-solid fa-calendar-days me-2\"></i>Reschedule</a></li>\n                  <li><a class=\"dropdown-item text-danger\" href=\"#\" onclick=\"cancelAppt(\\${a.appointment_id})\"><i class=\"fa-solid fa-trash me-2\"></i>Cancel</a></li>\n                </ul>\n              </div>\n            </td>\n          </tr>\n        `;\n      }).join('');\n    }\n\n    async function updateStatus(id, newStatus) {\n      if (!confirm('Update appointment #' + id + ' status to ' + newStatus + '?')) return;\n      await fetch(apiUrl, {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ action: 'UPDATE_STATUS', appointment_id: id, status: newStatus })\n      });\n      loadAppointments();\n    }\n\n    async function cancelAppt(id) {\n      if (!confirm('Cancel appointment #' + id + '?')) return;\n      await fetch(apiUrl, {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ action: 'CANCEL_APPOINTMENT', appointment_id: id })\n      });\n      loadAppointments();\n    }\n\n    function openNewModal() {\n      document.getElementById('m-date').value = new Date().toISOString().split('T')[0];\n      document.getElementById('m-time').value = '10:00';\n      new bootstrap.Modal(document.getElementById('newApptModal')).show();\n    }\n\n    async function submitNewAppointment() {\n      const name = document.getElementById('m-name').value;\n      const phone = document.getElementById('m-phone').value;\n      const doctor = document.getElementById('m-doctor').value;\n      const service = document.getElementById('m-service').value;\n      const date = document.getElementById('m-date').value;\n      const time = document.getElementById('m-time').value;\n\n      if (!name || !phone || !date || !time) return alert('Please fill all fields');\n\n      const res = await fetch(apiUrl, {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ action: 'CREATE_APPOINTMENT', customer_name: name, phone: phone, doctor_id: doctor, service: service, date: date, time: time })\n      });\n      const data = await res.json();\n      if (!data.success) {\n        alert('Booking failed: ' + (data.error?.message || 'Conflict detected'));\n      } else {\n        bootstrap.Modal.getInstance(document.getElementById('newApptModal')).hide();\n        loadAppointments();\n      }\n    }\n\n    function openReschedModal(id, name) {\n      document.getElementById('r-id').value = id;\n      document.getElementById('r-patient').innerText = name;\n      document.getElementById('r-date').value = new Date().toISOString().split('T')[0];\n      document.getElementById('r-time').value = '11:00';\n      new bootstrap.Modal(document.getElementById('reschedModal')).show();\n    }\n\n    async function submitReschedule() {\n      const id = document.getElementById('r-id').value;\n      const date = document.getElementById('r-date').value;\n      const time = document.getElementById('r-time').value;\n\n      const res = await fetch(apiUrl, {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ action: 'RESCHEDULE_APPOINTMENT', appointment_id: id, date: date, time: time })\n      });\n      const data = await res.json();\n      if (!data.success) {\n        alert('Reschedule failed: ' + (data.error?.message || 'Slot occupied'));\n      } else {\n        bootstrap.Modal.getInstance(document.getElementById('reschedModal')).hide();\n        loadAppointments();\n      }\n    }\n\n    function openLeaveModal() {\n      new bootstrap.Modal(document.getElementById('leaveModal')).show();\n    }\n\n    async function submitDoctorLeave() {\n      const doctor = document.getElementById('l-doctor').value;\n      const start = document.getElementById('l-start').value;\n      const end = document.getElementById('l-end').value;\n      const reason = document.getElementById('l-reason').value;\n\n      const res = await fetch(apiUrl, {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ action: 'SET_DOCTOR_LEAVE', doctor_id: doctor, start_time: start, end_time: end, reason: reason })\n      });\n      const data = await res.json();\n      if (data.data?.affected_appointments?.length > 0) {\n        alert('Leave recorded. Notice: ' + data.data.affected_appointments.length + ' existing booking(s) fall in this window and need rescheduling.');\n      } else {\n        alert('Doctor unavailability recorded.');\n      }\n      bootstrap.Modal.getInstance(document.getElementById('leaveModal')).hide();\n    }\n\n    loadAppointments();\n    setInterval(loadAppointments, 30000);\n  </script>\n</body>\n</html>`;\n\nreturn [{ json: { html: html } }];\n"
+      }
+    },
+    {
+      "id": "78a81bf1-6b19-4552-a8c8-a8f6a8c67d63",
+      "name": "Respond_Dashboard_HTML",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1020,
+        100
+      ],
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ $json.html }}",
+        "options": {
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "text/html; charset=utf-8"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "a3ef6008-3eb2-4cd6-b87d-733b6c7a5535",
+      "name": "Postgres_Dashboard_Get_Appts",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        800,
+        260
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "\n    WITH total_cnt AS (\n      SELECT COUNT(*) AS total FROM appointments\n    )\n    SELECT \n      a.appointment_id, a.customer_name, a.phone, a.doctor_id, a.service, \n      a.start_time, a.end_time, a.status, a.calendar_event_id, a.created_at, a.updated_at,\n      d.doctor_name, d.calendar_id, d.timezone,\n      (SELECT total FROM total_cnt) AS total_count\n    FROM appointments a\n    LEFT JOIN doctors d ON a.doctor_id = d.doctor_id\n    ORDER BY a.start_time DESC\n    LIMIT COALESCE($1, 100) OFFSET COALESCE($2, 0);\n    ",
+        "queryParameters": "={{ [$('Parse_Dashboard_Request').item.json.payload.page_size || 100, (($('Parse_Dashboard_Request').item.json.payload.page || 1) - 1) * ($('Parse_Dashboard_Request').item.json.payload.page_size || 100)] }}"
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres_credentials_id",
+          "name": "PostgreSQL Account"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "id": "2c9406d7-6d85-4aa4-9419-48e3a5beb41f",
+      "name": "Format_Dashboard_Appts_JSON",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1020,
+        260
+      ],
+      "parameters": {
+        "language": "javascript",
+        "jsCode": "const items = $input.all().map(i => i.json);\nconst total = items[0]?.total_count || items.length;\nreturn [{\n  json: {\n    success: true,\n    data: {\n      appointments: items,\n      total: total\n    }\n  }\n}];"
+      }
+    },
+    {
+      "id": "f6268e11-b5a1-435d-806e-35243443346d",
+      "name": "Respond_Dashboard_Appts_JSON",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1240,
+        260
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json) }}"
+      }
+    },
+    {
+      "id": "22ecaed3-6b49-4f13-994f-35a0df8fac64",
+      "name": "Prep_Manual_Create",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        800,
+        420
+      ],
+      "parameters": {
+        "language": "javascript",
+        "jsCode": "\nfunction getUtcFromLocal(dateStr, timeStr, timeZone) {\n  const [yyyy, mm, dd] = dateStr.split('-').map(Number);\n  const [hh, min] = timeStr.split(':').map(Number);\n  const utcDate = new Date(Date.UTC(yyyy, mm - 1, dd, hh, min, 0));\n  const invDate = new Date(utcDate.toLocaleString('en-US', { timeZone: 'UTC' }));\n  const targetDate = new Date(utcDate.toLocaleString('en-US', { timeZone: timeZone }));\n  const diff = targetDate.getTime() - invDate.getTime();\n  return new Date(utcDate.getTime() - diff);\n}\n\nfunction formatInTimezone(dateObj, timeZone, options) {\n  return new Intl.DateTimeFormat('en-US', { timeZone, ...options }).format(dateObj);\n}\n\nfunction getLocalWeekday(dateStr, timeStr, timeZone) {\n  const d = getUtcFromLocal(dateStr, timeStr || '12:00', timeZone);\n  const dayStr = new Intl.DateTimeFormat('en-US', { timeZone, weekday: 'short' }).format(d);\n  const map = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };\n  return map[dayStr];\n}\n\nconst payload = $input.item.json.payload || {};\nconst docId = payload.doctor_id || 'dr_smith';\n\nreturn [{\n  json: {\n    doctor_id: docId,\n    customer_name: payload.customer_name,\n    phone: String(payload.phone || '').replace(/[^0-9]/g, ''),\n    service: payload.service || 'General Consultation',\n    date: payload.date,\n    time: payload.time\n  }\n}];\n"
+      }
+    },
+    {
+      "id": "8a8313b6-0e3c-4baa-85a1-b2f6dc6adba9",
+      "name": "Postgres_Fetch_Doc_For_Manual",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1020,
+        420
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT * FROM doctors WHERE doctor_id = $1 AND is_active = TRUE;",
+        "queryParameters": "={{ [$json.doctor_id] }}"
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres_credentials_id",
+          "name": "PostgreSQL Account"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "id": "b1c94975-098d-42c7-8138-3bd23e6ef486",
+      "name": "Calc_Manual_Times",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1240,
+        420
+      ],
+      "parameters": {
+        "language": "javascript",
+        "jsCode": "\nfunction getUtcFromLocal(dateStr, timeStr, timeZone) {\n  const [yyyy, mm, dd] = dateStr.split('-').map(Number);\n  const [hh, min] = timeStr.split(':').map(Number);\n  const utcDate = new Date(Date.UTC(yyyy, mm - 1, dd, hh, min, 0));\n  const invDate = new Date(utcDate.toLocaleString('en-US', { timeZone: 'UTC' }));\n  const targetDate = new Date(utcDate.toLocaleString('en-US', { timeZone: timeZone }));\n  const diff = targetDate.getTime() - invDate.getTime();\n  return new Date(utcDate.getTime() - diff);\n}\n\nfunction formatInTimezone(dateObj, timeZone, options) {\n  return new Intl.DateTimeFormat('en-US', { timeZone, ...options }).format(dateObj);\n}\n\nfunction getLocalWeekday(dateStr, timeStr, timeZone) {\n  const d = getUtcFromLocal(dateStr, timeStr || '12:00', timeZone);\n  const dayStr = new Intl.DateTimeFormat('en-US', { timeZone, weekday: 'short' }).format(d);\n  const map = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };\n  return map[dayStr];\n}\n\nconst prev = $('Prep_Manual_Create').first().json;\nconst doc = $input.first()?.json || { doctor_id: prev.doctor_id, calendar_id: 'dr_smith@clinic.com', timezone: 'Asia/Kolkata' };\nconst tz = doc.timezone || 'Asia/Kolkata';\n\nconst startUtc = getUtcFromLocal(prev.date, prev.time, tz);\nconst endUtc = new Date(startUtc.getTime() + (doc.slot_duration_minutes || 30) * 60000);\n\nreturn [{\n  json: {\n    ...prev,\n    doctor_name: doc.doctor_name,\n    calendar_id: doc.calendar_id,\n    timezone: tz,\n    start_time_iso: startUtc.toISOString(),\n    end_time_iso: endUtc.toISOString()\n  }\n}];\n"
+      }
+    },
+    {
+      "id": "9736fa0d-a76c-4d09-b52e-8416b1435d2f",
+      "name": "GCal_Create_Manual_Event",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1.2,
+      "position": [
+        1460,
+        420
+      ],
+      "parameters": {
+        "operation": "create",
+        "calendar": {
+          "__rl": true,
+          "value": "={{ $json.calendar_id }}",
+          "mode": "id"
+        },
+        "start": "={{ $json.start_time_iso }}",
+        "end": "={{ $json.end_time_iso }}",
+        "summary": "={{ 'Appointment (Manual): ' + $json.customer_name + ' (' + $json.doctor_id + ')' }}",
+        "description": "={{ 'Patient Phone: ' + $json.phone + '\\nService: ' + $json.service + '\\nStatus: CONFIRMED' }}"
+      },
+      "credentials": {
+        "googleCalendarOAuth2": {
+          "id": "google_calendar_credentials_id",
+          "name": "Google Calendar Account"
+        }
+      }
+    },
+    {
+      "id": "83207d51-c421-42cf-9f67-cace84d2e613",
+      "name": "Postgres_Manual_Insert",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1680,
+        420
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "\n    INSERT INTO appointments (customer_name, phone, doctor_id, service, start_time, end_time, status, calendar_event_id, created_at, updated_at)\n    VALUES ($1, $2, $3, $4, $5, $6, 'CONFIRMED', $7, NOW(), NOW())\n    RETURNING *;\n    ",
+        "queryParameters": "={{ [$('Calc_Manual_Times').item.json.customer_name, $('Calc_Manual_Times').item.json.phone, $('Calc_Manual_Times').item.json.doctor_id, $('Calc_Manual_Times').item.json.service, $('Calc_Manual_Times').item.json.start_time_iso, $('Calc_Manual_Times').item.json.end_time_iso, $json.id] }}"
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres_credentials_id",
+          "name": "PostgreSQL Account"
+        }
+      }
+    },
+    {
+      "id": "565699eb-8915-47b8-b850-b77651136a3b",
+      "name": "Respond_Manual_Create_JSON",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1900,
+        420
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ success: true, data: { appointment: $json } }) }}"
+      }
+    },
+    {
+      "id": "729dc654-c6c7-4a5c-af43-d5256a69b62f",
+      "name": "Postgres_Dashboard_Update_Status",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        800,
+        580
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "\n    UPDATE appointments\n    SET status = $1, updated_at = NOW()\n    WHERE appointment_id = $2\n      AND (\n        ($1 = 'ARRIVED' AND status = 'CONFIRMED')\n        OR ($1 = 'COMPLETED' AND status IN ('ARRIVED', 'CONFIRMED'))\n        OR ($1 = 'NO_SHOW' AND status = 'CONFIRMED')\n        OR ($1 = 'CANCELLED' AND status IN ('PENDING', 'CONFIRMED'))\n      )\n    RETURNING *;\n    ",
+        "queryParameters": "={{ [$json.payload.status, $json.payload.appointment_id] }}"
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres_credentials_id",
+          "name": "PostgreSQL Account"
+        }
+      }
+    },
+    {
+      "id": "cabdffca-4f06-4762-99d6-082efdcf8221",
+      "name": "Respond_Dashboard_Status_JSON",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1020,
+        580
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ success: true, data: { updated: $json } }) }}"
+      }
+    },
+    {
+      "id": "a2b2ae83-75eb-4c92-a7b3-9ad8aa0a3b77",
+      "name": "Postgres_Fetch_Appt_For_Resched",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        800,
+        740
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "\n    SELECT a.*, d.calendar_id, d.timezone \n    FROM appointments a\n    JOIN doctors d ON a.doctor_id = d.doctor_id\n    WHERE a.appointment_id = $1 AND a.status = 'CONFIRMED';\n    ",
+        "queryParameters": "={{ [$json.payload.appointment_id] }}"
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres_credentials_id",
+          "name": "PostgreSQL Account"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "id": "c7b6053c-eb99-4a69-88d2-0cc7268e89a9",
+      "name": "Prep_Dashboard_Reschedule",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1020,
+        740
+      ],
+      "parameters": {
+        "language": "javascript",
+        "jsCode": "\nfunction getUtcFromLocal(dateStr, timeStr, timeZone) {\n  const [yyyy, mm, dd] = dateStr.split('-').map(Number);\n  const [hh, min] = timeStr.split(':').map(Number);\n  const utcDate = new Date(Date.UTC(yyyy, mm - 1, dd, hh, min, 0));\n  const invDate = new Date(utcDate.toLocaleString('en-US', { timeZone: 'UTC' }));\n  const targetDate = new Date(utcDate.toLocaleString('en-US', { timeZone: timeZone }));\n  const diff = targetDate.getTime() - invDate.getTime();\n  return new Date(utcDate.getTime() - diff);\n}\n\nfunction formatInTimezone(dateObj, timeZone, options) {\n  return new Intl.DateTimeFormat('en-US', { timeZone, ...options }).format(dateObj);\n}\n\nfunction getLocalWeekday(dateStr, timeStr, timeZone) {\n  const d = getUtcFromLocal(dateStr, timeStr || '12:00', timeZone);\n  const dayStr = new Intl.DateTimeFormat('en-US', { timeZone, weekday: 'short' }).format(d);\n  const map = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };\n  return map[dayStr];\n}\n\nconst appt = $input.first()?.json;\nconst payload = $('Parse_Dashboard_Request').first().json.payload || {};\n\nif (!appt || !appt.appointment_id) {\n  throw new Error('Appointment not found or not in CONFIRMED state.');\n}\n\nconst tz = appt.timezone || 'Asia/Kolkata';\nconst startUtc = getUtcFromLocal(payload.date, payload.time, tz);\nconst endUtc = new Date(startUtc.getTime() + 30 * 60000);\n\nreturn [{\n  json: {\n    appointment_id: appt.appointment_id,\n    calendar_id: appt.calendar_id,\n    calendar_event_id: appt.calendar_event_id,\n    start_time_iso: startUtc.toISOString(),\n    end_time_iso: endUtc.toISOString()\n  }\n}];\n"
+      }
+    },
+    {
+      "id": "26b6f692-b3c0-4a63-bc20-3c5e882191da",
+      "name": "GCal_Dashboard_Reschedule_Event",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1.2,
+      "position": [
+        1240,
+        740
+      ],
+      "parameters": {
+        "operation": "update",
+        "calendar": {
+          "__rl": true,
+          "value": "={{ $json.calendar_id }}",
+          "mode": "id"
+        },
+        "eventId": "={{ $json.calendar_event_id }}",
+        "start": "={{ $json.start_time_iso }}",
+        "end": "={{ $json.end_time_iso }}"
+      },
+      "credentials": {
+        "googleCalendarOAuth2": {
+          "id": "google_calendar_credentials_id",
+          "name": "Google Calendar Account"
+        }
+      }
+    },
+    {
+      "id": "942043f9-0325-48c8-9e92-6b4bb5ad7de4",
+      "name": "Postgres_Dashboard_Update_Resched",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1460,
+        740
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "\n    UPDATE appointments\n    SET start_time = $1,\n        end_time = $2,\n        status = 'CONFIRMED',\n        updated_at = NOW(),\n        reminder_3d_sent = FALSE,\n        reminder_1d_sent = FALSE,\n        reminder_4h_sent = FALSE,\n        reminder_1h_sent = FALSE\n    WHERE appointment_id = $3\n    RETURNING *;\n    ",
+        "queryParameters": "={{ [$('Prep_Dashboard_Reschedule').item.json.start_time_iso, $('Prep_Dashboard_Reschedule').item.json.end_time_iso, $('Prep_Dashboard_Reschedule').item.json.appointment_id] }}"
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres_credentials_id",
+          "name": "PostgreSQL Account"
+        }
+      }
+    },
+    {
+      "id": "edc7cde6-da7b-4198-950a-20c14e6e92f1",
+      "name": "Respond_Dashboard_Resched_JSON",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1680,
+        740
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ success: true, data: { rescheduled: $json } }) }}"
+      }
+    },
+    {
+      "id": "e08afb87-4054-4d0f-b8fc-3e4fccbd11ce",
+      "name": "Postgres_Fetch_Appt_For_Cancel",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        800,
+        900
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "\n    SELECT a.*, d.calendar_id \n    FROM appointments a\n    JOIN doctors d ON a.doctor_id = d.doctor_id\n    WHERE a.appointment_id = $1 AND a.status IN ('PENDING', 'CONFIRMED');\n    ",
+        "queryParameters": "={{ [$json.payload.appointment_id] }}"
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres_credentials_id",
+          "name": "PostgreSQL Account"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "id": "0917b2ed-9b5a-4829-aef3-ed22bfcf5fdd",
+      "name": "GCal_Dashboard_Delete_Cancel",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1.2,
+      "position": [
+        1020,
+        900
+      ],
+      "parameters": {
+        "operation": "delete",
+        "calendar": {
+          "__rl": true,
+          "value": "={{ $json.calendar_id }}",
+          "mode": "id"
+        },
+        "eventId": "={{ $json.calendar_event_id }}"
+      },
+      "credentials": {
+        "googleCalendarOAuth2": {
+          "id": "google_calendar_credentials_id",
+          "name": "Google Calendar Account"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "id": "31ee0fc9-d46d-4826-994e-51fad4f52484",
+      "name": "Postgres_Dashboard_Update_Cancel",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1240,
+        900
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "\n    UPDATE appointments\n    SET status = 'CANCELLED',\n        updated_at = NOW(),\n        reminder_3d_sent = TRUE,\n        reminder_1d_sent = TRUE,\n        reminder_4h_sent = TRUE,\n        reminder_1h_sent = TRUE\n    WHERE appointment_id = $1\n    RETURNING *;\n    ",
+        "queryParameters": "={{ [$('Postgres_Fetch_Appt_For_Cancel').item.json.appointment_id] }}"
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres_credentials_id",
+          "name": "PostgreSQL Account"
+        }
+      }
+    },
+    {
+      "id": "0872cd3c-1e43-4a9f-ae29-b3adf5ff6806",
+      "name": "Respond_Dashboard_Cancel_JSON",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1460,
+        900
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ success: true, data: { cancelled: $json } }) }}"
+      }
+    },
+    {
+      "id": "06915049-aaf5-489b-a181-2c01b8af27b5",
+      "name": "Postgres_Insert_Doctor_Leave",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        800,
+        1060
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "\n    WITH inserted_leave AS (\n      INSERT INTO doctor_unavailability (doctor_id, start_time, end_time, reason, created_at)\n      VALUES ($1, $2, $3, $4, NOW())\n      RETURNING *\n    )\n    SELECT \n      l.doctor_id, l.start_time, l.end_time, l.reason,\n      COALESCE(\n        json_agg(\n          json_build_object(\n            'appointment_id', a.appointment_id,\n            'customer_name', a.customer_name,\n            'phone', a.phone,\n            'start_time', a.start_time\n          )\n        ) FILTER (WHERE a.appointment_id IS NOT NULL), '[]'::json\n      ) AS affected_appointments\n    FROM inserted_leave l\n    LEFT JOIN appointments a ON a.doctor_id = l.doctor_id \n      AND a.status = 'CONFIRMED'\n      AND a.start_time < l.end_time \n      AND a.end_time > l.start_time\n    GROUP BY l.id, l.doctor_id, l.start_time, l.end_time, l.reason, l.created_at;\n    ",
+        "queryParameters": "={{ [$json.payload.doctor_id, $json.payload.start_time, $json.payload.end_time, $json.payload.reason] }}"
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres_credentials_id",
+          "name": "PostgreSQL Account"
+        }
+      }
+    },
+    {
+      "id": "0822d8a5-5574-4bf4-8cc2-07b11caad4fb",
+      "name": "Respond_Doctor_Leave_JSON",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1020,
+        1060
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ success: true, data: { leave: $json, affected_appointments: $json.affected_appointments } }) }}"
+      }
+    }
+  ],
+  "connections": {
+    "Reception_Dashboard_Webhook": {
+      "main": [
+        [
+          {
+            "node": "Parse_Dashboard_Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Reception_Dashboard_API_Webhook": {
+      "main": [
+        [
+          {
+            "node": "Parse_Dashboard_Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse_Dashboard_Request": {
+      "main": [
+        [
+          {
+            "node": "Route_Dashboard_Action",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route_Dashboard_Action": {
+      "main": [
+        [
+          {
+            "node": "Generate_Dashboard_HTML",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Postgres_Dashboard_Get_Appts",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prep_Manual_Create",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Postgres_Dashboard_Update_Status",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Postgres_Fetch_Appt_For_Resched",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Postgres_Fetch_Appt_For_Cancel",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Postgres_Insert_Doctor_Leave",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate_Dashboard_HTML": {
+      "main": [
+        [
+          {
+            "node": "Respond_Dashboard_HTML",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres_Dashboard_Get_Appts": {
+      "main": [
+        [
+          {
+            "node": "Format_Dashboard_Appts_JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format_Dashboard_Appts_JSON": {
+      "main": [
+        [
+          {
+            "node": "Respond_Dashboard_Appts_JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prep_Manual_Create": {
+      "main": [
+        [
+          {
+            "node": "Postgres_Fetch_Doc_For_Manual",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres_Fetch_Doc_For_Manual": {
+      "main": [
+        [
+          {
+            "node": "Calc_Manual_Times",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Calc_Manual_Times": {
+      "main": [
+        [
+          {
+            "node": "GCal_Create_Manual_Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GCal_Create_Manual_Event": {
+      "main": [
+        [
+          {
+            "node": "Postgres_Manual_Insert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres_Manual_Insert": {
+      "main": [
+        [
+          {
+            "node": "Respond_Manual_Create_JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres_Dashboard_Update_Status": {
+      "main": [
+        [
+          {
+            "node": "Respond_Dashboard_Status_JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres_Fetch_Appt_For_Resched": {
+      "main": [
+        [
+          {
+            "node": "Prep_Dashboard_Reschedule",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prep_Dashboard_Reschedule": {
+      "main": [
+        [
+          {
+            "node": "GCal_Dashboard_Reschedule_Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GCal_Dashboard_Reschedule_Event": {
+      "main": [
+        [
+          {
+            "node": "Postgres_Dashboard_Update_Resched",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres_Dashboard_Update_Resched": {
+      "main": [
+        [
+          {
+            "node": "Respond_Dashboard_Resched_JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres_Fetch_Appt_For_Cancel": {
+      "main": [
+        [
+          {
+            "node": "GCal_Dashboard_Delete_Cancel",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GCal_Dashboard_Delete_Cancel": {
+      "main": [
+        [
+          {
+            "node": "Postgres_Dashboard_Update_Cancel",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres_Dashboard_Update_Cancel": {
+      "main": [
+        [
+          {
+            "node": "Respond_Dashboard_Cancel_JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres_Insert_Doctor_Leave": {
+      "main": [
+        [
+          {
+            "node": "Respond_Doctor_Leave_JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "5eb95377-ae6b-45f9-8fff-cfbd69ba05ff",
+  "meta": {
+    "templateCredsSetupCompleted": false,
+    "instanceId": "03_Reception_Dashboard"
+  },
+  "id": "03_Reception_Dashboard",
+  "tags": [
+    {
+      "id": "reception-dashboard",
+      "name": "Reception Dashboard"
+    }
+  ]
+}

@@ -1,0 +1,182 @@
+{
+  "name": "02 - Appointment Reminder Engine",
+  "nodes": [
+    {
+      "id": "ff85960d-a821-4fbc-a10a-ceb364af76f4",
+      "name": "Schedule_Trigger_15Min",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        100,
+        100
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 15
+            }
+          ]
+        }
+      },
+      "notesInFlow": true,
+      "notes": "Autonomous 15-minute scheduler checking for upcoming confirmed appointments needing reminders"
+    },
+    {
+      "id": "6ab45d46-fa0c-4427-aa82-4f04ec7f9f73",
+      "name": "Postgres_Fetch_And_Claim_Due_Reminders",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        320,
+        100
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "\n    WITH due_candidates AS (\n      SELECT \n        a.appointment_id,\n        CASE \n          WHEN a.start_time <= NOW() + INTERVAL '3 days' AND a.start_time > NOW() + INTERVAL '1 day' \n               AND a.reminder_3d_sent = FALSE \n               AND (a.reminder_3d_claimed_at IS NULL OR a.reminder_3d_claimed_at < NOW() - INTERVAL '15 minutes') THEN '3D'\n          WHEN a.start_time <= NOW() + INTERVAL '1 day' AND a.start_time > NOW() + INTERVAL '4 hours' \n               AND a.reminder_1d_sent = FALSE \n               AND (a.reminder_1d_claimed_at IS NULL OR a.reminder_1d_claimed_at < NOW() - INTERVAL '15 minutes') THEN '1D'\n          WHEN a.start_time <= NOW() + INTERVAL '4 hours' AND a.start_time > NOW() + INTERVAL '1 hour' \n               AND a.reminder_4h_sent = FALSE \n               AND (a.reminder_4h_claimed_at IS NULL OR a.reminder_4h_claimed_at < NOW() - INTERVAL '15 minutes') THEN '4H'\n          WHEN a.start_time <= NOW() + INTERVAL '1 hour' AND a.start_time > NOW() \n               AND a.reminder_1h_sent = FALSE \n               AND (a.reminder_1h_claimed_at IS NULL OR a.reminder_1h_claimed_at < NOW() - INTERVAL '15 minutes') THEN '1H'\n          ELSE NULL\n        END AS tier\n      FROM appointments a\n      WHERE a.status = 'CONFIRMED'\n    ),\n    valid_due AS (\n      SELECT appointment_id, tier FROM due_candidates WHERE tier IS NOT NULL\n    )\n    UPDATE appointments a\n    SET \n      reminder_3d_claimed_at = CASE WHEN v.tier = '3D' THEN NOW() ELSE a.reminder_3d_claimed_at END,\n      reminder_1d_claimed_at = CASE WHEN v.tier = '1D' THEN NOW() ELSE a.reminder_1d_claimed_at END,\n      reminder_4h_claimed_at = CASE WHEN v.tier = '4H' THEN NOW() ELSE a.reminder_4h_claimed_at END,\n      reminder_1h_claimed_at = CASE WHEN v.tier = '1H' THEN NOW() ELSE a.reminder_1h_claimed_at END\n    FROM valid_due v\n    JOIN doctors d ON a.doctor_id = d.doctor_id\n    WHERE a.appointment_id = v.appointment_id\n    RETURNING \n      a.appointment_id, a.customer_name, a.phone, a.doctor_id, a.service, \n      a.start_time, a.end_time, a.status,\n      d.doctor_name, d.timezone, v.tier AS reminder_tier;\n    "
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres_credentials_id",
+          "name": "PostgreSQL Account"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "id": "7093014f-71cb-4e50-885a-1070db8df6c6",
+      "name": "Format_Reminder_Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        540,
+        100
+      ],
+      "parameters": {
+        "language": "javascript",
+        "jsCode": "\nfunction getUtcFromLocal(dateStr, timeStr, timeZone) {\n  const [yyyy, mm, dd] = dateStr.split('-').map(Number);\n  const [hh, min] = timeStr.split(':').map(Number);\n  const utcDate = new Date(Date.UTC(yyyy, mm - 1, dd, hh, min, 0));\n  const invDate = new Date(utcDate.toLocaleString('en-US', { timeZone: 'UTC' }));\n  const targetDate = new Date(utcDate.toLocaleString('en-US', { timeZone: timeZone }));\n  const diff = targetDate.getTime() - invDate.getTime();\n  return new Date(utcDate.getTime() - diff);\n}\n\nfunction formatInTimezone(dateObj, timeZone, options) {\n  return new Intl.DateTimeFormat('en-US', { timeZone, ...options }).format(dateObj);\n}\n\nfunction getLocalWeekday(dateStr, timeStr, timeZone) {\n  const d = getUtcFromLocal(dateStr, timeStr || '12:00', timeZone);\n  const dayStr = new Intl.DateTimeFormat('en-US', { timeZone, weekday: 'short' }).format(d);\n  const map = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };\n  return map[dayStr];\n}\n\nconst items = $input.all().map(i => i.json).filter(j => j.appointment_id && j.reminder_tier && j.status === 'CONFIRMED');\n\nconst results = [];\nfor (const appt of items) {\n  const tz = appt.timezone || 'Asia/Kolkata';\n  const startDt = new Date(appt.start_time);\n  const dateStr = formatInTimezone(startDt, tz, { month: 'short', day: 'numeric', year: 'numeric' });\n  const timeStr = formatInTimezone(startDt, tz, { hour: '2-digit', minute: '2-digit' });\n\n  let timeNotice = '';\n  if (appt.reminder_tier === '3D') timeNotice = 'in 3 days';\n  else if (appt.reminder_tier === '1D') timeNotice = 'tomorrow';\n  else if (appt.reminder_tier === '4H') timeNotice = 'in 4 hours';\n  else if (appt.reminder_tier === '1H') timeNotice = 'in 1 hour';\n\n  const body = `\ud83d\udd14 *APPOINTMENT REMINDER*\\n\\n` +\n  `Hello ${appt.customer_name}, this is a reminder for your upcoming visit ${timeNotice}.\\n\\n` +\n  `\ud83d\udccb *Reference:* #${appt.appointment_id}\\n` +\n  `\ud83d\udc68\u200d\u2695\ufe0f *Doctor:* ${appt.doctor_name || appt.doctor_id}\\n` +\n  `\ud83d\udcbc *Service:* ${appt.service}\\n` +\n  `\ud83d\udcc5 *Date:* ${dateStr}\\n` +\n  `\u23f0 *Time:* ${timeStr} (${tz})\\n\\n` +\n  `\ud83d\udccd *Location:* Apex Healthcare Clinic, Main Facility\\n\\n` +\n  `If you need to reschedule or cancel, please reply directly to this message.`;\n\n  results.push({\n    json: {\n      ...appt,\n      reminder_body: body\n    }\n  });\n}\n\nreturn results;\n"
+      }
+    },
+    {
+      "id": "fb6f0804-ebfe-4f3a-96bc-96cb629f1fbb",
+      "name": "Send_WhatsApp_Reminder",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        760,
+        100
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://graph.facebook.com/v20.0/FROM_PHONE_NUMBER_ID/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{\n{\n  \"messaging_product\": \"whatsapp\",\n  \"recipient_type\": \"individual\",\n  \"to\": $json.phone,\n  \"type\": \"text\",\n  \"text\": {\n    \"preview_url\": false,\n    \"body\": $json.reminder_body\n  }\n}\n}}"
+      },
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "whatsapp_cloud_api_credentials",
+          "name": "WhatsApp Cloud API Auth"
+        }
+      },
+      "notesInFlow": true,
+      "notes": "Only flows to Mark_Sent upon verified HTTP 200 WhatsApp delivery"
+    },
+    {
+      "id": "a636ebd9-34f1-429f-87e1-ce1652d1f8e1",
+      "name": "Postgres_Mark_Reminder_Sent",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        980,
+        100
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "\n    UPDATE appointments\n    SET reminder_3d_sent = CASE WHEN $1 = '3D' THEN TRUE ELSE reminder_3d_sent END,\n        reminder_1d_sent = CASE WHEN $1 = '1D' THEN TRUE ELSE reminder_1d_sent END,\n        reminder_4h_sent = CASE WHEN $1 = '4H' THEN TRUE ELSE reminder_4h_sent END,\n        reminder_1h_sent = CASE WHEN $1 = '1H' THEN TRUE ELSE reminder_1h_sent END,\n        updated_at = NOW()\n    WHERE appointment_id = $2;\n    ",
+        "queryParameters": "={{ [$json.reminder_tier, $json.appointment_id] }}"
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres_credentials_id",
+          "name": "PostgreSQL Account"
+        }
+      },
+      "continueOnFail": true
+    }
+  ],
+  "connections": {
+    "Schedule_Trigger_15Min": {
+      "main": [
+        [
+          {
+            "node": "Postgres_Fetch_And_Claim_Due_Reminders",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres_Fetch_And_Claim_Due_Reminders": {
+      "main": [
+        [
+          {
+            "node": "Format_Reminder_Payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format_Reminder_Payload": {
+      "main": [
+        [
+          {
+            "node": "Send_WhatsApp_Reminder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send_WhatsApp_Reminder": {
+      "main": [
+        [
+          {
+            "node": "Postgres_Mark_Reminder_Sent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "7b03be7e-5d9f-491d-bd30-cb4f9435ef01",
+  "meta": {
+    "templateCredsSetupCompleted": false,
+    "instanceId": "02_Appointment_Reminder_Engine"
+  },
+  "id": "02_Appointment_Reminder_Engine",
+  "tags": [
+    {
+      "id": "reminder-engine",
+      "name": "Reminder Engine"
+    }
+  ]
+}

@@ -1,0 +1,3204 @@
+{
+  "name": "AI WhatsApp Appointment Booking + Reminder + Reception System",
+  "nodes": [
+    {
+      "id": "05dd721e-d1f5-4e17-8a34-059d9e71c0b3",
+      "name": "DB_Init_Manual_Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        100,
+        100
+      ],
+      "parameters": {},
+      "notesInFlow": true,
+      "notes": "Execute once to initialize Postgres tables and schema."
+    },
+    {
+      "id": "76b188f8-00c2-4fa3-ac7a-261293837b3a",
+      "name": "Postgres_Init_Schema",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        320,
+        100
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "\n    CREATE TABLE IF NOT EXISTS appointments (\n        appointment_id SERIAL PRIMARY KEY,\n        customer_name VARCHAR(255) NOT NULL,\n        phone VARCHAR(50) NOT NULL,\n        doctor_id VARCHAR(100) NOT NULL,\n        service VARCHAR(255) NOT NULL,\n        start_time TIMESTAMP WITH TIME ZONE NOT NULL,\n        end_time TIMESTAMP WITH TIME ZONE NOT NULL,\n        status VARCHAR(50) DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'CONFIRMED', 'CANCELLED', 'RESCHEDULED', 'ARRIVED', 'COMPLETED', 'NO_SHOW')),\n        calendar_event_id VARCHAR(255),\n        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),\n        updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),\n        reminder_3d_sent BOOLEAN DEFAULT FALSE,\n        reminder_1d_sent BOOLEAN DEFAULT FALSE,\n        reminder_4h_sent BOOLEAN DEFAULT FALSE,\n        reminder_1h_sent BOOLEAN DEFAULT FALSE\n    );\n\n    CREATE TABLE IF NOT EXISTS doctor_unavailability (\n        id SERIAL PRIMARY KEY,\n        doctor_id VARCHAR(100) NOT NULL,\n        start_time TIMESTAMP WITH TIME ZONE NOT NULL,\n        end_time TIMESTAMP WITH TIME ZONE NOT NULL,\n        reason VARCHAR(255),\n        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()\n    );\n\n    CREATE INDEX IF NOT EXISTS idx_appointments_phone ON appointments(phone);\n    CREATE INDEX IF NOT EXISTS idx_appointments_status ON appointments(status);\n    CREATE INDEX IF NOT EXISTS idx_appointments_start_time ON appointments(start_time);\n    CREATE INDEX IF NOT EXISTS idx_doctor_unavailability_doc_time ON doctor_unavailability(doctor_id, start_time, end_time);\n    "
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres_credentials_id",
+          "name": "PostgreSQL Account"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "id": "c1ac5682-d146-4ce0-8165-916a49105849",
+      "name": "WhatsApp_Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        100,
+        500
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "whatsapp-webhook",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "notesInFlow": true,
+      "notes": "WhatsApp Inbound Webhook endpoint (/webhook/whatsapp-webhook)"
+    },
+    {
+      "id": "f7630f23-fa24-4dc7-b869-62f58ce7878a",
+      "name": "Parse_WhatsApp_Inbound",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        320,
+        500
+      ],
+      "parameters": {
+        "language": "javascript",
+        "jsCode": "// Safe WhatsApp payload extractor supporting Meta Cloud API, Twilio & generic payloads\nconst body = $input.item.json.body || $input.item.json;\nlet phone = '';\nlet customerName = 'Customer';\nlet message = '';\nlet channel = 'whatsapp';\n\nif (body.entry && body.entry[0]?.changes && body.entry[0].changes[0]?.value) {\n  // Meta WhatsApp Cloud API format\n  const val = body.entry[0].changes[0].value;\n  if (val.contacts && val.contacts[0]) {\n    customerName = val.contacts[0].profile?.name || customerName;\n  }\n  if (val.messages && val.messages[0]) {\n    const msgObj = val.messages[0];\n    phone = msgObj.from || '';\n    if (msgObj.type === 'text') {\n      message = msgObj.text?.body || '';\n    } else if (msgObj.type === 'interactive') {\n      message = msgObj.interactive?.button_reply?.title || msgObj.interactive?.list_reply?.title || '';\n    } else if (msgObj.type === 'button') {\n      message = msgObj.button?.text || '';\n    }\n  }\n} else if (body.From || body.Body) {\n  // Twilio format\n  phone = (body.From || '').replace('whatsapp:', '').trim();\n  customerName = body.ProfileName || customerName;\n  message = body.Body || '';\n  channel = 'twilio';\n} else {\n  // Direct generic json format\n  phone = String(body.phone || body.from || body.sender || '').replace(/[^0-9+]/g, '').trim();\n  customerName = body.name || body.customer_name || body.customerName || customerName;\n  message = body.message || body.text || body.body || '';\n}\n\nphone = phone.replace(/[^0-9]/g, '');\n\nreturn [{\n  json: {\n    phone: phone,\n    customer_name: customerName,\n    message: (message || '').trim(),\n    channel: channel,\n    received_at: new Date().toISOString()\n  }\n}];\n"
+      }
+    },
+    {
+      "id": "b75df82c-1f4e-423d-944c-7736bb37fed6",
+      "name": "Get_Customer_Context_Postgres",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        540,
+        500
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT appointment_id, customer_name, phone, doctor_id, service, start_time, end_time, status, calendar_event_id, reminder_3d_sent, reminder_1d_sent, reminder_4h_sent, reminder_1h_sent, created_at, updated_at FROM appointments WHERE phone = $1 ORDER BY updated_at DESC LIMIT 10;",
+        "queryParameters": "={{ [$json.phone] }}"
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres_credentials_id",
+          "name": "PostgreSQL Account"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "id": "20d72500-af3e-43f2-b587-bcdc4ea6893b",
+      "name": "Merge_Context_For_AI",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        760,
+        500
+      ],
+      "parameters": {
+        "language": "javascript",
+        "jsCode": "// Retrieve input from inbound parser and DB query\nconst inbound = $('Parse_WhatsApp_Inbound').first().json;\nconst dbItems = $input.all().map(i => i.json).filter(j => j.appointment_id);\n\nconst activePending = dbItems.find(a => a.status === 'PENDING');\nconst activeConfirmed = dbItems.find(a => a.status === 'CONFIRMED' || a.status === 'RESCHEDULED');\n\n// Clinic configuration\nconst clinicConfig = {\n  name: \"Apex Healthcare Clinic\",\n  timezone: \"UTC\",\n  working_hours: {\n    start: \"09:00\",\n    end: \"17:00\",\n    slot_duration_minutes: 30,\n    buffer_minutes: 0,\n    working_days: [\"Monday\", \"Tuesday\", \"Wednesday\", \"Thursday\", \"Friday\", \"Saturday\"],\n    closed_days: [\"Sunday\"]\n  },\n  doctors: [\n    { id: \"dr_smith\", name: \"Dr. John Smith\", specialty: \"General Physician\" },\n    { id: \"dr_emily\", name: \"Dr. Emily Davis\", specialty: \"Dental Specialist\" },\n    { id: \"dr_robert\", name: \"Dr. Robert Wilson\", specialty: \"Cardiologist\" }\n  ],\n  services: [\n    \"General Consultation\",\n    \"Dental Checkup\",\n    \"Teeth Cleaning\",\n    \"Cardiology Consultation\",\n    \"ECG & Follow-up\"\n  ]\n};\n\nconst now = new Date();\nconst todayStr = now.toISOString().split('T')[0];\nconst dayOfWeek = [\"Sunday\", \"Monday\", \"Tuesday\", \"Wednesday\", \"Thursday\", \"Friday\", \"Saturday\"][now.getDay()];\n\n// Build system prompt for Gemini\nconst prompt = `You are an intelligent clinical appointment receptionist AI for ${clinicConfig.name}.\nCurrent Date: ${todayStr} (${dayOfWeek}).\nClinic Working Hours: 09:00 - 17:00, Monday to Saturday. Closed on Sundays.\nDoctors Available:\n${clinicConfig.doctors.map(d => `- ${d.id}: ${d.name} (${d.specialty})`).join('\\n')}\nServices: ${clinicConfig.services.join(', ')}\n\nCustomer Information:\n- Name: ${inbound.customer_name || 'Valued Patient'}\n- Phone: ${inbound.phone}\n- Latest Customer Message: \"${inbound.message}\"\n\nCustomer Active Context:\n- Pending Hold Appointment: ${activePending ? JSON.stringify(activePending) : 'None'}\n- Confirmed Upcoming Appointment: ${activeConfirmed ? JSON.stringify(activeConfirmed) : 'None'}\n\nYour Task:\nAnalyze the message and return a strictly structured JSON response.\n\nIntents:\n1. \"BOOK\" -> Customer wants to book a new appointment or picked a specific date/time/doctor.\n2. \"CHECK_AVAILABILITY\" -> Customer is asking if a doctor or time slot is free without explicitly confirming booking yet.\n3. \"CONFIRM\" -> Customer says \"YES\", \"CONFIRM\", \"OK\", \"Sure\", \"book it\", or confirms the pending slot.\n4. \"RESCHEDULE\" -> Customer wants to change the date/time of their existing appointment.\n5. \"CANCEL\" -> Customer wants to cancel their appointment.\n6. \"GENERAL_QUESTIONS\" -> Customer is asking general queries (services, doctor info, address, working hours).\n7. \"UNKNOWN\" -> Any unintelligible or unrelated query.\n\nIMPORTANT INSTRUCTIONS:\n- If there is an active Pending Hold appointment and customer says \"YES\", \"CONFIRM\", \"Y\", \"Sure\", \"go ahead\" -> INTENT IS \"CONFIRM\".\n- DO NOT invent calendar availability. Google Calendar is the source of truth.\n- Extract requested_date in YYYY-MM-DD format (resolve relative dates like \"tomorrow\", \"next Monday\", \"Wednesday\").\n- Extract requested_time in 24-hour HH:MM format (e.g. 09:30, 14:00, 16:30).\n- Extract doctor_id matching one of [dr_smith, dr_emily, dr_robert] or default to dr_smith if unspecified.\n- Extract service if mentioned.\n\nOutput MUST be a single raw JSON object with this exact structure:\n{\n  \"intent\": \"BOOK\" | \"CHECK_AVAILABILITY\" | \"CONFIRM\" | \"RESCHEDULE\" | \"CANCEL\" | \"GENERAL_QUESTIONS\" | \"UNKNOWN\",\n  \"doctor_id\": \"dr_smith\" | \"dr_emily\" | \"dr_robert\" | null,\n  \"doctor_name\": string | null,\n  \"service\": string | null,\n  \"requested_date\": \"YYYY-MM-DD\" | null,\n  \"requested_time\": \"HH:MM\" | null,\n  \"appointment_id\": number | null,\n  \"general_answer\": string | null,\n  \"notes\": string | null\n}`;\n\nreturn [{\n  json: {\n    phone: inbound.phone,\n    customer_name: inbound.customer_name,\n    message: inbound.message,\n    channel: inbound.channel,\n    received_at: inbound.received_at,\n    active_pending: activePending || null,\n    active_confirmed: activeConfirmed || null,\n    all_db_appointments: dbItems,\n    clinic_config: clinicConfig,\n    today_str: todayStr,\n    gemini_prompt: prompt\n  }\n}];\n"
+      }
+    },
+    {
+      "id": "c8b26e76-f2a7-45d5-963e-167ac3fb821d",
+      "name": "Gemini_AI_Agent",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        980,
+        500
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "x-goog-api-key",
+              "value": "={{ $node[\"Merge_Context_For_AI\"].json.gemini_api_key || \"\" }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{\n{\n  \"contents\": [\n    {\n      \"role\": \"user\",\n      \"parts\": [\n        {\n          \"text\": $json.gemini_prompt\n        }\n      ]\n    }\n  ],\n  \"generationConfig\": {\n    \"temperature\": 0.1,\n    \"topK\": 1,\n    \"topP\": 0.9,\n    \"responseMimeType\": \"application/json\"\n  }\n}\n}}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "continueOnFail": true,
+      "notesInFlow": true,
+      "notes": "Calls Google Gemini 1.5 Flash to extract intent and entities in JSON"
+    },
+    {
+      "id": "bbff49b7-43c6-4b09-9a8e-7259eaf099bb",
+      "name": "Parse_Gemini_Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1200,
+        500
+      ],
+      "parameters": {
+        "language": "javascript",
+        "jsCode": "const prev = $('Merge_Context_For_AI').first().json;\nconst response = $input.item.json;\n\nlet aiResult = {\n  intent: 'UNKNOWN',\n  doctor_id: 'dr_smith',\n  doctor_name: 'Dr. John Smith',\n  service: 'General Consultation',\n  requested_date: null,\n  requested_time: null,\n  appointment_id: null,\n  general_answer: null,\n  notes: null\n};\n\n// Check user quick confirmation keywords directly\nconst cleanMsg = (prev.message || '').trim().toLowerCase();\nconst isDirectConfirm = ['yes', 'confirm', 'y', 'sure', 'ok', 'okay', 'proceed', 'book it', 'yes please', 'confirm please'].includes(cleanMsg);\n\nif (prev.active_pending && isDirectConfirm) {\n  aiResult.intent = 'CONFIRM';\n  aiResult.appointment_id = prev.active_pending.appointment_id;\n  aiResult.doctor_id = prev.active_pending.doctor_id;\n  aiResult.service = prev.active_pending.service;\n} else if (response && response.candidates && response.candidates[0]?.content?.parts?.[0]?.text) {\n  try {\n    let rawText = response.candidates[0].content.parts[0].text.trim();\n    if (rawText.startsWith('```json')) {\n      rawText = rawText.replace(/^```json\\n?/, '').replace(/\\n?```$/, '');\n    } else if (rawText.startsWith('```')) {\n      rawText = rawText.replace(/^```\\n?/, '').replace(/\\n?```$/, '');\n    }\n    const parsed = JSON.parse(rawText);\n    aiResult = { ...aiResult, ...parsed };\n  } catch (e) {\n    if (cleanMsg.includes('cancel')) aiResult.intent = 'CANCEL';\n    else if (cleanMsg.includes('reschedule') || cleanMsg.includes('change')) aiResult.intent = 'RESCHEDULE';\n    else if (cleanMsg.includes('book') || cleanMsg.includes('appointment')) aiResult.intent = 'BOOK';\n    else if (cleanMsg.includes('available') || cleanMsg.includes('free')) aiResult.intent = 'CHECK_AVAILABILITY';\n    else aiResult.intent = 'GENERAL_QUESTIONS';\n  }\n} else {\n  if (prev.active_pending && isDirectConfirm) {\n    aiResult.intent = 'CONFIRM';\n  } else if (cleanMsg.includes('cancel')) {\n    aiResult.intent = 'CANCEL';\n  } else if (cleanMsg.includes('reschedule')) {\n    aiResult.intent = 'RESCHEDULE';\n  } else if (cleanMsg.includes('book') || cleanMsg.includes('slot')) {\n    aiResult.intent = 'BOOK';\n  } else {\n    aiResult.intent = 'GENERAL_QUESTIONS';\n    aiResult.general_answer = 'Welcome to Apex Healthcare Clinic! You can book an appointment, check available doctor slots, reschedule, or cancel anytime. How may we assist you today?';\n  }\n}\n\nconst doctorMap = {\n  dr_smith: 'Dr. John Smith (General Physician)',\n  dr_emily: 'Dr. Emily Davis (Dental Specialist)',\n  dr_robert: 'Dr. Robert Wilson (Cardiologist)'\n};\n\nif (!aiResult.doctor_id && prev.active_pending) {\n  aiResult.doctor_id = prev.active_pending.doctor_id;\n}\nif (!aiResult.doctor_id && prev.active_confirmed) {\n  aiResult.doctor_id = prev.active_confirmed.doctor_id;\n}\nif (!aiResult.doctor_id) {\n  aiResult.doctor_id = 'dr_smith';\n}\naiResult.doctor_name = doctorMap[aiResult.doctor_id] || 'Dr. John Smith (General Physician)';\n\nreturn [{\n  json: {\n    phone: prev.phone,\n    customer_name: prev.customer_name,\n    message: prev.message,\n    channel: prev.channel,\n    received_at: prev.received_at,\n    active_pending: prev.active_pending,\n    active_confirmed: prev.active_confirmed,\n    all_db_appointments: prev.all_db_appointments,\n    clinic_config: prev.clinic_config,\n    today_str: prev.today_str,\n    intent: (aiResult.intent || 'GENERAL_QUESTIONS').toUpperCase(),\n    doctor_id: aiResult.doctor_id,\n    doctor_name: aiResult.doctor_name,\n    service: aiResult.service || 'General Consultation',\n    requested_date: aiResult.requested_date,\n    requested_time: aiResult.requested_time,\n    appointment_id: aiResult.appointment_id || (prev.active_pending ? prev.active_pending.appointment_id : null),\n    general_answer: aiResult.general_answer,\n    notes: aiResult.notes\n  }\n}];\n"
+      }
+    },
+    {
+      "id": "147f5685-bcf3-41d6-83e7-7402b99f6a7d",
+      "name": "Route_Intent",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [
+        1440,
+        500
+      ],
+      "parameters": {
+        "mode": "rules",
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": false,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.intent }}",
+                    "rightValue": "BOOK",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": false,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.intent }}",
+                    "rightValue": "CHECK_AVAILABILITY",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": false,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.intent }}",
+                    "rightValue": "CONFIRM",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": false,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.intent }}",
+                    "rightValue": "RESCHEDULE",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": false,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.intent }}",
+                    "rightValue": "CANCEL",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": false,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.intent }}",
+                    "rightValue": "GENERAL_QUESTIONS",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "fallbackOutput": 6
+      },
+      "notesInFlow": true,
+      "notes": "Routes message by extracted intent"
+    },
+    {
+      "id": "2db67bdb-c4b1-41ad-b657-976c7d9747d5",
+      "name": "Validate_Booking_Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1700,
+        300
+      ],
+      "parameters": {
+        "language": "javascript",
+        "jsCode": "const item = $input.item.json;\nlet needsInfo = false;\nlet missingFields = [];\nlet replyMsg = '';\n\nif (!item.requested_date) {\n  needsInfo = true;\n  missingFields.push('preferred date (e.g., Tomorrow, 2026-09-10)');\n}\n\nif (!item.requested_time) {\n  needsInfo = true;\n  missingFields.push('preferred time (e.g., 10:00 AM, 02:30 PM)');\n}\n\nif (needsInfo) {\n  replyMsg = `Hello ${item.customer_name || 'there'}! To check availability with ${item.doctor_name || 'our doctor'}, please provide your ${missingFields.join(' and ')}.`;\n} else {\n  const dateObj = new Date(`${item.requested_date}T${item.requested_time}:00Z`);\n  const day = dateObj.getUTCDay();\n  if (day === 0) {\n    needsInfo = true;\n    replyMsg = `We are closed on Sundays. Our working hours are Monday to Saturday, 09:00 to 17:00. Please select another date.`;\n  } else {\n    const [hh, mm] = item.requested_time.split(':').map(Number);\n    if (hh < 9 || (hh === 17 && mm > 0) || hh > 17) {\n      needsInfo = true;\n      replyMsg = `Our clinic working hours are 09:00 to 17:00. The requested time (${item.requested_time}) is outside working hours. Please pick a slot between 09:00 and 16:30.`;\n    }\n  }\n}\n\nconst startIso = item.requested_date ? `${item.requested_date}T00:00:00.000Z` : new Date().toISOString();\nconst endIso = item.requested_date ? `${item.requested_date}T23:59:59.000Z` : new Date(Date.now() + 86400000).toISOString();\n\nreturn [{\n  json: {\n    ...item,\n    needs_info: needsInfo,\n    missing_fields: missingFields,\n    missing_info_message: replyMsg,\n    gcal_time_min: startIso,\n    gcal_time_max: endIso\n  }\n}];\n"
+      }
+    },
+    {
+      "id": "b45d1ab7-d8ce-411f-be3b-8d03f81830c1",
+      "name": "If_Needs_Booking_Info",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1920,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.needs_info }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "7e965989-0785-4904-b0d4-69b656d3bd89",
+      "name": "Send_WhatsApp_Missing_Info",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2150,
+        180
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://graph.facebook.com/v20.0/FROM_PHONE_NUMBER_ID/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer {{ $node[\"Merge_Context_For_AI\"].json.whatsapp_token || \"\" }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{\n{\n  \"messaging_product\": \"whatsapp\",\n  \"recipient_type\": \"individual\",\n  \"to\": $json.phone,\n  \"type\": \"text\",\n  \"text\": {\n    \"preview_url\": false,\n    \"body\": $json.missing_info_message\n  }\n}\n}}",
+        "options": {}
+      },
+      "continueOnFail": true,
+      "notesInFlow": true,
+      "notes": "Sends WhatsApp response asking for missing details or working hours notice"
+    },
+    {
+      "id": "2cd1e21a-e2f7-4aa5-803c-871ca3ab70c5",
+      "name": "Respond_Missing_Info",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        2380,
+        180
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'info_requested', phone: $('Validate_Booking_Input').item.json.phone }) }}"
+      }
+    },
+    {
+      "id": "9383a2c6-b11a-4779-a08b-290364ac644b",
+      "name": "GCal_Get_Events_For_Date",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1.2,
+      "position": [
+        2150,
+        400
+      ],
+      "parameters": {
+        "operation": "getAll",
+        "calendar": {
+          "__rl": true,
+          "value": "primary",
+          "mode": "list"
+        },
+        "options": {
+          "timeMin": "={{ $json.gcal_time_min }}",
+          "timeMax": "={{ $json.gcal_time_max }}",
+          "singleEvents": true,
+          "orderBy": "startTime"
+        }
+      },
+      "credentials": {
+        "googleCalendarOAuth2": {
+          "id": "google_calendar_credentials_id",
+          "name": "Google Calendar Account"
+        }
+      },
+      "continueOnFail": true,
+      "notesInFlow": true,
+      "notes": "Fetches existing Google Calendar events for the requested day to ensure zero double booking"
+    },
+    {
+      "id": "643b9c82-43b2-4861-8b8c-12c997705ab3",
+      "name": "Calculate_Available_Slots",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2380,
+        400
+      ],
+      "parameters": {
+        "language": "javascript",
+        "jsCode": "const prev = $('Validate_Booking_Input').first().json;\nconst gcalItems = $input.all().map(i => i.json).filter(j => j.id || j.start);\n\nconst reqDate = prev.requested_date;\nconst reqTime = prev.requested_time;\nconst slotDuration = prev.clinic_config?.working_hours?.slot_duration_minutes || 30;\n\nconst reqStart = new Date(`${reqDate}T${reqTime}:00Z`);\nconst reqEnd = new Date(reqStart.getTime() + slotDuration * 60000);\n\nfunction isOverlap(startA, endA, events) {\n  for (const ev of events) {\n    const evStartStr = ev.start?.dateTime || ev.start?.date;\n    const evEndStr = ev.end?.dateTime || ev.end?.date;\n    if (!evStartStr || !evEndStr) continue;\n    const evStart = new Date(evStartStr);\n    const evEnd = new Date(evEndStr);\n    if (startA < evEnd && endA > evStart) {\n      return true;\n    }\n  }\n  return false;\n}\n\nconst isRequestedFree = !isOverlap(reqStart, reqEnd, gcalItems);\n\nconst allDaySlots = [];\nconst startHour = 9;\nconst endHour = 17;\n\nfor (let h = startHour; h < endHour; h++) {\n  for (let m = 0; m < 60; m += slotDuration) {\n    const hhStr = String(h).padStart(2, '0');\n    const mmStr = String(m).padStart(2, '0');\n    const timeStr = `${hhStr}:${mmStr}`;\n    const sTime = new Date(`${reqDate}T${timeStr}:00Z`);\n    const eTime = new Date(sTime.getTime() + slotDuration * 60000);\n\n    const now = new Date();\n    if (sTime <= now) continue;\n\n    if (!isOverlap(sTime, eTime, gcalItems)) {\n      allDaySlots.push(timeStr);\n    }\n  }\n}\n\nconst alternatives = allDaySlots.slice(0, 4);\n\nreturn [{\n  json: {\n    ...prev,\n    is_slot_available: isRequestedFree,\n    start_time_iso: reqStart.toISOString(),\n    end_time_iso: reqEnd.toISOString(),\n    available_alternatives: alternatives,\n    existing_events_count: gcalItems.length\n  }\n}];\n"
+      }
+    },
+    {
+      "id": "ac75f426-a0cf-4308-9647-c0d18791267c",
+      "name": "If_Slot_Available",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        2600,
+        400
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.is_slot_available }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "c016c543-3fd4-46af-815b-c0793881fe16",
+      "name": "Format_Unavailable_Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2840,
+        260
+      ],
+      "parameters": {
+        "language": "javascript",
+        "jsCode": "const item = $input.item.json;\nconst alts = item.available_alternatives || [];\nlet msg = '';\n\nif (alts.length > 0) {\n  msg = `\u26a0\ufe0f Sorry, ${item.doctor_name || 'the doctor'} is not available on ${item.requested_date} at ${item.requested_time}.\\n\\nHere are the next available slots on ${item.requested_date}:\\n` +\n        alts.map(s => `\ud83d\udd39 ${s}`).join('\\n') +\n        `\\n\\nPlease reply with your preferred time from the list above to proceed with booking.`;\n} else {\n  msg = `\u26a0\ufe0f Sorry, all appointment slots for ${item.doctor_name || 'the doctor'} are fully booked on ${item.requested_date}.\\n\\nPlease suggest another date (e.g., the following working day) and we will check availability immediately!`;\n}\n\nreturn [{\n  json: {\n    ...item,\n    unavailable_whatsapp_msg: msg\n  }\n}];\n"
+      }
+    },
+    {
+      "id": "1efa6480-a951-439e-babf-d5a6c733657a",
+      "name": "Send_WhatsApp_Alternatives",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3060,
+        260
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://graph.facebook.com/v20.0/FROM_PHONE_NUMBER_ID/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer {{ $node[\"Merge_Context_For_AI\"].json.whatsapp_token || \"\" }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{\n{\n  \"messaging_product\": \"whatsapp\",\n  \"recipient_type\": \"individual\",\n  \"to\": $json.phone,\n  \"type\": \"text\",\n  \"text\": {\n    \"preview_url\": false,\n    \"body\": $json.unavailable_whatsapp_msg\n  }\n}\n}}",
+        "options": {}
+      },
+      "continueOnFail": true
+    },
+    {
+      "id": "1c530ca5-40ca-4c64-8460-35edde89755e",
+      "name": "Respond_Alternatives_Sent",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        3280,
+        260
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'alternatives_offered', phone: $('Format_Unavailable_Message').item.json.phone }) }}"
+      }
+    },
+    {
+      "id": "91d0b56a-d16e-46c2-af9d-04c0cccaa286",
+      "name": "If_Check_Availability_Only",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        2840,
+        450
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.intent }}",
+              "rightValue": "CHECK_AVAILABILITY",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "c45dd6aa-57ae-4375-927b-c9d7b74e956e",
+      "name": "Send_WhatsApp_Availability_Notice",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3060,
+        380
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://graph.facebook.com/v20.0/FROM_PHONE_NUMBER_ID/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer {{ $node[\"Merge_Context_For_AI\"].json.whatsapp_token || \"\" }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{\n{\n  \"messaging_product\": \"whatsapp\",\n  \"recipient_type\": \"individual\",\n  \"to\": $json.phone,\n  \"type\": \"text\",\n  \"text\": {\n    \"preview_url\": false,\n    \"body\": \"\u2705 Good news! \" + $json.doctor_name + \" is AVAILABLE on \" + $json.requested_date + \" at \" + $json.requested_time + \".\\n\\nWould you like me to book this slot for you? Reply *BOOK* or *YES* to proceed.\"\n  }\n}\n}}",
+        "options": {}
+      },
+      "continueOnFail": true
+    },
+    {
+      "id": "fb570398-bf02-4c79-8b60-59877b093032",
+      "name": "Respond_Availability_Notice",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        3280,
+        380
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'availability_notified', available: true }) }}"
+      }
+    },
+    {
+      "id": "67fbc7bb-1a3e-46a4-8e1c-982f9ee4a1d4",
+      "name": "Postgres_Insert_Pending_Appt",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        3060,
+        520
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO appointments (customer_name, phone, doctor_id, service, start_time, end_time, status, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, 'PENDING', NOW(), NOW()) RETURNING appointment_id, customer_name, phone, doctor_id, service, start_time, end_time, status;",
+        "queryParameters": "={{ [$json.customer_name, $json.phone, $json.doctor_id, $json.service, $json.start_time_iso, $json.end_time_iso] }}"
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres_credentials_id",
+          "name": "PostgreSQL Account"
+        }
+      }
+    },
+    {
+      "id": "9cc1a719-e028-4443-aa2e-755f1c4bc543",
+      "name": "Format_Pending_WhatsApp_Msg",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3280,
+        520
+      ],
+      "parameters": {
+        "language": "javascript",
+        "jsCode": "const prev = $('Calculate_Available_Slots').first().json;\nconst appt = $input.item.json;\n\nconst dateStr = prev.requested_date;\nconst timeStr = prev.requested_time;\nconst doctor = prev.doctor_name || prev.doctor_id;\nconst service = prev.service || 'Consultation';\n\nconst message = `\ud83d\udccb *APPOINTMENT PROPOSAL (PENDING CONFIRMATION)*\\n\\n` +\n`\ud83d\udc64 Patient: ${prev.customer_name || 'Valued Patient'}\\n` +\n`\ud83d\udc68\u200d\u2695\ufe0f Doctor: ${doctor}\\n` +\n`\ud83d\udcbc Service: ${service}\\n` +\n`\ud83d\udcc5 Date: ${dateStr}\\n` +\n`\u23f0 Time: ${timeStr}\\n\\n` +\n`We have tentatively held this slot for you.\\n` +\n`\ud83d\udc49 *Please reply YES or CONFIRM to finalize your booking.*`;\n\nreturn [{\n  json: {\n    ...prev,\n    appointment_id: appt.appointment_id,\n    pending_whatsapp_msg: message\n  }\n}];\n"
+      }
+    },
+    {
+      "id": "b1b4d634-b8f0-4954-94b4-3923eea9b828",
+      "name": "Send_WhatsApp_Pending_Confirmation_Prompt",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3500,
+        520
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://graph.facebook.com/v20.0/FROM_PHONE_NUMBER_ID/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer {{ $node[\"Merge_Context_For_AI\"].json.whatsapp_token || \"\" }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{\n{\n  \"messaging_product\": \"whatsapp\",\n  \"recipient_type\": \"individual\",\n  \"to\": $json.phone,\n  \"type\": \"text\",\n  \"text\": {\n    \"preview_url\": false,\n    \"body\": $json.pending_whatsapp_msg\n  }\n}\n}}",
+        "options": {}
+      },
+      "continueOnFail": true
+    },
+    {
+      "id": "f6624a1e-732b-4297-bd62-464f135b1d6c",
+      "name": "Respond_Pending_Created",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        3720,
+        520
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'pending_hold_created', appointment_id: $('Format_Pending_WhatsApp_Msg').item.json.appointment_id }) }}"
+      }
+    },
+    {
+      "id": "869ba86a-ef9d-47d3-a61e-a57c88caab0e",
+      "name": "Validate_Pending_For_Confirm",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1700,
+        700
+      ],
+      "parameters": {
+        "language": "javascript",
+        "jsCode": "const prev = $input.item.json;\nconst pending = prev.active_pending;\n\nif (!pending || !pending.start_time || !pending.end_time) {\n  return [{\n    json: {\n      ...prev,\n      has_valid_pending: false,\n      error_msg: \"You do not currently have any pending appointment held. Reply with a date and time (e.g. 'Book tomorrow at 10 AM') to start a new booking.\"\n    }\n  }];\n}\n\nreturn [{\n  json: {\n    ...prev,\n    has_valid_pending: true,\n    appointment_id: pending.appointment_id,\n    start_time_iso: new Date(pending.start_time).toISOString(),\n    end_time_iso: new Date(pending.end_time).toISOString(),\n    doctor_id: pending.doctor_id,\n    service: pending.service,\n    customer_name: pending.customer_name || prev.customer_name\n  }\n}];\n"
+      }
+    },
+    {
+      "id": "d91afadc-da5d-492f-9ff0-98e8d7f5d19e",
+      "name": "If_Has_Pending_Appt",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1920,
+        700
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.has_valid_pending }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "6862a405-8830-4005-8982-efce4f9308e0",
+      "name": "Send_WhatsApp_No_Pending",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2150,
+        600
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://graph.facebook.com/v20.0/FROM_PHONE_NUMBER_ID/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer {{ $node[\"Merge_Context_For_AI\"].json.whatsapp_token || \"\" }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{\n{\n  \"messaging_product\": \"whatsapp\",\n  \"recipient_type\": \"individual\",\n  \"to\": $json.phone,\n  \"type\": \"text\",\n  \"text\": {\n    \"preview_url\": false,\n    \"body\": $json.error_msg\n  }\n}\n}}",
+        "options": {}
+      },
+      "continueOnFail": true
+    },
+    {
+      "id": "1e26518a-f252-4b88-a64b-dcf334f03db0",
+      "name": "Respond_No_Pending",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        2380,
+        600
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'no_pending_found' }) }}"
+      }
+    },
+    {
+      "id": "1c58227d-3b5d-4e50-81bc-630c057a5f40",
+      "name": "GCal_Final_Availability_Check",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1.2,
+      "position": [
+        2150,
+        780
+      ],
+      "parameters": {
+        "operation": "getAll",
+        "calendar": {
+          "__rl": true,
+          "value": "primary",
+          "mode": "list"
+        },
+        "options": {
+          "timeMin": "={{ $json.start_time_iso }}",
+          "timeMax": "={{ $json.end_time_iso }}",
+          "singleEvents": true
+        }
+      },
+      "credentials": {
+        "googleCalendarOAuth2": {
+          "id": "google_calendar_credentials_id",
+          "name": "Google Calendar Account"
+        }
+      },
+      "continueOnFail": true,
+      "notesInFlow": true,
+      "notes": "Final required GCal availability check to eliminate race-condition double bookings"
+    },
+    {
+      "id": "47ef6613-1204-4601-b6e8-0a846f367d23",
+      "name": "Verify_Final_Availability",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2380,
+        780
+      ],
+      "parameters": {
+        "language": "javascript",
+        "jsCode": "const prev = $('Validate_Pending_For_Confirm').first().json;\nconst gcalItems = $input.all().map(i => i.json).filter(j => j.id || j.start);\n\nconst reqStart = new Date(prev.start_time_iso);\nconst reqEnd = new Date(prev.end_time_iso);\n\nlet isFree = true;\nfor (const ev of gcalItems) {\n  const evStart = new Date(ev.start?.dateTime || ev.start?.date);\n  const evEnd = new Date(ev.end?.dateTime || ev.end?.date);\n  if (reqStart < evEnd && reqEnd > evStart) {\n    isFree = false;\n    break;\n  }\n}\n\nreturn [{\n  json: {\n    ...prev,\n    is_final_slot_free: isFree\n  }\n}];\n"
+      }
+    },
+    {
+      "id": "38752825-161a-4731-b4b8-fd900935515e",
+      "name": "If_Final_Slot_Free",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        2600,
+        780
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.is_final_slot_free }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "9833016d-2c57-4302-911c-d6cdc26a1261",
+      "name": "Postgres_Mark_Interim_Conflict",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2840,
+        680
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE appointments SET status = 'CANCELLED', updated_at = NOW() WHERE appointment_id = $1;",
+        "queryParameters": "={{ [$json.appointment_id] }}"
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres_credentials_id",
+          "name": "PostgreSQL Account"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "id": "d0895362-af23-4c9b-a8bb-788048edb18c",
+      "name": "Send_WhatsApp_Interim_Conflict",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3060,
+        680
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://graph.facebook.com/v20.0/FROM_PHONE_NUMBER_ID/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer {{ $node[\"Merge_Context_For_AI\"].json.whatsapp_token || \"\" }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{\n{\n  \"messaging_product\": \"whatsapp\",\n  \"recipient_type\": \"individual\",\n  \"to\": $json.phone,\n  \"type\": \"text\",\n  \"text\": {\n    \"preview_url\": false,\n    \"body\": \"\u26a0\ufe0f We are sorry! That time slot was just booked by another patient. Please reply with another date or time and we will secure it for you right away.\"\n  }\n}\n}}",
+        "options": {}
+      },
+      "continueOnFail": true
+    },
+    {
+      "id": "a25bd965-1e12-4ff9-826e-d5b255749a55",
+      "name": "Respond_Interim_Conflict",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        3280,
+        680
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'slot_taken_interim' }) }}"
+      }
+    },
+    {
+      "id": "ea843815-ab71-44b5-bf89-e78cfbe5f03d",
+      "name": "GCal_Create_Confirmed_Event",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1.2,
+      "position": [
+        2840,
+        880
+      ],
+      "parameters": {
+        "operation": "create",
+        "calendar": {
+          "__rl": true,
+          "value": "primary",
+          "mode": "list"
+        },
+        "start": "={{ $json.start_time_iso }}",
+        "end": "={{ $json.end_time_iso }}",
+        "summary": "={{ 'Appointment: ' + $json.customer_name + ' (' + $json.doctor_id + ')' }}",
+        "description": "={{ 'Patient Phone: ' + $json.phone + '\\nService: ' + $json.service + '\\nDoctor: ' + $json.doctor_id + '\\nStatus: CONFIRMED\\nAppt ID: ' + $json.appointment_id }}"
+      },
+      "credentials": {
+        "googleCalendarOAuth2": {
+          "id": "google_calendar_credentials_id",
+          "name": "Google Calendar Account"
+        }
+      },
+      "continueOnFail": true,
+      "notesInFlow": true,
+      "notes": "Creates the official calendar booking in Google Calendar"
+    },
+    {
+      "id": "c0208302-8c00-45ab-b663-f8177182f6d9",
+      "name": "Postgres_Update_To_Confirmed",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        3060,
+        880
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE appointments SET status = 'CONFIRMED', calendar_event_id = $1, updated_at = NOW(), reminder_3d_sent = FALSE, reminder_1d_sent = FALSE, reminder_4h_sent = FALSE, reminder_1h_sent = FALSE WHERE appointment_id = $2 RETURNING appointment_id, customer_name, phone, doctor_id, service, start_time, end_time, status, calendar_event_id;",
+        "queryParameters": "={{ [$('GCal_Create_Confirmed_Event').item.json.id || 'GCAL_' + Date.now(), $('Verify_Final_Availability').item.json.appointment_id] }}"
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres_credentials_id",
+          "name": "PostgreSQL Account"
+        }
+      }
+    },
+    {
+      "id": "a3428bfc-cb8d-4d37-962e-063a7affb0c6",
+      "name": "Format_Confirmed_Receipt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3280,
+        880
+      ],
+      "parameters": {
+        "language": "javascript",
+        "jsCode": "const prev = $('Verify_Final_Availability').first().json;\nconst appt = $input.item.json;\n\nconst startDt = new Date(prev.start_time_iso);\nconst dateStr = startDt.toISOString().split('T')[0];\nconst timeStr = startDt.toISOString().split('T')[1].substring(0, 5);\n\nconst message = `\ud83c\udf89 *APPOINTMENT CONFIRMED!*\\n\\n` +\n`\u2705 *Booking Reference:* #${appt.appointment_id || prev.appointment_id}\\n` +\n`\ud83d\udc64 *Patient:* ${prev.customer_name}\\n` +\n`\ud83d\udc68\u200d\u2695\ufe0f *Doctor:* ${prev.doctor_name || prev.doctor_id}\\n` +\n`\ud83d\udcbc *Service:* ${prev.service}\\n` +\n`\ud83d\udcc5 *Date:* ${dateStr}\\n` +\n`\u23f0 *Time:* ${timeStr} (UTC)\\n\\n` +\n`\ud83d\udccd *Location:* Apex Healthcare Clinic, Main Facility\\n\\n` +\n`We have added your appointment to our system. You will receive automatic reminders prior to your visit. Reply RESCHEDULE or CANCEL at any time if your plans change.`;\n\nreturn [{\n  json: {\n    ...prev,\n    appointment_id: appt.appointment_id || prev.appointment_id,\n    confirmed_whatsapp_msg: message\n  }\n}];\n"
+      }
+    },
+    {
+      "id": "4e6c0b00-2b80-4cb8-a1ae-2cfcd391c6ee",
+      "name": "Send_WhatsApp_Confirmed_Receipt",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3500,
+        880
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://graph.facebook.com/v20.0/FROM_PHONE_NUMBER_ID/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer {{ $node[\"Merge_Context_For_AI\"].json.whatsapp_token || \"\" }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{\n{\n  \"messaging_product\": \"whatsapp\",\n  \"recipient_type\": \"individual\",\n  \"to\": $json.phone,\n  \"type\": \"text\",\n  \"text\": {\n    \"preview_url\": false,\n    \"body\": $json.confirmed_whatsapp_msg\n  }\n}\n}}",
+        "options": {}
+      },
+      "continueOnFail": true
+    },
+    {
+      "id": "7f02c48f-f7a1-4c2c-9dcc-d8af915e435b",
+      "name": "Respond_Confirmed_Success",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        3720,
+        880
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'confirmed', appointment_id: $('Format_Confirmed_Receipt').item.json.appointment_id }) }}"
+      }
+    },
+    {
+      "id": "fc93fb45-d1a1-4c81-996f-fdc868ac7a3d",
+      "name": "Validate_Reschedule_Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1700,
+        1050
+      ],
+      "parameters": {
+        "language": "javascript",
+        "jsCode": "const prev = $input.item.json;\nconst active = prev.active_confirmed;\n\nif (!active) {\n  return [{\n    json: {\n      ...prev,\n      can_reschedule: false,\n      error_msg: \"You do not have any active confirmed appointment to reschedule. Reply with a date and time to book a new appointment.\"\n    }\n  }];\n}\n\nif (!prev.requested_date || !prev.requested_time) {\n  const currentStart = new Date(active.start_time).toISOString().replace('T', ' ').substring(0, 16);\n  return [{\n    json: {\n      ...prev,\n      can_reschedule: false,\n      error_msg: `Your current appointment (#${active.appointment_id}) is scheduled for ${currentStart}.\\n\\nPlease reply with your new requested date and time (e.g. 'Reschedule to tomorrow at 3 PM').`\n    }\n  }];\n}\n\nconst slotDuration = prev.clinic_config?.working_hours?.slot_duration_minutes || 30;\nconst newStart = new Date(`${prev.requested_date}T${prev.requested_time}:00Z`);\nconst newEnd = new Date(newStart.getTime() + slotDuration * 60000);\n\nreturn [{\n  json: {\n    ...prev,\n    can_reschedule: true,\n    appointment_id: active.appointment_id,\n    calendar_event_id: active.calendar_event_id,\n    new_start_iso: newStart.toISOString(),\n    new_end_iso: newEnd.toISOString()\n  }\n}];\n"
+      }
+    },
+    {
+      "id": "4d1a71c6-dcff-4928-bcce-c92243600d8b",
+      "name": "If_Can_Reschedule",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1920,
+        1050
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.can_reschedule }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "f203a54b-79ec-47cd-9d43-d00c40d2834a",
+      "name": "Send_WhatsApp_Reschedule_Notice",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2150,
+        950
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://graph.facebook.com/v20.0/FROM_PHONE_NUMBER_ID/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer {{ $node[\"Merge_Context_For_AI\"].json.whatsapp_token || \"\" }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{\n{\n  \"messaging_product\": \"whatsapp\",\n  \"recipient_type\": \"individual\",\n  \"to\": $json.phone,\n  \"type\": \"text\",\n  \"text\": {\n    \"preview_url\": false,\n    \"body\": $json.error_msg\n  }\n}\n}}",
+        "options": {}
+      },
+      "continueOnFail": true
+    },
+    {
+      "id": "81cdef70-2f37-4ac9-8238-72c3482d99d6",
+      "name": "Respond_Reschedule_Notice",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        2380,
+        950
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'reschedule_info_needed' }) }}"
+      }
+    },
+    {
+      "id": "3eba18d8-bc3f-458b-abbf-68c2837bf5ec",
+      "name": "GCal_Check_Reschedule_Slot",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1.2,
+      "position": [
+        2150,
+        1150
+      ],
+      "parameters": {
+        "operation": "getAll",
+        "calendar": {
+          "__rl": true,
+          "value": "primary",
+          "mode": "list"
+        },
+        "options": {
+          "timeMin": "={{ $json.new_start_iso }}",
+          "timeMax": "={{ $json.new_end_iso }}",
+          "singleEvents": true
+        }
+      },
+      "credentials": {
+        "googleCalendarOAuth2": {
+          "id": "google_calendar_credentials_id",
+          "name": "Google Calendar Account"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "id": "6d84ffb0-1280-4605-89fe-96f9ab20fe7e",
+      "name": "Process_Reschedule_Availability",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2380,
+        1150
+      ],
+      "parameters": {
+        "language": "javascript",
+        "jsCode": "const prev = $('Validate_Reschedule_Request').first().json;\nconst gcalItems = $input.all().map(i => i.json).filter(j => j.id || j.start);\n\nconst reqStart = new Date(prev.new_start_iso);\nconst reqEnd = new Date(prev.new_end_iso);\n\nlet isFree = true;\nfor (const ev of gcalItems) {\n  if (prev.calendar_event_id && ev.id === prev.calendar_event_id) continue;\n  const evStart = new Date(ev.start?.dateTime || ev.start?.date);\n  const evEnd = new Date(ev.end?.dateTime || ev.end?.date);\n  if (reqStart < evEnd && reqEnd > evStart) {\n    isFree = false;\n    break;\n  }\n}\n\nreturn [{\n  json: {\n    ...prev,\n    is_reschedule_slot_free: isFree\n  }\n}];\n"
+      }
+    },
+    {
+      "id": "be469141-8840-4af1-b35a-05014436f9fc",
+      "name": "If_Reschedule_Slot_Free",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        2600,
+        1150
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.is_reschedule_slot_free }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "9126529e-abe1-401d-b588-b66880902f1d",
+      "name": "Send_WhatsApp_Reschedule_Busy",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2840,
+        1050
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://graph.facebook.com/v20.0/FROM_PHONE_NUMBER_ID/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer {{ $node[\"Merge_Context_For_AI\"].json.whatsapp_token || \"\" }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{\n{\n  \"messaging_product\": \"whatsapp\",\n  \"recipient_type\": \"individual\",\n  \"to\": $json.phone,\n  \"type\": \"text\",\n  \"text\": {\n    \"preview_url\": false,\n    \"body\": \"\u26a0\ufe0f That new slot (\" + $json.requested_date + \" at \" + $json.requested_time + \") is currently occupied. Please suggest another time slot for your appointment.\"\n  }\n}\n}}",
+        "options": {}
+      },
+      "continueOnFail": true
+    },
+    {
+      "id": "785f3c55-a877-4324-b36c-5e8bb4309af5",
+      "name": "Respond_Reschedule_Busy",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        3060,
+        1050
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'reschedule_slot_busy' }) }}"
+      }
+    },
+    {
+      "id": "5507de48-870a-4004-bd87-0de5e734c46d",
+      "name": "GCal_Update_Rescheduled_Event",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1.2,
+      "position": [
+        2840,
+        1250
+      ],
+      "parameters": {
+        "operation": "update",
+        "calendar": {
+          "__rl": true,
+          "value": "primary",
+          "mode": "list"
+        },
+        "eventId": "={{ $json.calendar_event_id }}",
+        "start": "={{ $json.new_start_iso }}",
+        "end": "={{ $json.new_end_iso }}",
+        "updateFields": {
+          "summary": "={{ 'Appointment (RESCHEDULED): ' + $json.customer_name + ' (' + $json.doctor_id + ')' }}",
+          "description": "={{ 'Patient Phone: ' + $json.phone + '\\nService: ' + $json.service + '\\nStatus: RESCHEDULED\\nAppt ID: ' + $json.appointment_id }}"
+        }
+      },
+      "credentials": {
+        "googleCalendarOAuth2": {
+          "id": "google_calendar_credentials_id",
+          "name": "Google Calendar Account"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "id": "656eb281-fc7f-4630-91c7-71c74c458ef3",
+      "name": "Postgres_Update_Rescheduled",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        3060,
+        1250
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE appointments SET start_time = $1, end_time = $2, status = 'CONFIRMED', updated_at = NOW(), reminder_3d_sent = FALSE, reminder_1d_sent = FALSE, reminder_4h_sent = FALSE, reminder_1h_sent = FALSE WHERE appointment_id = $3 RETURNING *;",
+        "queryParameters": "={{ [$json.new_start_iso, $json.new_end_iso, $json.appointment_id] }}"
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres_credentials_id",
+          "name": "PostgreSQL Account"
+        }
+      }
+    },
+    {
+      "id": "161ee629-3db6-4dbf-bfa6-67ae6f44dc0d",
+      "name": "Send_WhatsApp_Reschedule_Success",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3280,
+        1250
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://graph.facebook.com/v20.0/FROM_PHONE_NUMBER_ID/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer {{ $node[\"Merge_Context_For_AI\"].json.whatsapp_token || \"\" }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{\n{\n  \"messaging_product\": \"whatsapp\",\n  \"recipient_type\": \"individual\",\n  \"to\": $json.phone,\n  \"type\": \"text\",\n  \"text\": {\n    \"preview_url\": false,\n    \"body\": \"\ud83d\uddd3\ufe0f *APPOINTMENT RESCHEDULED!*\\n\\nYour appointment (#\" + $json.appointment_id + \") has been successfully rescheduled to \" + $json.start_time + \".\\n\\nWe look forward to welcoming you!\"\n  }\n}\n}}",
+        "options": {}
+      },
+      "continueOnFail": true
+    },
+    {
+      "id": "4736e9d7-9614-4e0f-a28a-0804088ac177",
+      "name": "Respond_Reschedule_Success",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        3500,
+        1250
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'rescheduled', appointment_id: $('Postgres_Update_Rescheduled').item.json.appointment_id }) }}"
+      }
+    },
+    {
+      "id": "57894e01-7150-4d2f-ac0e-8215bfe9b873",
+      "name": "Validate_Cancel_Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1700,
+        1400
+      ],
+      "parameters": {
+        "language": "javascript",
+        "jsCode": "const prev = $input.item.json;\nconst target = prev.active_confirmed || prev.active_pending;\n\nif (!target) {\n  return [{\n    json: {\n      ...prev,\n      has_cancel_target: false,\n      error_msg: \"You do not have any active appointments to cancel.\"\n    }\n  }];\n}\n\nreturn [{\n  json: {\n    ...prev,\n    has_cancel_target: true,\n    appointment_id: target.appointment_id,\n    calendar_event_id: target.calendar_event_id,\n    cancel_start_time: target.start_time\n  }\n}];\n"
+      }
+    },
+    {
+      "id": "cdf62c67-cbb9-47db-b80b-92431ecac2a6",
+      "name": "If_Has_Appt_To_Cancel",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1920,
+        1400
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.has_cancel_target }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "3a0ace9d-16f4-48de-b971-ffd6be688153",
+      "name": "Send_WhatsApp_No_Cancel_Target",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2150,
+        1320
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://graph.facebook.com/v20.0/FROM_PHONE_NUMBER_ID/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer {{ $node[\"Merge_Context_For_AI\"].json.whatsapp_token || \"\" }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{\n{\n  \"messaging_product\": \"whatsapp\",\n  \"recipient_type\": \"individual\",\n  \"to\": $json.phone,\n  \"type\": \"text\",\n  \"text\": {\n    \"preview_url\": false,\n    \"body\": $json.error_msg\n  }\n}\n}}",
+        "options": {}
+      },
+      "continueOnFail": true
+    },
+    {
+      "id": "ec9210f0-f6ea-4112-a8cf-6292dc667605",
+      "name": "Respond_No_Cancel_Target",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        2380,
+        1320
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'no_appointment_to_cancel' }) }}"
+      }
+    },
+    {
+      "id": "bc98d395-3bbe-469a-99d1-25178b53b5dd",
+      "name": "GCal_Delete_Cancelled_Event",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1.2,
+      "position": [
+        2150,
+        1480
+      ],
+      "parameters": {
+        "operation": "delete",
+        "calendar": {
+          "__rl": true,
+          "value": "primary",
+          "mode": "list"
+        },
+        "eventId": "={{ $json.calendar_event_id || 'NONE' }}"
+      },
+      "credentials": {
+        "googleCalendarOAuth2": {
+          "id": "google_calendar_credentials_id",
+          "name": "Google Calendar Account"
+        }
+      },
+      "continueOnFail": true,
+      "notesInFlow": true,
+      "notes": "Deletes the corresponding Google Calendar event"
+    },
+    {
+      "id": "2180fa34-ee4e-40bf-b0d0-94763f5fafd2",
+      "name": "Postgres_Update_Cancelled",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2380,
+        1480
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE appointments SET status = 'CANCELLED', updated_at = NOW(), reminder_3d_sent = TRUE, reminder_1d_sent = TRUE, reminder_4h_sent = TRUE, reminder_1h_sent = TRUE WHERE appointment_id = $1 RETURNING *;",
+        "queryParameters": "={{ [$('Validate_Cancel_Request').item.json.appointment_id] }}"
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres_credentials_id",
+          "name": "PostgreSQL Account"
+        }
+      }
+    },
+    {
+      "id": "64f894ea-b499-48e4-a5e1-addf5e8466ad",
+      "name": "Send_WhatsApp_Cancel_Success",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2600,
+        1480
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://graph.facebook.com/v20.0/FROM_PHONE_NUMBER_ID/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer {{ $node[\"Merge_Context_For_AI\"].json.whatsapp_token || \"\" }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{\n{\n  \"messaging_product\": \"whatsapp\",\n  \"recipient_type\": \"individual\",\n  \"to\": $json.phone,\n  \"type\": \"text\",\n  \"text\": {\n    \"preview_url\": false,\n    \"body\": \"\u274c *APPOINTMENT CANCELLED*\\n\\nYour appointment (#\" + $json.appointment_id + \") has been successfully cancelled. No further reminders will be sent.\\n\\nYou are welcome to book again whenever convenient.\"\n  }\n}\n}}",
+        "options": {}
+      },
+      "continueOnFail": true
+    },
+    {
+      "id": "9f5b4471-efaf-45cf-8038-98e628f906c0",
+      "name": "Respond_Cancel_Success",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        2840,
+        1480
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'cancelled', appointment_id: $('Postgres_Update_Cancelled').item.json.appointment_id }) }}"
+      }
+    },
+    {
+      "id": "c49c49ef-e13d-4ea8-b22c-db2e8d09808f",
+      "name": "Format_General_Reply",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1700,
+        1620
+      ],
+      "parameters": {
+        "language": "javascript",
+        "jsCode": "const prev = $input.item.json;\nconst reply = prev.general_answer || `Welcome to Apex Healthcare Clinic!\\n\\n\ud83d\udccd Location: 100 Health Avenue, Suite 400\\n\u23f0 Hours: Monday - Saturday, 09:00 - 17:00 (Sundays Closed)\\n\ud83d\udcde Reception: +1-800-555-APEX\\n\\nHow can we assist you today? You can reply with a date and time to book an appointment with our specialists.`;\n\nreturn [{\n  json: {\n    ...prev,\n    general_reply_text: reply\n  }\n}];\n"
+      }
+    },
+    {
+      "id": "9476dc91-2857-4f80-ba55-3703e763479d",
+      "name": "Send_WhatsApp_General_Reply",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1920,
+        1620
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://graph.facebook.com/v20.0/FROM_PHONE_NUMBER_ID/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer {{ $node[\"Merge_Context_For_AI\"].json.whatsapp_token || \"\" }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{\n{\n  \"messaging_product\": \"whatsapp\",\n  \"recipient_type\": \"individual\",\n  \"to\": $json.phone,\n  \"type\": \"text\",\n  \"text\": {\n    \"preview_url\": false,\n    \"body\": $json.general_reply_text\n  }\n}\n}}",
+        "options": {}
+      },
+      "continueOnFail": true
+    },
+    {
+      "id": "cff3c8d2-da07-4cc5-9a52-7453c0175d04",
+      "name": "Respond_General_Reply",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        2150,
+        1620
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'general_reply_sent' }) }}"
+      }
+    },
+    {
+      "id": "d293ed4e-87d9-49c5-8737-28b095360d9f",
+      "name": "Schedule_Trigger_15Min",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        100,
+        2000
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 15
+            }
+          ]
+        }
+      },
+      "notesInFlow": true,
+      "notes": "Automated scheduler running every 15 minutes to find upcoming appointments needing reminders"
+    },
+    {
+      "id": "297a83f9-6637-458c-ad6a-cbb514c3e2cf",
+      "name": "Postgres_Fetch_Due_Reminders",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        320,
+        2000
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT appointment_id, customer_name, phone, doctor_id, service, start_time, end_time, status, reminder_3d_sent, reminder_1d_sent, reminder_4h_sent, reminder_1h_sent, CASE WHEN start_time >= NOW() + INTERVAL '71 hours' AND start_time <= NOW() + INTERVAL '73 hours' AND reminder_3d_sent = FALSE THEN '3D' WHEN start_time >= NOW() + INTERVAL '23 hours' AND start_time <= NOW() + INTERVAL '25 hours' AND reminder_1d_sent = FALSE THEN '1D' WHEN start_time >= NOW() + INTERVAL '3 hours 45 minutes' AND start_time <= NOW() + INTERVAL '4 hours 15 minutes' AND reminder_4h_sent = FALSE THEN '4H' WHEN start_time >= NOW() + INTERVAL '45 minutes' AND start_time <= NOW() + INTERVAL '1 hour 15 minutes' AND reminder_1h_sent = FALSE THEN '1H' ELSE NULL END AS reminder_tier FROM appointments WHERE status = 'CONFIRMED' AND ((start_time >= NOW() + INTERVAL '71 hours' AND start_time <= NOW() + INTERVAL '73 hours' AND reminder_3d_sent = FALSE) OR (start_time >= NOW() + INTERVAL '23 hours' AND start_time <= NOW() + INTERVAL '25 hours' AND reminder_1d_sent = FALSE) OR (start_time >= NOW() + INTERVAL '3 hours 45 minutes' AND start_time <= NOW() + INTERVAL '4 hours 15 minutes' AND reminder_4h_sent = FALSE) OR (start_time >= NOW() + INTERVAL '45 minutes' AND start_time <= NOW() + INTERVAL '1 hour 15 minutes' AND reminder_1h_sent = FALSE));"
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres_credentials_id",
+          "name": "PostgreSQL Account"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "id": "08be4621-3626-4eec-9c1e-12dd3326d8ee",
+      "name": "Format_Reminder_Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        540,
+        2000
+      ],
+      "parameters": {
+        "language": "javascript",
+        "jsCode": "const items = $input.all().map(i => i.json).filter(j => j.appointment_id && j.reminder_tier && j.status === 'CONFIRMED');\n\nconst results = [];\nfor (const appt of items) {\n  const startDt = new Date(appt.start_time);\n  const dateStr = startDt.toISOString().split('T')[0];\n  const timeStr = startDt.toISOString().split('T')[1].substring(0, 5);\n\n  let timeNotice = '';\n  if (appt.reminder_tier === '3D') timeNotice = 'in 3 days';\n  else if (appt.reminder_tier === '1D') timeNotice = 'tomorrow';\n  else if (appt.reminder_tier === '4H') timeNotice = 'in 4 hours';\n  else if (appt.reminder_tier === '1H') timeNotice = 'in 1 hour';\n\n  const body = `\ud83d\udd14 *APPOINTMENT REMINDER*\\n\\n` +\n  `Hello ${appt.customer_name}, this is a friendly reminder for your upcoming appointment ${timeNotice}.\\n\\n` +\n  `\ud83d\udccb *Reference:* #${appt.appointment_id}\\n` +\n  `\ud83d\udc68\u200d\u2695\ufe0f *Doctor:* ${appt.doctor_id}\\n` +\n  `\ud83d\udcbc *Service:* ${appt.service}\\n` +\n  `\ud83d\udcc5 *Date:* ${dateStr}\\n` +\n  `\u23f0 *Time:* ${timeStr} (UTC)\\n\\n` +\n  `\ud83d\udccd *Location:* Apex Healthcare Clinic\\n\\n` +\n  `If you need to reschedule or cancel, please reply directly to this message.`;\n\n  results.push({\n    json: {\n      ...appt,\n      reminder_body: body\n    }\n  });\n}\n\nreturn results;\n"
+      }
+    },
+    {
+      "id": "a3e26353-a775-4a68-bd22-16e6d47d4544",
+      "name": "Send_WhatsApp_Reminder",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        760,
+        2000
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "https://graph.facebook.com/v20.0/FROM_PHONE_NUMBER_ID/messages",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer {{ $node[\"Merge_Context_For_AI\"].json.whatsapp_token || \"\" }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{\n{\n  \"messaging_product\": \"whatsapp\",\n  \"recipient_type\": \"individual\",\n  \"to\": $json.phone,\n  \"type\": \"text\",\n  \"text\": {\n    \"preview_url\": false,\n    \"body\": $json.reminder_body\n  }\n}\n}}",
+        "options": {}
+      },
+      "continueOnFail": true
+    },
+    {
+      "id": "3f985851-10d6-4e69-8812-45ea65ac1763",
+      "name": "Postgres_Mark_Reminder_Sent",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        980,
+        2000
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE appointments SET reminder_3d_sent = CASE WHEN $1 = '3D' THEN TRUE ELSE reminder_3d_sent END, reminder_1d_sent = CASE WHEN $1 = '1D' THEN TRUE ELSE reminder_1d_sent END, reminder_4h_sent = CASE WHEN $1 = '4H' THEN TRUE ELSE reminder_4h_sent END, reminder_1h_sent = CASE WHEN $1 = '1H' THEN TRUE ELSE reminder_1h_sent END, updated_at = NOW() WHERE appointment_id = $2;",
+        "queryParameters": "={{ [$json.reminder_tier, $json.appointment_id] }}"
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres_credentials_id",
+          "name": "PostgreSQL Account"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "id": "207e6ea6-bf86-4d46-b8d2-78528146a33e",
+      "name": "Reception_Dashboard_Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        100,
+        2600
+      ],
+      "parameters": {
+        "httpMethod": "GET",
+        "path": "reception-dashboard",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "notesInFlow": true,
+      "notes": "Serves Reception Staff Dashboard Web UI and handles all API management actions"
+    },
+    {
+      "id": "d1f6f879-a217-47e1-80cb-736eafaaaf03",
+      "name": "Reception_Dashboard_API_Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        100,
+        2800
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "reception-dashboard",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "notesInFlow": true,
+      "notes": "Handles POST API actions from the dashboard"
+    },
+    {
+      "id": "b88a81a6-5196-43d6-8c27-035b1ed12f7b",
+      "name": "Parse_Dashboard_Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        320,
+        2700
+      ],
+      "parameters": {
+        "language": "javascript",
+        "jsCode": "const item = $input.item.json;\nconst headers = item.headers || {};\nconst query = item.query || {};\nconst body = item.body || {};\n\nlet action = 'SERVE_HTML';\nif (body.action) {\n  action = body.action;\n} else if (query.action) {\n  action = query.action;\n}\n\nreturn [{\n  json: {\n    action: action,\n    payload: body,\n    query: query,\n    received_at: new Date().toISOString()\n  }\n}];\n"
+      }
+    },
+    {
+      "id": "23ac448c-2ae9-4506-b422-3e63b0c23558",
+      "name": "Route_Dashboard_Action",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [
+        540,
+        2700
+      ],
+      "parameters": {
+        "mode": "rules",
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": false,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "SERVE_HTML",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": false,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "GET_APPOINTMENTS",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": false,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "CREATE_APPOINTMENT",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": false,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "UPDATE_STATUS",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": false,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "RESCHEDULE_APPOINTMENT",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": false,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "CANCEL_APPOINTMENT",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": false,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "SET_DOCTOR_LEAVE",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "fallbackOutput": 0
+      }
+    },
+    {
+      "id": "01d0e2f7-c1a8-4bba-8596-230b37ddc591",
+      "name": "Generate_Dashboard_HTML",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        800,
+        2400
+      ],
+      "parameters": {
+        "language": "javascript",
+        "jsCode": "const html = `<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n  <meta charset=\"UTF-8\">\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n  <title>Apex Healthcare - Reception & Booking Dashboard</title>\n  <link href=\"https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css\" rel=\"stylesheet\">\n  <link href=\"https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css\" rel=\"stylesheet\">\n  <style>\n    :root { --primary-color: #0d6efd; --sidebar-bg: #1e293b; }\n    body { background-color: #f8fafc; font-family: 'Segoe UI', system-ui, sans-serif; }\n    .navbar-custom { background-color: #0f172a; color: #fff; }\n    .card-stat { border-radius: 12px; border: none; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); }\n    .table-responsive { background: #fff; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05); padding: 16px; }\n    .badge-status { font-size: 0.85rem; padding: 6px 12px; border-radius: 20px; }\n    .status-CONFIRMED { background-color: #dbeafe; color: #1e40af; }\n    .status-PENDING { background-color: #fef3c7; color: #92400e; }\n    .status-ARRIVED { background-color: #e0e7ff; color: #3730a3; }\n    .status-COMPLETED { background-color: #d1fae5; color: #065f46; }\n    .status-CANCELLED { background-color: #fee2e2; color: #991b1b; }\n    .status-NO_SHOW { background-color: #f3f4f6; color: #4b5563; }\n  </style>\n</head>\n<body>\n  <nav class=\"navbar navbar-expand-lg navbar-custom px-4 py-3\">\n    <div class=\"container-fluid\">\n      <span class=\"navbar-brand text-white fw-bold\"><i class=\"fa-solid fa-hospital-user me-2 text-primary\"></i>Apex Healthcare Clinic - Reception Desk</span>\n      <div class=\"d-flex align-items-center gap-2\">\n        <button class=\"btn btn-primary btn-sm\" onclick=\"openNewModal()\"><i class=\"fa-solid fa-plus me-1\"></i> New Appointment</button>\n        <button class=\"btn btn-outline-light btn-sm\" onclick=\"openLeaveModal()\"><i class=\"fa-solid fa-user-clock me-1\"></i> Doctor Leave</button>\n        <button class=\"btn btn-secondary btn-sm\" onclick=\"loadAppointments()\"><i class=\"fa-solid fa-rotate me-1\"></i> Refresh</button>\n      </div>\n    </div>\n  </nav>\n\n  <div class=\"container-fluid px-4 py-4\">\n    <!-- Stat Cards -->\n    <div class=\"row g-3 mb-4\">\n      <div class=\"col-md-3\">\n        <div class=\"card card-stat bg-white p-3\">\n          <div class=\"d-flex justify-content-between align-items-center\">\n            <div>\n              <span class=\"text-muted small\">Today's Total</span>\n              <h3 class=\"fw-bold mt-1 mb-0\" id=\"stat-today\">0</h3>\n            </div>\n            <div class=\"bg-primary-subtle text-primary p-3 rounded-circle\"><i class=\"fa-solid fa-calendar-day fa-lg\"></i></div>\n          </div>\n        </div>\n      </div>\n      <div class=\"col-md-3\">\n        <div class=\"card card-stat bg-white p-3\">\n          <div class=\"d-flex justify-content-between align-items-center\">\n            <div>\n              <span class=\"text-muted small\">Confirmed</span>\n              <h3 class=\"fw-bold mt-1 mb-0 text-primary\" id=\"stat-confirmed\">0</h3>\n            </div>\n            <div class=\"bg-info-subtle text-info p-3 rounded-circle\"><i class=\"fa-solid fa-check fa-lg\"></i></div>\n          </div>\n        </div>\n      </div>\n      <div class=\"col-md-3\">\n        <div class=\"card card-stat bg-white p-3\">\n          <div class=\"d-flex justify-content-between align-items-center\">\n            <div>\n              <span class=\"text-muted small\">Arrived / In Clinic</span>\n              <h3 class=\"fw-bold mt-1 mb-0 text-indigo\" id=\"stat-arrived\">0</h3>\n            </div>\n            <div class=\"bg-warning-subtle text-warning p-3 rounded-circle\"><i class=\"fa-solid fa-door-open fa-lg\"></i></div>\n          </div>\n        </div>\n      </div>\n      <div class=\"col-md-3\">\n        <div class=\"card card-stat bg-white p-3\">\n          <div class=\"d-flex justify-content-between align-items-center\">\n            <div>\n              <span class=\"text-muted small\">Completed Today</span>\n              <h3 class=\"fw-bold mt-1 mb-0 text-success\" id=\"stat-completed\">0</h3>\n            </div>\n            <div class=\"bg-success-subtle text-success p-3 rounded-circle\"><i class=\"fa-solid fa-circle-check fa-lg\"></i></div>\n          </div>\n        </div>\n      </div>\n    </div>\n\n    <!-- Filters & Search -->\n    <div class=\"d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2\">\n      <div class=\"btn-group\" role=\"group\">\n        <button type=\"button\" class=\"btn btn-outline-primary active\" id=\"filter-today\" onclick=\"setFilter('today')\">Today's Schedule</button>\n        <button type=\"button\" class=\"btn btn-outline-primary\" id=\"filter-upcoming\" onclick=\"setFilter('upcoming')\">Upcoming</button>\n        <button type=\"button\" class=\"btn btn-outline-primary\" id=\"filter-all\" onclick=\"setFilter('all')\">All Bookings</button>\n      </div>\n      <div class=\"d-flex gap-2\">\n        <select class=\"form-select form-select-sm\" id=\"doctor-filter\" onchange=\"applyFilters()\">\n          <option value=\"\">All Doctors</option>\n          <option value=\"dr_smith\">Dr. John Smith (General)</option>\n          <option value=\"dr_emily\">Dr. Emily Davis (Dentist)</option>\n          <option value=\"dr_robert\">Dr. Robert Wilson (Cardiology)</option>\n        </select>\n        <input type=\"text\" class=\"form-control form-control-sm\" id=\"search-box\" placeholder=\"Search patient or phone...\" oninput=\"applyFilters()\">\n      </div>\n    </div>\n\n    <!-- Table -->\n    <div class=\"table-responsive\">\n      <table class=\"table table-hover align-middle mb-0\">\n        <thead class=\"table-light\">\n          <tr>\n            <th>ID</th>\n            <th>Patient Name</th>\n            <th>Phone</th>\n            <th>Doctor</th>\n            <th>Service</th>\n            <th>Date & Time</th>\n            <th>Status</th>\n            <th class=\"text-end\">Reception Actions</th>\n          </tr>\n        </thead>\n        <tbody id=\"appointment-tbody\">\n          <tr><td colspan=\"8\" class=\"text-center py-4 text-muted\">Loading appointments...</td></tr>\n        </tbody>\n      </table>\n    </div>\n  </div>\n\n  <!-- New Appointment Modal -->\n  <div class=\"modal fade\" id=\"newApptModal\" tabindex=\"-1\">\n    <div class=\"modal-dialog\">\n      <div class=\"modal-content\">\n        <div class=\"modal-header\">\n          <h5 class=\"modal-title fw-bold\">Create Manual Appointment</h5>\n          <button type=\"button\" class=\"btn-close\" data-bs-dismiss=\"modal\"></button>\n        </div>\n        <div class=\"modal-body\">\n          <form id=\"newApptForm\">\n            <div class=\"mb-3\">\n              <label class=\"form-label\">Patient Name</label>\n              <input type=\"text\" class=\"form-control\" id=\"m-name\" required>\n            </div>\n            <div class=\"mb-3\">\n              <label class=\"form-label\">Phone Number</label>\n              <input type=\"tel\" class=\"form-control\" id=\"m-phone\" required placeholder=\"+1234567890\">\n            </div>\n            <div class=\"mb-3\">\n              <label class=\"form-label\">Doctor</label>\n              <select class=\"form-select\" id=\"m-doctor\" required>\n                <option value=\"dr_smith\">Dr. John Smith (General Physician)</option>\n                <option value=\"dr_emily\">Dr. Emily Davis (Dental Specialist)</option>\n                <option value=\"dr_robert\">Dr. Robert Wilson (Cardiologist)</option>\n              </select>\n            </div>\n            <div class=\"mb-3\">\n              <label class=\"form-label\">Service</label>\n              <input type=\"text\" class=\"form-control\" id=\"m-service\" value=\"General Consultation\" required>\n            </div>\n            <div class=\"row g-2 mb-3\">\n              <div class=\"col-6\">\n                <label class=\"form-label\">Date</label>\n                <input type=\"date\" class=\"form-control\" id=\"m-date\" required>\n              </div>\n              <div class=\"col-6\">\n                <label class=\"form-label\">Time</label>\n                <input type=\"time\" class=\"form-control\" id=\"m-time\" required>\n              </div>\n            </div>\n          </form>\n        </div>\n        <div class=\"modal-footer\">\n          <button type=\"button\" class=\"btn btn-secondary\" data-bs-dismiss=\"modal\">Cancel</button>\n          <button type=\"button\" class=\"btn btn-primary\" onclick=\"submitNewAppointment()\">Confirm & Book</button>\n        </div>\n      </div>\n    </div>\n  </div>\n\n  <!-- Reschedule Modal -->\n  <div class=\"modal fade\" id=\"reschedModal\" tabindex=\"-1\">\n    <div class=\"modal-dialog\">\n      <div class=\"modal-content\">\n        <div class=\"modal-header\">\n          <h5 class=\"modal-title fw-bold\">Reschedule Appointment</h5>\n          <button type=\"button\" class=\"btn-close\" data-bs-dismiss=\"modal\"></button>\n        </div>\n        <div class=\"modal-body\">\n          <input type=\"hidden\" id=\"r-id\">\n          <input type=\"hidden\" id=\"r-cal-id\">\n          <p class=\"text-muted\">Rescheduling appointment for <strong id=\"r-patient\"></strong></p>\n          <div class=\"row g-2 mb-3\">\n            <div class=\"col-6\">\n              <label class=\"form-label\">New Date</label>\n              <input type=\"date\" class=\"form-control\" id=\"r-date\" required>\n            </div>\n            <div class=\"col-6\">\n              <label class=\"form-label\">New Time</label>\n              <input type=\"time\" class=\"form-control\" id=\"r-time\" required>\n            </div>\n          </div>\n        </div>\n        <div class=\"modal-footer\">\n          <button type=\"button\" class=\"btn btn-secondary\" data-bs-dismiss=\"modal\">Close</button>\n          <button type=\"button\" class=\"btn btn-primary\" onclick=\"submitReschedule()\">Update Appointment</button>\n        </div>\n      </div>\n    </div>\n  </div>\n\n  <!-- Doctor Leave Modal -->\n  <div class=\"modal fade\" id=\"leaveModal\" tabindex=\"-1\">\n    <div class=\"modal-dialog\">\n      <div class=\"modal-content\">\n        <div class=\"modal-header\">\n          <h5 class=\"modal-title fw-bold\">Mark Doctor Leave / Unavailability</h5>\n          <button type=\"button\" class=\"btn-close\" data-bs-dismiss=\"modal\"></button>\n        </div>\n        <div class=\"modal-body\">\n          <div class=\"mb-3\">\n            <label class=\"form-label\">Doctor</label>\n            <select class=\"form-select\" id=\"l-doctor\">\n              <option value=\"dr_smith\">Dr. John Smith</option>\n              <option value=\"dr_emily\">Dr. Emily Davis</option>\n              <option value=\"dr_robert\">Dr. Robert Wilson</option>\n            </select>\n          </div>\n          <div class=\"row g-2 mb-3\">\n            <div class=\"col-6\">\n              <label class=\"form-label\">Start Time</label>\n              <input type=\"datetime-local\" class=\"form-control\" id=\"l-start\" required>\n            </div>\n            <div class=\"col-6\">\n              <label class=\"form-label\">End Time</label>\n              <input type=\"datetime-local\" class=\"form-control\" id=\"l-end\" required>\n            </div>\n          </div>\n          <div class=\"mb-3\">\n            <label class=\"form-label\">Reason / Notes</label>\n            <input type=\"text\" class=\"form-control\" id=\"l-reason\" placeholder=\"e.g., Medical conference, personal leave\">\n          </div>\n        </div>\n        <div class=\"modal-footer\">\n          <button type=\"button\" class=\"btn btn-secondary\" data-bs-dismiss=\"modal\">Close</button>\n          <button type=\"button\" class=\"btn btn-warning\" onclick=\"submitDoctorLeave()\">Save Unavailability</button>\n        </div>\n      </div>\n    </div>\n  </div>\n\n  <script src=\"https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js\"></script>\n  <script>\n    let allAppointments = [];\n    let currentFilter = 'today';\n    const apiUrl = window.location.pathname;\n\n    async function loadAppointments() {\n      try {\n        const res = await fetch(apiUrl, {\n          method: 'POST',\n          headers: { 'Content-Type': 'application/json' },\n          body: JSON.stringify({ action: 'GET_APPOINTMENTS' })\n        });\n        const data = await res.json();\n        allAppointments = Array.isArray(data) ? data : (data.appointments || []);\n        applyFilters();\n      } catch (err) {\n        console.error('Failed to load appointments', err);\n        document.getElementById('appointment-tbody').innerHTML = '<tr><td colspan=\"8\" class=\"text-danger text-center\">Failed to load appointments. Please check connection.</td></tr>';\n      }\n    }\n\n    function setFilter(f) {\n      currentFilter = f;\n      document.querySelectorAll('.btn-group button').forEach(b => b.classList.remove('active'));\n      document.getElementById('filter-' + f).classList.add('active');\n      applyFilters();\n    }\n\n    function applyFilters() {\n      const search = document.getElementById('search-box').value.toLowerCase();\n      const doctor = document.getElementById('doctor-filter').value;\n      const todayStr = new Date().toISOString().split('T')[0];\n\n      let filtered = allAppointments.filter(a => {\n        const startStr = (a.start_time || '').split('T')[0];\n        if (currentFilter === 'today' && startStr !== todayStr) return false;\n        if (currentFilter === 'upcoming' && startStr < todayStr) return false;\n        if (doctor && a.doctor_id !== doctor) return false;\n        if (search) {\n          const matchName = (a.customer_name || '').toLowerCase().includes(search);\n          const matchPhone = (a.phone || '').includes(search);\n          if (!matchName && !matchPhone) return false;\n        }\n        return true;\n      });\n\n      const todayList = allAppointments.filter(a => (a.start_time || '').split('T')[0] === todayStr);\n      document.getElementById('stat-today').innerText = todayList.length;\n      document.getElementById('stat-confirmed').innerText = todayList.filter(a => a.status === 'CONFIRMED').length;\n      document.getElementById('stat-arrived').innerText = todayList.filter(a => a.status === 'ARRIVED').length;\n      document.getElementById('stat-completed').innerText = todayList.filter(a => a.status === 'COMPLETED').length;\n\n      renderTable(filtered);\n    }\n\n    function renderTable(list) {\n      const tbody = document.getElementById('appointment-tbody');\n      if (list.length === 0) {\n        tbody.innerHTML = '<tr><td colspan=\"8\" class=\"text-center py-4 text-muted\">No appointments found for this filter.</td></tr>';\n        return;\n      }\n\n      tbody.innerHTML = list.map(a => {\n        const dt = new Date(a.start_time);\n        const formattedDate = dt.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });\n        const formattedTime = dt.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });\n\n        return `\n          <tr>\n            <td><span class=\"text-muted fw-bold\">#` + a.appointment_id + `</span></td>\n            <td class=\"fw-semibold\">` + a.customer_name + `</td>\n            <td><a href=\"https://wa.me/` + a.phone + `\" target=\"_blank\" class=\"text-decoration-none\"><i class=\"fa-brands fa-whatsapp text-success me-1\"></i>` + a.phone + `</a></td>\n            <td><span class=\"badge bg-light text-dark border\">` + a.doctor_id + `</span></td>\n            <td>` + a.service + `</td>\n            <td><strong>` + formattedDate + `</strong> <span class=\"text-muted\">` + formattedTime + `</span></td>\n            <td><span class=\"badge badge-status status-` + a.status + `\">` + a.status + `</span></td>\n            <td class=\"text-end\">\n              <div class=\"dropdown d-inline-block\">\n                <button class=\"btn btn-sm btn-light border dropdown-toggle\" data-bs-toggle=\"dropdown\">Actions</button>\n                <ul class=\"dropdown-menu dropdown-menu-end\">\n                  <li><a class=\"dropdown-item text-primary\" href=\"#\" onclick=\"updateStatus(` + a.appointment_id + `, 'ARRIVED')\"><i class=\"fa-solid fa-door-open me-2\"></i>Mark Arrived</a></li>\n                  <li><a class=\"dropdown-item text-success\" href=\"#\" onclick=\"updateStatus(` + a.appointment_id + `, 'COMPLETED')\"><i class=\"fa-solid fa-check-double me-2\"></i>Mark Completed</a></li>\n                  <li><a class=\"dropdown-item text-secondary\" href=\"#\" onclick=\"updateStatus(` + a.appointment_id + `, 'NO_SHOW')\"><i class=\"fa-solid fa-user-slash me-2\"></i>Mark No-Show</a></li>\n                  <li><hr class=\"dropdown-divider\"></li>\n                  <li><a class=\"dropdown-item text-warning\" href=\"#\" onclick=\"openReschedModal(` + a.appointment_id + `, '` + a.customer_name + `', '` + a.calendar_event_id + `')\"><i class=\"fa-solid fa-calendar-days me-2\"></i>Reschedule</a></li>\n                  <li><a class=\"dropdown-item text-danger\" href=\"#\" onclick=\"cancelAppt(` + a.appointment_id + `, '` + a.calendar_event_id + `')\"><i class=\"fa-solid fa-trash me-2\"></i>Cancel</a></li>\n                </ul>\n              </div>\n            </td>\n          </tr>\n        `;\n      }).join('');\n    }\n\n    async function updateStatus(id, newStatus) {\n      if (!confirm('Update appointment #' + id + ' status to ' + newStatus + '?')) return;\n      await fetch(apiUrl, {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ action: 'UPDATE_STATUS', appointment_id: id, status: newStatus })\n      });\n      loadAppointments();\n    }\n\n    async function cancelAppt(id, calId) {\n      if (!confirm('Are you sure you want to cancel appointment #' + id + '?')) return;\n      await fetch(apiUrl, {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({ action: 'CANCEL_APPOINTMENT', appointment_id: id, calendar_event_id: calId })\n      });\n      loadAppointments();\n    }\n\n    function openNewModal() {\n      document.getElementById('m-date').value = new Date().toISOString().split('T')[0];\n      document.getElementById('m-time').value = '10:00';\n      new bootstrap.Modal(document.getElementById('newApptModal')).show();\n    }\n\n    async function submitNewAppointment() {\n      const name = document.getElementById('m-name').value;\n      const phone = document.getElementById('m-phone').value;\n      const doctor = document.getElementById('m-doctor').value;\n      const service = document.getElementById('m-service').value;\n      const date = document.getElementById('m-date').value;\n      const time = document.getElementById('m-time').value;\n\n      if (!name || !phone || !date || !time) {\n        alert('Please fill all required fields');\n        return;\n      }\n\n      await fetch(apiUrl, {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({\n          action: 'CREATE_APPOINTMENT',\n          customer_name: name,\n          phone: phone,\n          doctor_id: doctor,\n          service: service,\n          date: date,\n          time: time\n        })\n      });\n\n      bootstrap.Modal.getInstance(document.getElementById('newApptModal')).hide();\n      loadAppointments();\n    }\n\n    function openReschedModal(id, name, calId) {\n      document.getElementById('r-id').value = id;\n      document.getElementById('r-cal-id').value = calId;\n      document.getElementById('r-patient').innerText = name;\n      document.getElementById('r-date').value = new Date().toISOString().split('T')[0];\n      document.getElementById('r-time').value = '11:00';\n      new bootstrap.Modal(document.getElementById('reschedModal')).show();\n    }\n\n    async function submitReschedule() {\n      const id = document.getElementById('r-id').value;\n      const calId = document.getElementById('r-cal-id').value;\n      const date = document.getElementById('r-date').value;\n      const time = document.getElementById('r-time').value;\n\n      await fetch(apiUrl, {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({\n          action: 'RESCHEDULE_APPOINTMENT',\n          appointment_id: id,\n          calendar_event_id: calId,\n          date: date,\n          time: time\n        })\n      });\n\n      bootstrap.Modal.getInstance(document.getElementById('reschedModal')).hide();\n      loadAppointments();\n    }\n\n    function openLeaveModal() {\n      new bootstrap.Modal(document.getElementById('leaveModal')).show();\n    }\n\n    async function submitDoctorLeave() {\n      const doctor = document.getElementById('l-doctor').value;\n      const start = document.getElementById('l-start').value;\n      const end = document.getElementById('l-end').value;\n      const reason = document.getElementById('l-reason').value;\n\n      await fetch(apiUrl, {\n        method: 'POST',\n        headers: { 'Content-Type': 'application/json' },\n        body: JSON.stringify({\n          action: 'SET_DOCTOR_LEAVE',\n          doctor_id: doctor,\n          start_time: start,\n          end_time: end,\n          reason: reason\n        })\n      });\n\n      alert('Doctor unavailability recorded.');\n      bootstrap.Modal.getInstance(document.getElementById('leaveModal')).hide();\n    }\n\n    loadAppointments();\n    setInterval(loadAppointments, 30000);\n  </script>\n</body>\n</html>`;\n\nreturn [{\n  json: {\n    html: html\n  }\n}];\n"
+      }
+    },
+    {
+      "id": "4367a618-e9d1-49e1-a67f-f11dde310f5b",
+      "name": "Respond_Dashboard_HTML",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1020,
+        2400
+      ],
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "={{ $json.html }}",
+        "options": {
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "text/html; charset=utf-8"
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": "e5ed4fb4-7202-4d6d-a153-ac2f8c5291b9",
+      "name": "Postgres_Dashboard_Get_Appts",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        800,
+        2560
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT appointment_id, customer_name, phone, doctor_id, service, start_time, end_time, status, calendar_event_id, created_at, updated_at FROM appointments ORDER BY start_time DESC LIMIT 100;"
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres_credentials_id",
+          "name": "PostgreSQL Account"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "id": "b376931e-d1b3-4633-9b29-feff63ae8b27",
+      "name": "Format_Dashboard_Appts_JSON",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1020,
+        2560
+      ],
+      "parameters": {
+        "language": "javascript",
+        "jsCode": "return [{ json: { appointments: $input.all().map(i => i.json) } }];"
+      }
+    },
+    {
+      "id": "6fc33396-d7b2-46f3-8efe-9713c905e021",
+      "name": "Respond_Dashboard_Appts_JSON",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1240,
+        2560
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json.appointments) }}"
+      }
+    },
+    {
+      "id": "d53da527-fa5a-45ea-afd0-7879a764c608",
+      "name": "Prep_Manual_Create",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        800,
+        2720
+      ],
+      "parameters": {
+        "language": "javascript",
+        "jsCode": "const payload = $input.item.json.payload || {};\nconst startIso = new Date(`${payload.date}T${payload.time}:00Z`).toISOString();\nconst endIso = new Date(new Date(startIso).getTime() + 30 * 60000).toISOString();\n\nreturn [{\n  json: {\n    customer_name: payload.customer_name,\n    phone: payload.phone,\n    doctor_id: payload.doctor_id || 'dr_smith',\n    service: payload.service || 'General Consultation',\n    start_time_iso: startIso,\n    end_time_iso: endIso\n  }\n}];\n"
+      }
+    },
+    {
+      "id": "564d1ce2-4f67-400c-99e0-09d0052b2150",
+      "name": "GCal_Create_Manual_Event",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1.2,
+      "position": [
+        1020,
+        2720
+      ],
+      "parameters": {
+        "operation": "create",
+        "calendar": {
+          "__rl": true,
+          "value": "primary",
+          "mode": "list"
+        },
+        "start": "={{ $json.start_time_iso }}",
+        "end": "={{ $json.end_time_iso }}",
+        "summary": "={{ 'Appointment (Manual): ' + $json.customer_name + ' (' + $json.doctor_id + ')' }}",
+        "description": "={{ 'Patient Phone: ' + $json.phone + '\\nService: ' + $json.service + '\\nStatus: CONFIRMED' }}"
+      },
+      "credentials": {
+        "googleCalendarOAuth2": {
+          "id": "google_calendar_credentials_id",
+          "name": "Google Calendar Account"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "id": "e1897960-4aa2-4212-a932-b957475976d8",
+      "name": "Postgres_Manual_Insert",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1240,
+        2720
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO appointments (customer_name, phone, doctor_id, service, start_time, end_time, status, calendar_event_id, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, 'CONFIRMED', $7, NOW(), NOW()) RETURNING *;",
+        "queryParameters": "={{ [$('Prep_Manual_Create').item.json.customer_name, $('Prep_Manual_Create').item.json.phone, $('Prep_Manual_Create').item.json.doctor_id, $('Prep_Manual_Create').item.json.service, $('Prep_Manual_Create').item.json.start_time_iso, $('Prep_Manual_Create').item.json.end_time_iso, $json.id || 'GCAL_' + Date.now()] }}"
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres_credentials_id",
+          "name": "PostgreSQL Account"
+        }
+      }
+    },
+    {
+      "id": "b6ac5e01-19be-4f0f-a3a7-27d14124a97c",
+      "name": "Respond_Manual_Create_JSON",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1460,
+        2720
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ success: true, appointment: $json }) }}"
+      }
+    },
+    {
+      "id": "8db1cc63-f668-49d2-aced-5ad032cbc79c",
+      "name": "Postgres_Dashboard_Update_Status",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        800,
+        2880
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE appointments SET status = $1, updated_at = NOW() WHERE appointment_id = $2 RETURNING *;",
+        "queryParameters": "={{ [$json.payload.status, $json.payload.appointment_id] }}"
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres_credentials_id",
+          "name": "PostgreSQL Account"
+        }
+      }
+    },
+    {
+      "id": "90489353-b7da-4692-bb28-7587ef8ed1d9",
+      "name": "Respond_Dashboard_Status_JSON",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1020,
+        2880
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ success: true, updated: $json }) }}"
+      }
+    },
+    {
+      "id": "909fab48-9da1-474a-86c6-87557f7e1607",
+      "name": "Prep_Dashboard_Reschedule",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        800,
+        3040
+      ],
+      "parameters": {
+        "language": "javascript",
+        "jsCode": "const payload = $input.item.json.payload || {};\nconst startIso = new Date(`${payload.date}T${payload.time}:00Z`).toISOString();\nconst endIso = new Date(new Date(startIso).getTime() + 30 * 60000).toISOString();\n\nreturn [{\n  json: {\n    appointment_id: payload.appointment_id,\n    calendar_event_id: payload.calendar_event_id,\n    start_time_iso: startIso,\n    end_time_iso: endIso\n  }\n}];\n"
+      }
+    },
+    {
+      "id": "068e0d24-109b-4508-b935-f4cce8b1bdd7",
+      "name": "GCal_Dashboard_Reschedule_Event",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1.2,
+      "position": [
+        1020,
+        3040
+      ],
+      "parameters": {
+        "operation": "update",
+        "calendar": {
+          "__rl": true,
+          "value": "primary",
+          "mode": "list"
+        },
+        "eventId": "={{ $json.calendar_event_id }}",
+        "start": "={{ $json.start_time_iso }}",
+        "end": "={{ $json.end_time_iso }}"
+      },
+      "credentials": {
+        "googleCalendarOAuth2": {
+          "id": "google_calendar_credentials_id",
+          "name": "Google Calendar Account"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "id": "83daccb5-d2ab-4dc4-b034-d942d2fd7d46",
+      "name": "Postgres_Dashboard_Update_Resched",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1240,
+        3040
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE appointments SET start_time = $1, end_time = $2, status = 'CONFIRMED', updated_at = NOW(), reminder_3d_sent = FALSE, reminder_1d_sent = FALSE, reminder_4h_sent = FALSE, reminder_1h_sent = FALSE WHERE appointment_id = $3 RETURNING *;",
+        "queryParameters": "={{ [$('Prep_Dashboard_Reschedule').item.json.start_time_iso, $('Prep_Dashboard_Reschedule').item.json.end_time_iso, $('Prep_Dashboard_Reschedule').item.json.appointment_id] }}"
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres_credentials_id",
+          "name": "PostgreSQL Account"
+        }
+      }
+    },
+    {
+      "id": "f629d185-d829-4a85-a48f-544f85ca27fe",
+      "name": "Respond_Dashboard_Resched_JSON",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1460,
+        3040
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ success: true, rescheduled: $json }) }}"
+      }
+    },
+    {
+      "id": "3b8c9849-7f5a-4d43-a637-4bcbfd1aed23",
+      "name": "GCal_Dashboard_Delete_Cancel",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1.2,
+      "position": [
+        800,
+        3200
+      ],
+      "parameters": {
+        "operation": "delete",
+        "calendar": {
+          "__rl": true,
+          "value": "primary",
+          "mode": "list"
+        },
+        "eventId": "={{ $json.payload.calendar_event_id || 'NONE' }}"
+      },
+      "credentials": {
+        "googleCalendarOAuth2": {
+          "id": "google_calendar_credentials_id",
+          "name": "Google Calendar Account"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "id": "707e48ad-fec9-407c-abba-adfa142739ef",
+      "name": "Postgres_Dashboard_Update_Cancel",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1020,
+        3200
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE appointments SET status = 'CANCELLED', updated_at = NOW(), reminder_3d_sent = TRUE, reminder_1d_sent = TRUE, reminder_4h_sent = TRUE, reminder_1h_sent = TRUE WHERE appointment_id = $1 RETURNING *;",
+        "queryParameters": "={{ [$json.payload.appointment_id] }}"
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres_credentials_id",
+          "name": "PostgreSQL Account"
+        }
+      }
+    },
+    {
+      "id": "38068fba-95fb-41f4-a7e7-c1c53d54e467",
+      "name": "Respond_Dashboard_Cancel_JSON",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1240,
+        3200
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ success: true, cancelled: $json }) }}"
+      }
+    },
+    {
+      "id": "25a0744b-11ec-4bac-ac9b-fb143926b40e",
+      "name": "Postgres_Insert_Doctor_Leave",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        800,
+        3360
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO doctor_unavailability (doctor_id, start_time, end_time, reason, created_at) VALUES ($1, $2, $3, $4, NOW()) RETURNING *;",
+        "queryParameters": "={{ [$json.payload.doctor_id, $json.payload.start_time, $json.payload.end_time, $json.payload.reason] }}"
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres_credentials_id",
+          "name": "PostgreSQL Account"
+        }
+      }
+    },
+    {
+      "id": "567e78d6-7c3e-446a-8f13-3cf295813206",
+      "name": "Respond_Doctor_Leave_JSON",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1020,
+        3360
+      ],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ success: true, leave: $json }) }}"
+      }
+    }
+  ],
+  "connections": {
+    "DB_Init_Manual_Trigger": {
+      "main": [
+        [
+          {
+            "node": "Postgres_Init_Schema",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "WhatsApp_Webhook": {
+      "main": [
+        [
+          {
+            "node": "Parse_WhatsApp_Inbound",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse_WhatsApp_Inbound": {
+      "main": [
+        [
+          {
+            "node": "Get_Customer_Context_Postgres",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get_Customer_Context_Postgres": {
+      "main": [
+        [
+          {
+            "node": "Merge_Context_For_AI",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge_Context_For_AI": {
+      "main": [
+        [
+          {
+            "node": "Gemini_AI_Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini_AI_Agent": {
+      "main": [
+        [
+          {
+            "node": "Parse_Gemini_Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse_Gemini_Response": {
+      "main": [
+        [
+          {
+            "node": "Route_Intent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route_Intent": {
+      "main": [
+        [
+          {
+            "node": "Validate_Booking_Input",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Validate_Booking_Input",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Validate_Pending_For_Confirm",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Validate_Reschedule_Request",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Validate_Cancel_Request",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Format_General_Reply",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Format_General_Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate_Booking_Input": {
+      "main": [
+        [
+          {
+            "node": "If_Needs_Booking_Info",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If_Needs_Booking_Info": {
+      "main": [
+        [
+          {
+            "node": "Send_WhatsApp_Missing_Info",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "GCal_Get_Events_For_Date",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send_WhatsApp_Missing_Info": {
+      "main": [
+        [
+          {
+            "node": "Respond_Missing_Info",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GCal_Get_Events_For_Date": {
+      "main": [
+        [
+          {
+            "node": "Calculate_Available_Slots",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Calculate_Available_Slots": {
+      "main": [
+        [
+          {
+            "node": "If_Slot_Available",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If_Slot_Available": {
+      "main": [
+        [
+          {
+            "node": "If_Check_Availability_Only",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Format_Unavailable_Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format_Unavailable_Message": {
+      "main": [
+        [
+          {
+            "node": "Send_WhatsApp_Alternatives",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send_WhatsApp_Alternatives": {
+      "main": [
+        [
+          {
+            "node": "Respond_Alternatives_Sent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If_Check_Availability_Only": {
+      "main": [
+        [
+          {
+            "node": "Send_WhatsApp_Availability_Notice",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Postgres_Insert_Pending_Appt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send_WhatsApp_Availability_Notice": {
+      "main": [
+        [
+          {
+            "node": "Respond_Availability_Notice",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres_Insert_Pending_Appt": {
+      "main": [
+        [
+          {
+            "node": "Format_Pending_WhatsApp_Msg",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format_Pending_WhatsApp_Msg": {
+      "main": [
+        [
+          {
+            "node": "Send_WhatsApp_Pending_Confirmation_Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send_WhatsApp_Pending_Confirmation_Prompt": {
+      "main": [
+        [
+          {
+            "node": "Respond_Pending_Created",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate_Pending_For_Confirm": {
+      "main": [
+        [
+          {
+            "node": "If_Has_Pending_Appt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If_Has_Pending_Appt": {
+      "main": [
+        [
+          {
+            "node": "GCal_Final_Availability_Check",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send_WhatsApp_No_Pending",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send_WhatsApp_No_Pending": {
+      "main": [
+        [
+          {
+            "node": "Respond_No_Pending",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GCal_Final_Availability_Check": {
+      "main": [
+        [
+          {
+            "node": "Verify_Final_Availability",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify_Final_Availability": {
+      "main": [
+        [
+          {
+            "node": "If_Final_Slot_Free",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If_Final_Slot_Free": {
+      "main": [
+        [
+          {
+            "node": "GCal_Create_Confirmed_Event",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Postgres_Mark_Interim_Conflict",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres_Mark_Interim_Conflict": {
+      "main": [
+        [
+          {
+            "node": "Send_WhatsApp_Interim_Conflict",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send_WhatsApp_Interim_Conflict": {
+      "main": [
+        [
+          {
+            "node": "Respond_Interim_Conflict",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GCal_Create_Confirmed_Event": {
+      "main": [
+        [
+          {
+            "node": "Postgres_Update_To_Confirmed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres_Update_To_Confirmed": {
+      "main": [
+        [
+          {
+            "node": "Format_Confirmed_Receipt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format_Confirmed_Receipt": {
+      "main": [
+        [
+          {
+            "node": "Send_WhatsApp_Confirmed_Receipt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send_WhatsApp_Confirmed_Receipt": {
+      "main": [
+        [
+          {
+            "node": "Respond_Confirmed_Success",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate_Reschedule_Request": {
+      "main": [
+        [
+          {
+            "node": "If_Can_Reschedule",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If_Can_Reschedule": {
+      "main": [
+        [
+          {
+            "node": "GCal_Check_Reschedule_Slot",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send_WhatsApp_Reschedule_Notice",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send_WhatsApp_Reschedule_Notice": {
+      "main": [
+        [
+          {
+            "node": "Respond_Reschedule_Notice",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GCal_Check_Reschedule_Slot": {
+      "main": [
+        [
+          {
+            "node": "Process_Reschedule_Availability",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Process_Reschedule_Availability": {
+      "main": [
+        [
+          {
+            "node": "If_Reschedule_Slot_Free",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If_Reschedule_Slot_Free": {
+      "main": [
+        [
+          {
+            "node": "GCal_Update_Rescheduled_Event",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send_WhatsApp_Reschedule_Busy",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send_WhatsApp_Reschedule_Busy": {
+      "main": [
+        [
+          {
+            "node": "Respond_Reschedule_Busy",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GCal_Update_Rescheduled_Event": {
+      "main": [
+        [
+          {
+            "node": "Postgres_Update_Rescheduled",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres_Update_Rescheduled": {
+      "main": [
+        [
+          {
+            "node": "Send_WhatsApp_Reschedule_Success",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send_WhatsApp_Reschedule_Success": {
+      "main": [
+        [
+          {
+            "node": "Respond_Reschedule_Success",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate_Cancel_Request": {
+      "main": [
+        [
+          {
+            "node": "If_Has_Appt_To_Cancel",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If_Has_Appt_To_Cancel": {
+      "main": [
+        [
+          {
+            "node": "GCal_Delete_Cancelled_Event",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send_WhatsApp_No_Cancel_Target",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send_WhatsApp_No_Cancel_Target": {
+      "main": [
+        [
+          {
+            "node": "Respond_No_Cancel_Target",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GCal_Delete_Cancelled_Event": {
+      "main": [
+        [
+          {
+            "node": "Postgres_Update_Cancelled",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres_Update_Cancelled": {
+      "main": [
+        [
+          {
+            "node": "Send_WhatsApp_Cancel_Success",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send_WhatsApp_Cancel_Success": {
+      "main": [
+        [
+          {
+            "node": "Respond_Cancel_Success",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format_General_Reply": {
+      "main": [
+        [
+          {
+            "node": "Send_WhatsApp_General_Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send_WhatsApp_General_Reply": {
+      "main": [
+        [
+          {
+            "node": "Respond_General_Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Schedule_Trigger_15Min": {
+      "main": [
+        [
+          {
+            "node": "Postgres_Fetch_Due_Reminders",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres_Fetch_Due_Reminders": {
+      "main": [
+        [
+          {
+            "node": "Format_Reminder_Payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format_Reminder_Payload": {
+      "main": [
+        [
+          {
+            "node": "Send_WhatsApp_Reminder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send_WhatsApp_Reminder": {
+      "main": [
+        [
+          {
+            "node": "Postgres_Mark_Reminder_Sent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Reception_Dashboard_Webhook": {
+      "main": [
+        [
+          {
+            "node": "Parse_Dashboard_Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Reception_Dashboard_API_Webhook": {
+      "main": [
+        [
+          {
+            "node": "Parse_Dashboard_Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse_Dashboard_Request": {
+      "main": [
+        [
+          {
+            "node": "Route_Dashboard_Action",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route_Dashboard_Action": {
+      "main": [
+        [
+          {
+            "node": "Generate_Dashboard_HTML",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Postgres_Dashboard_Get_Appts",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prep_Manual_Create",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Postgres_Dashboard_Update_Status",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prep_Dashboard_Reschedule",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "GCal_Dashboard_Delete_Cancel",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Postgres_Insert_Doctor_Leave",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate_Dashboard_HTML": {
+      "main": [
+        [
+          {
+            "node": "Respond_Dashboard_HTML",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres_Dashboard_Get_Appts": {
+      "main": [
+        [
+          {
+            "node": "Format_Dashboard_Appts_JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format_Dashboard_Appts_JSON": {
+      "main": [
+        [
+          {
+            "node": "Respond_Dashboard_Appts_JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prep_Manual_Create": {
+      "main": [
+        [
+          {
+            "node": "GCal_Create_Manual_Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GCal_Create_Manual_Event": {
+      "main": [
+        [
+          {
+            "node": "Postgres_Manual_Insert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres_Manual_Insert": {
+      "main": [
+        [
+          {
+            "node": "Respond_Manual_Create_JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres_Dashboard_Update_Status": {
+      "main": [
+        [
+          {
+            "node": "Respond_Dashboard_Status_JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prep_Dashboard_Reschedule": {
+      "main": [
+        [
+          {
+            "node": "GCal_Dashboard_Reschedule_Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GCal_Dashboard_Reschedule_Event": {
+      "main": [
+        [
+          {
+            "node": "Postgres_Dashboard_Update_Resched",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres_Dashboard_Update_Resched": {
+      "main": [
+        [
+          {
+            "node": "Respond_Dashboard_Resched_JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GCal_Dashboard_Delete_Cancel": {
+      "main": [
+        [
+          {
+            "node": "Postgres_Dashboard_Update_Cancel",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres_Dashboard_Update_Cancel": {
+      "main": [
+        [
+          {
+            "node": "Respond_Dashboard_Cancel_JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres_Insert_Doctor_Leave": {
+      "main": [
+        [
+          {
+            "node": "Respond_Doctor_Leave_JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "465eec06-7a58-42e4-b80e-f3f5d187158b",
+  "meta": {
+    "templateCredsSetupCompleted": false,
+    "instanceId": "ai-whatsapp-appointment-system"
+  },
+  "id": "AI_WhatsApp_Appointment_System",
+  "tags": [
+    {
+      "id": "appointment-booking",
+      "name": "Appointment Booking"
+    }
+  ]
+}
