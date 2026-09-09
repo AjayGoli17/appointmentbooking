@@ -114,7 +114,7 @@ BEGIN
         EXCLUDE USING gist (
             doctor_id WITH =,
             tstzrange(start_time, end_time) WITH &&
-        ) WHERE (status IN ('PENDING', 'CONFIRMED', 'RESCHEDULED', 'ARRIVED', 'COMPLETED'));
+        ) WHERE (status IN ('PENDING', 'CONFIRMED', 'RESCHEDULED', 'ARRIVED'));
     END IF;
 END $$;
 

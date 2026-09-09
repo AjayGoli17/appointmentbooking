@@ -1,0 +1,318 @@
+{
+  "name": "04 - Calendar Integration Worker",
+  "nodes": [
+    {
+      "id": "w4-schedule",
+      "name": "Schedule_Trigger_5Min",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [100, 300],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 5
+            }
+          ]
+        }
+      },
+      "notesInFlow": true,
+      "notes": "Processes pending and failed-but-retryable Calendar integration operations every 5 minutes."
+    },
+    {
+      "id": "w4-claim-ops",
+      "name": "Postgres_Claim_Pending_Ops",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [300, 300],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "\nWITH claimable AS (\n  SELECT io.operation_id, io.appointment_id, io.operation_type, io.payload, io.attempt_count\n  FROM integration_operations io\n  WHERE io.status IN ('PENDING')\n     OR (io.status = 'FAILED' AND io.next_retry_at <= NOW() AND io.attempt_count < 5)\n  ORDER BY io.created_at\n  LIMIT 10\n  FOR UPDATE SKIP LOCKED\n)\nUPDATE integration_operations io\nSET\n  status = 'IN_PROGRESS',\n  last_attempt_at = NOW(),\n  attempt_count = io.attempt_count + 1,\n  updated_at = NOW()\nFROM claimable c\nJOIN appointments a ON c.appointment_id = a.appointment_id\nJOIN doctors d ON a.doctor_id = d.doctor_id\nWHERE io.operation_id = c.operation_id\nRETURNING\n  io.operation_id,\n  io.appointment_id,\n  io.operation_type,\n  io.attempt_count,\n  a.customer_name,\n  a.service,\n  a.start_time,\n  a.end_time,\n  a.status AS appt_status,\n  a.calendar_event_id,\n  d.doctor_name,\n  d.calendar_id,\n  d.timezone;\n",
+        "queryParameters": ""
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres_credentials_id",
+          "name": "PostgreSQL Account"
+        }
+      },
+      "continueOnFail": false
+    },
+    {
+      "id": "w4-if-ops-exist",
+      "name": "If_Operations_Exist",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [500, 300],
+      "parameters": {
+        "conditions": {
+          "options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict"},
+          "conditions": [
+            {
+              "leftValue": "={{ $json.operation_id !== undefined && $json.operation_id !== null }}",
+              "rightValue": true,
+              "operator": {"type": "boolean", "operation": "equals"}
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "w4-route-op-type",
+      "name": "Route_Operation_Type",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [700, 300],
+      "parameters": {
+        "mode": "expression",
+        "output": "={{ $json.operation_type }}",
+        "rules": {
+          "values": [
+            {"outputKey": "GCAL_CREATE"},
+            {"outputKey": "GCAL_UPDATE"},
+            {"outputKey": "GCAL_DELETE"}
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "w4-gcal-create",
+      "name": "GCal_Create_Event",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1.2,
+      "position": [960, 100],
+      "parameters": {
+        "operation": "create",
+        "calendar": {
+          "__rl": true,
+          "value": "={{ $json.calendar_id }}",
+          "mode": "id"
+        },
+        "start": "={{ $json.start_time }}",
+        "end": "={{ $json.end_time }}",
+        "additionalFields": {
+          "summary": "={{ $json.customer_name + ' - ' + $json.service + ' with ' + $json.doctor_name }}",
+          "description": "={{ 'Appointment ID: ' + $json.appointment_id + '\\nService: ' + $json.service + '\\nPatient: ' + $json.customer_name }}",
+          "attendees": [],
+          "timeZone": "={{ $json.timezone }}"
+        }
+      },
+      "credentials": {
+        "googleCalendarOAuth2": {
+          "id": "google_calendar_credentials_id",
+          "name": "Google Calendar Account"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "id": "w4-gcal-update",
+      "name": "GCal_Update_Event",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1.2,
+      "position": [960, 300],
+      "parameters": {
+        "operation": "update",
+        "calendar": {
+          "__rl": true,
+          "value": "={{ $json.calendar_id }}",
+          "mode": "id"
+        },
+        "eventId": "={{ $json.calendar_event_id }}",
+        "updateFields": {
+          "start": "={{ $json.start_time }}",
+          "end": "={{ $json.end_time }}",
+          "summary": "={{ $json.customer_name + ' - ' + $json.service + ' with ' + $json.doctor_name + ' [RESCHEDULED]' }}",
+          "timeZone": "={{ $json.timezone }}"
+        }
+      },
+      "credentials": {
+        "googleCalendarOAuth2": {
+          "id": "google_calendar_credentials_id",
+          "name": "Google Calendar Account"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "id": "w4-gcal-delete",
+      "name": "GCal_Delete_Event",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1.2,
+      "position": [960, 500],
+      "parameters": {
+        "operation": "delete",
+        "calendar": {
+          "__rl": true,
+          "value": "={{ $json.calendar_id }}",
+          "mode": "id"
+        },
+        "eventId": "={{ $json.calendar_event_id }}"
+      },
+      "credentials": {
+        "googleCalendarOAuth2": {
+          "id": "google_calendar_credentials_id",
+          "name": "Google Calendar Account"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "id": "w4-check-create-result",
+      "name": "Check_GCal_Create_Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1160, 100],
+      "parameters": {
+        "language": "javascript",
+        "jsCode": "\nconst result = $input.first()?.json || {};\nconst opCtx = $('Route_Operation_Type').first()?.json || {};\n\nconst success = Boolean(result.id && !result.error);\nconst gcalEventId = result.id || null;\nconst errorDetail = result.error ? JSON.stringify(result.error) : (result.statusCode >= 400 ? 'HTTP ' + result.statusCode : null);\n\nreturn [{ json: {\n  operation_id: opCtx.operation_id,\n  appointment_id: opCtx.appointment_id,\n  operation_type: opCtx.operation_type,\n  attempt_count: opCtx.attempt_count,\n  success: success,\n  gcal_event_id: gcalEventId,\n  error_detail: errorDetail\n}}];\n"
+      }
+    },
+    {
+      "id": "w4-check-update-result",
+      "name": "Check_GCal_Update_Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1160, 300],
+      "parameters": {
+        "language": "javascript",
+        "jsCode": "\nconst result = $input.first()?.json || {};\nconst opCtx = $('Route_Operation_Type').first()?.json || {};\n\nconst success = Boolean(result.id && !result.error);\nconst errorDetail = result.error ? JSON.stringify(result.error) : (result.statusCode >= 400 ? 'HTTP ' + result.statusCode : null);\n\nreturn [{ json: {\n  operation_id: opCtx.operation_id,\n  appointment_id: opCtx.appointment_id,\n  operation_type: opCtx.operation_type,\n  attempt_count: opCtx.attempt_count,\n  success: success,\n  gcal_event_id: result.id || opCtx.calendar_event_id || null,\n  error_detail: errorDetail\n}}];\n"
+      }
+    },
+    {
+      "id": "w4-check-delete-result",
+      "name": "Check_GCal_Delete_Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1160, 500],
+      "parameters": {
+        "language": "javascript",
+        "jsCode": "\nconst result = $input.first()?.json || {};\nconst opCtx = $('Route_Operation_Type').first()?.json || {};\n\n// GCal delete returns empty object on success (HTTP 204), or error object on failure\nconst hasError = Boolean(result.error || (result.statusCode && result.statusCode >= 400));\nconst success = !hasError;\nconst errorDetail = result.error ? JSON.stringify(result.error) : (result.statusCode >= 400 ? 'HTTP ' + result.statusCode : null);\n\nreturn [{ json: {\n  operation_id: opCtx.operation_id,\n  appointment_id: opCtx.appointment_id,\n  operation_type: opCtx.operation_type,\n  attempt_count: opCtx.attempt_count,\n  success: success,\n  gcal_event_id: null,\n  error_detail: errorDetail\n}}];\n"
+      }
+    },
+    {
+      "id": "w4-if-op-success",
+      "name": "If_Operation_Succeeded",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1360, 300],
+      "parameters": {
+        "conditions": {
+          "options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict"},
+          "conditions": [
+            {
+              "leftValue": "={{ $json.success }}",
+              "rightValue": true,
+              "operator": {"type": "boolean", "operation": "equals"}
+            }
+          ],
+          "combinator": "and"
+        }
+      }
+    },
+    {
+      "id": "w4-mark-success",
+      "name": "Postgres_Mark_Op_Success",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1580, 180],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "\nWITH op_update AS (\n  UPDATE integration_operations\n  SET status = 'SUCCESS', updated_at = NOW()\n  WHERE operation_id = $1\n  RETURNING operation_id, appointment_id, operation_type\n)\nUPDATE appointments a\nSET\n  calendar_event_id = CASE WHEN $2 IS NOT NULL AND $2 != '' THEN $2 ELSE a.calendar_event_id END,\n  updated_at = NOW()\nFROM op_update o\nWHERE a.appointment_id = o.appointment_id\n  AND o.operation_type IN ('GCAL_CREATE', 'GCAL_UPDATE')\nRETURNING a.appointment_id, a.calendar_event_id, o.operation_type;\n",
+        "queryParameters": "={{ [$json.operation_id, $json.gcal_event_id] }}"
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres_credentials_id",
+          "name": "PostgreSQL Account"
+        }
+      },
+      "continueOnFail": false
+    },
+    {
+      "id": "w4-mark-failure",
+      "name": "Postgres_Mark_Op_Failed",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [1580, 420],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "\nUPDATE integration_operations\nSET\n  status = CASE WHEN $1 >= 5 THEN 'PERMANENTLY_FAILED' ELSE 'FAILED' END,\n  next_retry_at = CASE\n    WHEN $1 < 5 THEN NOW() + (INTERVAL '1 minute' * POWER(2, $1))\n    ELSE NULL\n  END,\n  error_details = $2::jsonb,\n  updated_at = NOW()\nWHERE operation_id = $3\nRETURNING operation_id, status, attempt_count, next_retry_at;\n",
+        "queryParameters": "={{ [$json.attempt_count, JSON.stringify({error: $json.error_detail, attempt: $json.attempt_count, ts: new Date().toISOString()}), $json.operation_id] }}"
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres_credentials_id",
+          "name": "PostgreSQL Account"
+        }
+      },
+      "continueOnFail": false
+    },
+    {
+      "id": "w4-no-ops",
+      "name": "No_Ops_To_Process",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [700, 500],
+      "parameters": {}
+    }
+  ],
+  "connections": {
+    "Schedule_Trigger_5Min": {
+      "main": [[{"node": "Postgres_Claim_Pending_Ops", "type": "main", "index": 0}]]
+    },
+    "Postgres_Claim_Pending_Ops": {
+      "main": [[{"node": "If_Operations_Exist", "type": "main", "index": 0}]]
+    },
+    "If_Operations_Exist": {
+      "main": [
+        [{"node": "Route_Operation_Type", "type": "main", "index": 0}],
+        [{"node": "No_Ops_To_Process", "type": "main", "index": 0}]
+      ]
+    },
+    "Route_Operation_Type": {
+      "main": [
+        [{"node": "GCal_Create_Event", "type": "main", "index": 0}],
+        [{"node": "GCal_Update_Event", "type": "main", "index": 0}],
+        [{"node": "GCal_Delete_Event", "type": "main", "index": 0}]
+      ]
+    },
+    "GCal_Create_Event": {
+      "main": [[{"node": "Check_GCal_Create_Result", "type": "main", "index": 0}]]
+    },
+    "GCal_Update_Event": {
+      "main": [[{"node": "Check_GCal_Update_Result", "type": "main", "index": 0}]]
+    },
+    "GCal_Delete_Event": {
+      "main": [[{"node": "Check_GCal_Delete_Result", "type": "main", "index": 0}]]
+    },
+    "Check_GCal_Create_Result": {
+      "main": [[{"node": "If_Operation_Succeeded", "type": "main", "index": 0}]]
+    },
+    "Check_GCal_Update_Result": {
+      "main": [[{"node": "If_Operation_Succeeded", "type": "main", "index": 0}]]
+    },
+    "Check_GCal_Delete_Result": {
+      "main": [[{"node": "If_Operation_Succeeded", "type": "main", "index": 0}]]
+    },
+    "If_Operation_Succeeded": {
+      "main": [
+        [{"node": "Postgres_Mark_Op_Success", "type": "main", "index": 0}],
+        [{"node": "Postgres_Mark_Op_Failed", "type": "main", "index": 0}]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "04-calendar-worker-v1",
+  "meta": {
+    "instanceId": "appointment-booking-system"
+  },
+  "id": "04-calendar-integration-worker",
+  "tags": []
+}
