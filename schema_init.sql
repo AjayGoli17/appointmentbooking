@@ -98,7 +98,7 @@ CREATE INDEX IF NOT EXISTS idx_appointment_audit_appt ON appointment_audit_logs(
 
 -- 8. Authoritative Active Appointment Overlap Exclusion Constraint (Bug #1, #2)
 -- Excludes all active bookings. Expired pending holds are transitioned to EXPIRED so they do not block new bookings.
-DO 5926
+DO $$
 BEGIN
     IF EXISTS (
         SELECT 1 FROM pg_constraint WHERE conname = 'no_overlapping_confirmed_appointments'
@@ -116,11 +116,11 @@ BEGIN
             tstzrange(start_time, end_time) WITH &&
         ) WHERE (status IN ('PENDING', 'CONFIRMED', 'RESCHEDULED', 'ARRIVED', 'COMPLETED'));
     END IF;
-END 5926;
+END $$;
 
 -- 9. Automatic Audit Logging Trigger (Bug #20, #21)
 CREATE OR REPLACE FUNCTION log_appointment_audit()
-RETURNS TRIGGER AS 5926
+RETURNS TRIGGER AS $$
 DECLARE
     v_actor VARCHAR(100);
     v_action VARCHAR(50);
@@ -150,7 +150,7 @@ BEGIN
     END IF;
     RETURN NULL;
 END;
-5926 LANGUAGE plpgsql;
+$$ LANGUAGE plpgsql;
 
 DROP TRIGGER IF EXISTS trg_appointment_audit ON appointments;
 CREATE TRIGGER trg_appointment_audit
@@ -159,12 +159,12 @@ FOR EACH ROW EXECUTE FUNCTION log_appointment_audit();
 
 -- 10. Automatic Updated At Timestamp Trigger
 CREATE OR REPLACE FUNCTION set_updated_at()
-RETURNS TRIGGER AS 5926
+RETURNS TRIGGER AS $$
 BEGIN
     NEW.updated_at = NOW();
     RETURN NEW;
 END;
-5926 LANGUAGE plpgsql;
+$$ LANGUAGE plpgsql;
 
 DROP TRIGGER IF EXISTS trg_appointments_updated_at ON appointments;
 CREATE TRIGGER trg_appointments_updated_at
@@ -173,7 +173,7 @@ FOR EACH ROW EXECUTE FUNCTION set_updated_at();
 
 -- 11. Maintenance Helper Functions for Cleanup & Retention (Bug #10, #30, #60)
 CREATE OR REPLACE FUNCTION expire_stale_pending_appointments()
-RETURNS INT AS 5926
+RETURNS INT AS $$
 DECLARE
     v_count INT;
 BEGIN
@@ -183,7 +183,7 @@ BEGIN
     GET DIAGNOSTICS v_count = ROW_COUNT;
     RETURN v_count;
 END;
-5926 LANGUAGE plpgsql;
+$$ LANGUAGE plpgsql;
 
 -- 12. PostgreSQL vs Google Calendar Reconciliation View (Bug #8)
 CREATE OR REPLACE VIEW vw_appointment_reconciliation AS
