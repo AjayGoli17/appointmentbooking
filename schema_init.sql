@@ -207,3 +207,104 @@ SELECT
     a.updated_at
 FROM appointments a
 JOIN doctors d ON a.doctor_id = d.doctor_id;
+
+-- 13. Durable Integration Operations Tracking
+CREATE TABLE IF NOT EXISTS integration_operations (
+    operation_id SERIAL PRIMARY KEY,
+    appointment_id INT REFERENCES appointments(appointment_id) ON DELETE CASCADE,
+    operation_type VARCHAR(50) NOT NULL, -- e.g., 'GCAL_CREATE', 'GCAL_UPDATE', 'GCAL_DELETE', 'WHATSAPP_SEND'
+    status VARCHAR(50) NOT NULL DEFAULT 'PENDING', -- 'PENDING', 'SUCCESS', 'FAILED'
+    attempt_count INT NOT NULL DEFAULT 0,
+    last_attempt_at TIMESTAMPTZ,
+    next_retry_at TIMESTAMPTZ,
+    error_details JSONB,
+    payload JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_integration_ops_status_retry ON integration_operations(status, next_retry_at) WHERE status = 'FAILED';
+CREATE INDEX IF NOT EXISTS idx_integration_ops_appt ON integration_operations(appointment_id);
+
+CREATE OR REPLACE FUNCTION set_integration_op_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_integration_ops_updated_at ON integration_operations;
+CREATE TRIGGER trg_integration_ops_updated_at
+BEFORE UPDATE ON integration_operations
+FOR EACH ROW EXECUTE FUNCTION set_integration_op_updated_at();
+
+-- 14. Outbox Pattern for Calendar Operations
+CREATE OR REPLACE FUNCTION queue_calendar_integration_ops()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        IF NEW.status = 'CONFIRMED' THEN
+            INSERT INTO integration_operations (appointment_id, operation_type, status, payload)
+            VALUES (NEW.appointment_id, 'GCAL_CREATE', 'PENDING', to_jsonb(NEW));
+        END IF;
+    ELSIF TG_OP = 'UPDATE' THEN
+        IF OLD.status != 'CANCELLED' AND NEW.status = 'CANCELLED' THEN
+            INSERT INTO integration_operations (appointment_id, operation_type, status, payload)
+            VALUES (NEW.appointment_id, 'GCAL_DELETE', 'PENDING', to_jsonb(NEW));
+        ELSIF (OLD.start_time != NEW.start_time OR OLD.end_time != NEW.end_time) AND NEW.status IN ('CONFIRMED', 'RESCHEDULED') THEN
+            INSERT INTO integration_operations (appointment_id, operation_type, status, payload)
+            VALUES (NEW.appointment_id, 'GCAL_UPDATE', 'PENDING', to_jsonb(NEW));
+        ELSIF OLD.status = 'PENDING' AND NEW.status = 'CONFIRMED' THEN
+            INSERT INTO integration_operations (appointment_id, operation_type, status, payload)
+            VALUES (NEW.appointment_id, 'GCAL_CREATE', 'PENDING', to_jsonb(NEW));
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_queue_calendar_ops ON appointments;
+CREATE TRIGGER trg_queue_calendar_ops
+AFTER INSERT OR UPDATE ON appointments
+FOR EACH ROW EXECUTE FUNCTION queue_calendar_integration_ops();
+
+-- 15. Phone Normalization Trigger
+CREATE OR REPLACE FUNCTION normalize_phone_number()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.phone = regexp_replace(NEW.phone, '[^0-9]', '', 'g');
+    IF length(NEW.phone) = 10 THEN
+        NEW.phone = '91' || NEW.phone;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_normalize_phone ON appointments;
+CREATE TRIGGER trg_normalize_phone
+BEFORE INSERT OR UPDATE ON appointments
+FOR EACH ROW EXECUTE FUNCTION normalize_phone_number();
+
+-- 16. Prevent Historical Appointments Trigger
+CREATE OR REPLACE FUNCTION prevent_past_appointments()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        -- Allow a tiny grace period of 5 minutes for latency
+        IF NEW.start_time < (NOW() - INTERVAL '5 minutes') THEN
+            RAISE EXCEPTION 'Cannot book an appointment in the past: %', NEW.start_time;
+        END IF;
+    ELSIF TG_OP = 'UPDATE' THEN
+        IF (NEW.start_time != OLD.start_time) AND (NEW.start_time < (NOW() - INTERVAL '5 minutes')) THEN
+            RAISE EXCEPTION 'Cannot reschedule an appointment to the past: %', NEW.start_time;
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_prevent_past_appts ON appointments;
+CREATE TRIGGER trg_prevent_past_appts
+BEFORE INSERT OR UPDATE ON appointments
+FOR EACH ROW EXECUTE FUNCTION prevent_past_appointments();
