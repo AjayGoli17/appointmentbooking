@@ -6,7 +6,10 @@
       "name": "Schedule_Trigger_5Min",
       "type": "n8n-nodes-base.scheduleTrigger",
       "typeVersion": 1.2,
-      "position": [100, 300],
+      "position": [
+        100,
+        300
+      ],
       "parameters": {
         "rule": {
           "interval": [
@@ -25,10 +28,13 @@
       "name": "Postgres_Claim_Pending_Ops",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
-      "position": [300, 300],
+      "position": [
+        300,
+        300
+      ],
       "parameters": {
         "operation": "executeQuery",
-        "query": "\nWITH claimable AS (\n  SELECT io.operation_id, io.appointment_id, io.operation_type, io.payload, io.attempt_count\n  FROM integration_operations io\n  WHERE io.status IN ('PENDING')\n     OR (io.status = 'FAILED' AND io.next_retry_at <= NOW() AND io.attempt_count < 5)\n  ORDER BY io.created_at\n  LIMIT 10\n  FOR UPDATE SKIP LOCKED\n)\nUPDATE integration_operations io\nSET\n  status = 'IN_PROGRESS',\n  last_attempt_at = NOW(),\n  attempt_count = io.attempt_count + 1,\n  updated_at = NOW()\nFROM claimable c\nJOIN appointments a ON c.appointment_id = a.appointment_id\nJOIN doctors d ON a.doctor_id = d.doctor_id\nWHERE io.operation_id = c.operation_id\nRETURNING\n  io.operation_id,\n  io.appointment_id,\n  io.operation_type,\n  io.attempt_count,\n  a.customer_name,\n  a.service,\n  a.start_time,\n  a.end_time,\n  a.status AS appt_status,\n  a.calendar_event_id,\n  d.doctor_name,\n  d.calendar_id,\n  d.timezone;\n",
+        "query": "\nWITH superseded AS (\n  UPDATE integration_operations io\n  SET status = 'SUPERSEDED', updated_at = NOW()\n  FROM integration_operations newer\n  WHERE io.appointment_id = newer.appointment_id\n    AND io.operation_id < newer.operation_id\n    AND io.status IN ('PENDING', 'FAILED')\n    AND newer.status IN ('PENDING', 'IN_PROGRESS', 'FAILED')\n    AND (\n      newer.operation_type = 'GCAL_DELETE'\n      OR (newer.operation_type = io.operation_type AND newer.operation_type = 'GCAL_UPDATE')\n    )\n  RETURNING io.operation_id\n),\nalready_done AS (\n  UPDATE integration_operations io\n  SET status = 'SUCCESS', updated_at = NOW()\n  FROM appointments a\n  WHERE io.appointment_id = a.appointment_id\n    AND io.status = 'PENDING'\n    AND io.operation_id NOT IN (SELECT operation_id FROM superseded)\n    AND (\n      (io.operation_type = 'GCAL_CREATE' AND a.calendar_event_id IS NOT NULL AND a.calendar_event_id != '')\n      OR (io.operation_type = 'GCAL_DELETE' AND (a.calendar_event_id IS NULL OR a.calendar_event_id = ''))\n    )\n  RETURNING io.operation_id\n),\nclaimable AS (\n  SELECT io.operation_id, io.appointment_id, io.operation_type, io.payload, io.attempt_count\n  FROM integration_operations io\n  WHERE (\n    io.status = 'PENDING'\n    OR (io.status = 'FAILED' AND io.next_retry_at <= NOW() AND io.attempt_count < 5)\n    OR (io.status = 'IN_PROGRESS' AND io.last_attempt_at < NOW() - INTERVAL '10 minutes' AND io.attempt_count < 5)\n  )\n  AND io.operation_id NOT IN (SELECT operation_id FROM superseded)\n  AND io.operation_id NOT IN (SELECT operation_id FROM already_done)\n  ORDER BY\n    CASE io.status WHEN 'IN_PROGRESS' THEN 0 WHEN 'PENDING' THEN 1 ELSE 2 END,\n    io.created_at\n  LIMIT 10\n  FOR UPDATE SKIP LOCKED\n)\nUPDATE integration_operations io\nSET\n  status = 'IN_PROGRESS',\n  last_attempt_at = NOW(),\n  attempt_count = CASE WHEN io.status = 'IN_PROGRESS' THEN io.attempt_count ELSE io.attempt_count + 1 END,\n  updated_at = NOW()\nFROM claimable c\nJOIN appointments a ON c.appointment_id = a.appointment_id\nJOIN doctors d ON a.doctor_id = d.doctor_id\nWHERE io.operation_id = c.operation_id\nRETURNING\n  io.operation_id,\n  io.appointment_id,\n  io.operation_type,\n  io.attempt_count,\n  a.customer_name,\n  a.service,\n  a.start_time,\n  a.end_time,\n  a.status AS appt_status,\n  a.calendar_event_id,\n  d.doctor_name,\n  d.calendar_id,\n  d.timezone;\n",
         "queryParameters": ""
       },
       "credentials": {
@@ -44,15 +50,25 @@
       "name": "If_Operations_Exist",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2,
-      "position": [500, 300],
+      "position": [
+        500,
+        300
+      ],
       "parameters": {
         "conditions": {
-          "options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict"},
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
           "conditions": [
             {
               "leftValue": "={{ $json.operation_id !== undefined && $json.operation_id !== null }}",
               "rightValue": true,
-              "operator": {"type": "boolean", "operation": "equals"}
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
             }
           ],
           "combinator": "and"
@@ -64,15 +80,24 @@
       "name": "Route_Operation_Type",
       "type": "n8n-nodes-base.switch",
       "typeVersion": 3,
-      "position": [700, 300],
+      "position": [
+        700,
+        300
+      ],
       "parameters": {
         "mode": "expression",
         "output": "={{ $json.operation_type }}",
         "rules": {
           "values": [
-            {"outputKey": "GCAL_CREATE"},
-            {"outputKey": "GCAL_UPDATE"},
-            {"outputKey": "GCAL_DELETE"}
+            {
+              "outputKey": "GCAL_CREATE"
+            },
+            {
+              "outputKey": "GCAL_UPDATE"
+            },
+            {
+              "outputKey": "GCAL_DELETE"
+            }
           ]
         },
         "options": {}
@@ -83,7 +108,10 @@
       "name": "GCal_Create_Event",
       "type": "n8n-nodes-base.googleCalendar",
       "typeVersion": 1.2,
-      "position": [960, 100],
+      "position": [
+        960,
+        100
+      ],
       "parameters": {
         "operation": "create",
         "calendar": {
@@ -113,7 +141,10 @@
       "name": "GCal_Update_Event",
       "type": "n8n-nodes-base.googleCalendar",
       "typeVersion": 1.2,
-      "position": [960, 300],
+      "position": [
+        960,
+        300
+      ],
       "parameters": {
         "operation": "update",
         "calendar": {
@@ -142,7 +173,10 @@
       "name": "GCal_Delete_Event",
       "type": "n8n-nodes-base.googleCalendar",
       "typeVersion": 1.2,
-      "position": [960, 500],
+      "position": [
+        960,
+        500
+      ],
       "parameters": {
         "operation": "delete",
         "calendar": {
@@ -165,10 +199,13 @@
       "name": "Check_GCal_Create_Result",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [1160, 100],
+      "position": [
+        1160,
+        100
+      ],
       "parameters": {
         "language": "javascript",
-        "jsCode": "\nconst result = $input.first()?.json || {};\nconst opCtx = $('Route_Operation_Type').first()?.json || {};\n\nconst success = Boolean(result.id && !result.error);\nconst gcalEventId = result.id || null;\nconst errorDetail = result.error ? JSON.stringify(result.error) : (result.statusCode >= 400 ? 'HTTP ' + result.statusCode : null);\n\nreturn [{ json: {\n  operation_id: opCtx.operation_id,\n  appointment_id: opCtx.appointment_id,\n  operation_type: opCtx.operation_type,\n  attempt_count: opCtx.attempt_count,\n  success: success,\n  gcal_event_id: gcalEventId,\n  error_detail: errorDetail\n}}];\n"
+        "jsCode": "\nconst result = $input.first()?.json || {};\n// The GCal node's pairedItem traces back through Route_Operation_Type -> Claim\n// We use pairedItem chain to get the original claim row\nlet opCtx = {};\ntry {\n  const claimItems = $('Postgres_Claim_Pending_Ops').all();\n  const pi = $input.first()?.pairedItem;\n  const piIdx = (pi && typeof pi.item === 'number') ? pi.item : (typeof pi === 'number' ? pi : 0);\n  // Walk through Route_Operation_Type pairedItem\n  const routeItems = $('Route_Operation_Type').all();\n  if (routeItems[piIdx]) {\n    const rpi = routeItems[piIdx]?.pairedItem;\n    const rpiIdx = (rpi && typeof rpi.item === 'number') ? rpi.item : (typeof rpi === 'number' ? rpi : piIdx);\n    opCtx = claimItems[rpiIdx]?.json || claimItems[0]?.json || {};\n  } else {\n    opCtx = claimItems[0]?.json || {};\n  }\n} catch(e) {\n  opCtx = $('Postgres_Claim_Pending_Ops').first()?.json || {};\n}\n\nconst success = Boolean(result.id && typeof result.id === 'string' && !result.error && !(result.statusCode >= 400));\nconst gcalEventId = success ? (result.id || null) : null;\nconst errorDetail = result.error ? JSON.stringify(result.error) : ((result.statusCode >= 400) ? 'HTTP_' + result.statusCode : (result.error_status ? result.error_status : null));\n\nreturn [{ json: {\n  operation_id: opCtx.operation_id,\n  appointment_id: opCtx.appointment_id,\n  operation_type: opCtx.operation_type,\n  attempt_count: opCtx.attempt_count,\n  calendar_event_id: opCtx.calendar_event_id,\n  success: success,\n  gcal_event_id: gcalEventId,\n  error_detail: errorDetail\n}}];\n"
       }
     },
     {
@@ -176,10 +213,13 @@
       "name": "Check_GCal_Update_Result",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [1160, 300],
+      "position": [
+        1160,
+        300
+      ],
       "parameters": {
         "language": "javascript",
-        "jsCode": "\nconst result = $input.first()?.json || {};\nconst opCtx = $('Route_Operation_Type').first()?.json || {};\n\nconst success = Boolean(result.id && !result.error);\nconst errorDetail = result.error ? JSON.stringify(result.error) : (result.statusCode >= 400 ? 'HTTP ' + result.statusCode : null);\n\nreturn [{ json: {\n  operation_id: opCtx.operation_id,\n  appointment_id: opCtx.appointment_id,\n  operation_type: opCtx.operation_type,\n  attempt_count: opCtx.attempt_count,\n  success: success,\n  gcal_event_id: result.id || opCtx.calendar_event_id || null,\n  error_detail: errorDetail\n}}];\n"
+        "jsCode": "\nconst result = $input.first()?.json || {};\nlet opCtx = {};\ntry {\n  const claimItems = $('Postgres_Claim_Pending_Ops').all();\n  const pi = $input.first()?.pairedItem;\n  const piIdx = (pi && typeof pi.item === 'number') ? pi.item : (typeof pi === 'number' ? pi : 0);\n  const routeItems = $('Route_Operation_Type').all();\n  if (routeItems[piIdx]) {\n    const rpi = routeItems[piIdx]?.pairedItem;\n    const rpiIdx = (rpi && typeof rpi.item === 'number') ? rpi.item : (typeof rpi === 'number' ? rpi : piIdx);\n    opCtx = claimItems[rpiIdx]?.json || claimItems[0]?.json || {};\n  } else {\n    opCtx = claimItems[0]?.json || {};\n  }\n} catch(e) {\n  opCtx = $('Postgres_Claim_Pending_Ops').first()?.json || {};\n}\n\nconst success = Boolean(result.id && !result.error && !(result.statusCode >= 400));\nconst errorDetail = result.error ? JSON.stringify(result.error) : ((result.statusCode >= 400) ? 'HTTP_' + result.statusCode : null);\n\nreturn [{ json: {\n  operation_id: opCtx.operation_id,\n  appointment_id: opCtx.appointment_id,\n  operation_type: opCtx.operation_type,\n  attempt_count: opCtx.attempt_count,\n  calendar_event_id: opCtx.calendar_event_id,\n  success: success,\n  gcal_event_id: success ? (result.id || opCtx.calendar_event_id) : null,\n  error_detail: errorDetail\n}}];\n"
       }
     },
     {
@@ -187,10 +227,13 @@
       "name": "Check_GCal_Delete_Result",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [1160, 500],
+      "position": [
+        1160,
+        500
+      ],
       "parameters": {
         "language": "javascript",
-        "jsCode": "\nconst result = $input.first()?.json || {};\nconst opCtx = $('Route_Operation_Type').first()?.json || {};\n\n// GCal delete returns empty object on success (HTTP 204), or error object on failure\nconst hasError = Boolean(result.error || (result.statusCode && result.statusCode >= 400));\nconst success = !hasError;\nconst errorDetail = result.error ? JSON.stringify(result.error) : (result.statusCode >= 400 ? 'HTTP ' + result.statusCode : null);\n\nreturn [{ json: {\n  operation_id: opCtx.operation_id,\n  appointment_id: opCtx.appointment_id,\n  operation_type: opCtx.operation_type,\n  attempt_count: opCtx.attempt_count,\n  success: success,\n  gcal_event_id: null,\n  error_detail: errorDetail\n}}];\n"
+        "jsCode": "\nconst result = $input.first()?.json || {};\nlet opCtx = {};\ntry {\n  const claimItems = $('Postgres_Claim_Pending_Ops').all();\n  const pi = $input.first()?.pairedItem;\n  const piIdx = (pi && typeof pi.item === 'number') ? pi.item : (typeof pi === 'number' ? pi : 0);\n  const routeItems = $('Route_Operation_Type').all();\n  if (routeItems[piIdx]) {\n    const rpi = routeItems[piIdx]?.pairedItem;\n    const rpiIdx = (rpi && typeof rpi.item === 'number') ? rpi.item : (typeof rpi === 'number' ? rpi : piIdx);\n    opCtx = claimItems[rpiIdx]?.json || claimItems[0]?.json || {};\n  } else {\n    opCtx = claimItems[0]?.json || {};\n  }\n} catch(e) {\n  opCtx = $('Postgres_Claim_Pending_Ops').first()?.json || {};\n}\n\n// GCal DELETE returns empty on 204, or error on failure\nconst hasError = Boolean(result.error || (result.statusCode && result.statusCode >= 400));\n// Treat 404 as success (event already deleted - idempotent)\nconst isNotFound = result.statusCode === 404 || (result.error && result.error.code === 404);\nconst success = !hasError || isNotFound;\nconst errorDetail = hasError && !isNotFound ? \n  (result.error ? JSON.stringify(result.error) : 'HTTP_' + result.statusCode) : null;\n\nreturn [{ json: {\n  operation_id: opCtx.operation_id,\n  appointment_id: opCtx.appointment_id,\n  operation_type: opCtx.operation_type,\n  attempt_count: opCtx.attempt_count,\n  calendar_event_id: opCtx.calendar_event_id,\n  success: success,\n  gcal_event_id: null,\n  error_detail: errorDetail\n}}];\n"
       }
     },
     {
@@ -198,15 +241,25 @@
       "name": "If_Operation_Succeeded",
       "type": "n8n-nodes-base.if",
       "typeVersion": 2,
-      "position": [1360, 300],
+      "position": [
+        1360,
+        300
+      ],
       "parameters": {
         "conditions": {
-          "options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict"},
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
           "conditions": [
             {
               "leftValue": "={{ $json.success }}",
               "rightValue": true,
-              "operator": {"type": "boolean", "operation": "equals"}
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
             }
           ],
           "combinator": "and"
@@ -218,10 +271,13 @@
       "name": "Postgres_Mark_Op_Success",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
-      "position": [1580, 180],
+      "position": [
+        1580,
+        180
+      ],
       "parameters": {
         "operation": "executeQuery",
-        "query": "\nWITH op_update AS (\n  UPDATE integration_operations\n  SET status = 'SUCCESS', updated_at = NOW()\n  WHERE operation_id = $1\n  RETURNING operation_id, appointment_id, operation_type\n)\nUPDATE appointments a\nSET\n  calendar_event_id = CASE WHEN $2 IS NOT NULL AND $2 != '' THEN $2 ELSE a.calendar_event_id END,\n  updated_at = NOW()\nFROM op_update o\nWHERE a.appointment_id = o.appointment_id\n  AND o.operation_type IN ('GCAL_CREATE', 'GCAL_UPDATE')\nRETURNING a.appointment_id, a.calendar_event_id, o.operation_type;\n",
+        "query": "\nWITH op_update AS (\n  UPDATE integration_operations\n  SET status = 'SUCCESS', updated_at = NOW()\n  WHERE operation_id = $1\n  RETURNING operation_id, appointment_id, operation_type\n),\nappt_update AS (\n  UPDATE appointments a\n  SET\n    calendar_event_id = CASE\n      WHEN o.operation_type = 'GCAL_DELETE' THEN NULL\n      WHEN o.operation_type IN ('GCAL_CREATE', 'GCAL_UPDATE') AND $2 IS NOT NULL AND $2 != '' THEN $2\n      ELSE a.calendar_event_id\n    END,\n    updated_at = NOW()\n  FROM op_update o\n  WHERE a.appointment_id = o.appointment_id\n  RETURNING a.appointment_id, a.calendar_event_id, o.operation_type\n)\nSELECT * FROM appt_update;\n",
         "queryParameters": "={{ [$json.operation_id, $json.gcal_event_id] }}"
       },
       "credentials": {
@@ -237,7 +293,10 @@
       "name": "Postgres_Mark_Op_Failed",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
-      "position": [1580, 420],
+      "position": [
+        1580,
+        420
+      ],
       "parameters": {
         "operation": "executeQuery",
         "query": "\nUPDATE integration_operations\nSET\n  status = CASE WHEN $1 >= 5 THEN 'PERMANENTLY_FAILED' ELSE 'FAILED' END,\n  next_retry_at = CASE\n    WHEN $1 < 5 THEN NOW() + (INTERVAL '1 minute' * POWER(2, $1))\n    ELSE NULL\n  END,\n  error_details = $2::jsonb,\n  updated_at = NOW()\nWHERE operation_id = $3\nRETURNING operation_id, status, attempt_count, next_retry_at;\n",
@@ -256,52 +315,161 @@
       "name": "No_Ops_To_Process",
       "type": "n8n-nodes-base.noOp",
       "typeVersion": 1,
-      "position": [700, 500],
+      "position": [
+        700,
+        500
+      ],
       "parameters": {}
     }
   ],
   "connections": {
     "Schedule_Trigger_5Min": {
-      "main": [[{"node": "Postgres_Claim_Pending_Ops", "type": "main", "index": 0}]]
+      "main": [
+        [
+          {
+            "node": "Postgres_Claim_Pending_Ops",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Postgres_Claim_Pending_Ops": {
-      "main": [[{"node": "If_Operations_Exist", "type": "main", "index": 0}]]
+      "main": [
+        [
+          {
+            "node": "If_Operations_Exist",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "If_Operations_Exist": {
       "main": [
-        [{"node": "Route_Operation_Type", "type": "main", "index": 0}],
-        [{"node": "No_Ops_To_Process", "type": "main", "index": 0}]
+        [
+          {
+            "node": "Route_Operation_Type",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "No_Ops_To_Process",
+            "type": "main",
+            "index": 0
+          }
+        ]
       ]
     },
     "Route_Operation_Type": {
       "main": [
-        [{"node": "GCal_Create_Event", "type": "main", "index": 0}],
-        [{"node": "GCal_Update_Event", "type": "main", "index": 0}],
-        [{"node": "GCal_Delete_Event", "type": "main", "index": 0}]
+        [
+          {
+            "node": "GCal_Create_Event",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "GCal_Update_Event",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "GCal_Delete_Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
       ]
     },
     "GCal_Create_Event": {
-      "main": [[{"node": "Check_GCal_Create_Result", "type": "main", "index": 0}]]
+      "main": [
+        [
+          {
+            "node": "Check_GCal_Create_Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "GCal_Update_Event": {
-      "main": [[{"node": "Check_GCal_Update_Result", "type": "main", "index": 0}]]
+      "main": [
+        [
+          {
+            "node": "Check_GCal_Update_Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "GCal_Delete_Event": {
-      "main": [[{"node": "Check_GCal_Delete_Result", "type": "main", "index": 0}]]
+      "main": [
+        [
+          {
+            "node": "Check_GCal_Delete_Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Check_GCal_Create_Result": {
-      "main": [[{"node": "If_Operation_Succeeded", "type": "main", "index": 0}]]
+      "main": [
+        [
+          {
+            "node": "If_Operation_Succeeded",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Check_GCal_Update_Result": {
-      "main": [[{"node": "If_Operation_Succeeded", "type": "main", "index": 0}]]
+      "main": [
+        [
+          {
+            "node": "If_Operation_Succeeded",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "Check_GCal_Delete_Result": {
-      "main": [[{"node": "If_Operation_Succeeded", "type": "main", "index": 0}]]
+      "main": [
+        [
+          {
+            "node": "If_Operation_Succeeded",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     },
     "If_Operation_Succeeded": {
       "main": [
-        [{"node": "Postgres_Mark_Op_Success", "type": "main", "index": 0}],
-        [{"node": "Postgres_Mark_Op_Failed", "type": "main", "index": 0}]
+        [
+          {
+            "node": "Postgres_Mark_Op_Success",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Postgres_Mark_Op_Failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
       ]
     }
   },

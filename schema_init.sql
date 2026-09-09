@@ -244,18 +244,26 @@ CREATE OR REPLACE FUNCTION queue_calendar_integration_ops()
 RETURNS TRIGGER AS $$
 BEGIN
     IF TG_OP = 'INSERT' THEN
-        IF NEW.status = 'CONFIRMED' THEN
+        -- Queue GCAL_CREATE only when status=CONFIRMED and no event_id yet (direct create may not have run)
+        IF NEW.status = 'CONFIRMED' AND (NEW.calendar_event_id IS NULL OR NEW.calendar_event_id = '') THEN
             INSERT INTO integration_operations (appointment_id, operation_type, status, payload)
             VALUES (NEW.appointment_id, 'GCAL_CREATE', 'PENDING', to_jsonb(NEW));
         END IF;
     ELSIF TG_OP = 'UPDATE' THEN
-        IF OLD.status != 'CANCELLED' AND NEW.status = 'CANCELLED' THEN
+        -- CANCELLED: queue GCAL_DELETE only if there was a calendar event to delete
+        IF OLD.status != 'CANCELLED' AND NEW.status = 'CANCELLED'
+           AND OLD.calendar_event_id IS NOT NULL AND OLD.calendar_event_id != '' THEN
             INSERT INTO integration_operations (appointment_id, operation_type, status, payload)
             VALUES (NEW.appointment_id, 'GCAL_DELETE', 'PENDING', to_jsonb(NEW));
-        ELSIF (OLD.start_time != NEW.start_time OR OLD.end_time != NEW.end_time) AND NEW.status IN ('CONFIRMED', 'RESCHEDULED') THEN
+        -- Time changed: queue GCAL_UPDATE only if a calendar event exists
+        ELSIF (OLD.start_time IS DISTINCT FROM NEW.start_time OR OLD.end_time IS DISTINCT FROM NEW.end_time)
+              AND NEW.status IN ('CONFIRMED', 'RESCHEDULED')
+              AND NEW.calendar_event_id IS NOT NULL AND NEW.calendar_event_id != '' THEN
             INSERT INTO integration_operations (appointment_id, operation_type, status, payload)
             VALUES (NEW.appointment_id, 'GCAL_UPDATE', 'PENDING', to_jsonb(NEW));
-        ELSIF OLD.status = 'PENDING' AND NEW.status = 'CONFIRMED' THEN
+        -- PENDING->CONFIRMED and no event_id: queue GCAL_CREATE (direct create may have failed)
+        ELSIF OLD.status = 'PENDING' AND NEW.status = 'CONFIRMED'
+              AND (NEW.calendar_event_id IS NULL OR NEW.calendar_event_id = '') THEN
             INSERT INTO integration_operations (appointment_id, operation_type, status, payload)
             VALUES (NEW.appointment_id, 'GCAL_CREATE', 'PENDING', to_jsonb(NEW));
         END IF;
@@ -308,3 +316,84 @@ DROP TRIGGER IF EXISTS trg_prevent_past_appts ON appointments;
 CREATE TRIGGER trg_prevent_past_appts
 BEFORE INSERT OR UPDATE ON appointments
 FOR EACH ROW EXECUTE FUNCTION prevent_past_appointments();
+
+
+-- 17. Formalize integration_operations status constraint
+-- Ensures no unknown status can silently enter the system
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'chk_integration_op_status'
+    ) THEN
+        ALTER TABLE integration_operations
+        ADD CONSTRAINT chk_integration_op_status
+        CHECK (status IN ('PENDING', 'IN_PROGRESS', 'SUCCESS', 'FAILED', 'PERMANENTLY_FAILED', 'SUPERSEDED'));
+    END IF;
+END $$;
+
+-- 18. Add lease_expires_at for deterministic IN_PROGRESS recovery
+-- (set when operation is claimed; recovery is safe when NOW() > lease_expires_at)
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='integration_operations' AND column_name='lease_expires_at') THEN
+        ALTER TABLE integration_operations ADD COLUMN lease_expires_at TIMESTAMPTZ;
+    END IF;
+END $$;
+
+-- 19. Index for efficient recovery query
+CREATE INDEX IF NOT EXISTS idx_integration_ops_recovery
+  ON integration_operations(status, last_attempt_at)
+  WHERE status = 'IN_PROGRESS';
+
+-- 20. Index for same-appointment supersession
+CREATE INDEX IF NOT EXISTS idx_integration_ops_appt_status
+  ON integration_operations(appointment_id, status, operation_id);
+
+-- 21. View: permanent failures visible to operators
+CREATE OR REPLACE VIEW v_permanently_failed_operations AS
+SELECT
+    io.operation_id,
+    io.appointment_id,
+    io.operation_type,
+    io.status,
+    io.attempt_count,
+    io.last_attempt_at,
+    io.error_details,
+    io.created_at,
+    a.customer_name,
+    a.phone,
+    a.status AS appt_status,
+    a.calendar_event_id,
+    d.doctor_name
+FROM integration_operations io
+JOIN appointments a ON io.appointment_id = a.appointment_id
+JOIN doctors d ON a.doctor_id = d.doctor_id
+WHERE io.status IN ('PERMANENTLY_FAILED', 'SUPERSEDED')
+ORDER BY io.last_attempt_at DESC;
+
+-- 22. View: stale IN_PROGRESS (potential crash indicators)
+CREATE OR REPLACE VIEW v_stale_in_progress_operations AS
+SELECT
+    io.operation_id,
+    io.appointment_id,
+    io.operation_type,
+    io.status,
+    io.attempt_count,
+    io.last_attempt_at,
+    io.lease_expires_at,
+    io.created_at,
+    a.customer_name,
+    a.status AS appt_status
+FROM integration_operations io
+JOIN appointments a ON io.appointment_id = a.appointment_id
+WHERE io.status = 'IN_PROGRESS'
+  AND io.last_attempt_at < NOW() - INTERVAL '10 minutes'
+ORDER BY io.last_attempt_at;
+
+-- 23. Reminder sent fields renamed semantics comment
+-- reminder_*_sent = TRUE means: WhatsApp API *accepted* the message (not confirmed delivery)
+-- Delivery confirmation requires Meta webhooks (status callbacks)
+COMMENT ON COLUMN appointments.reminder_3d_sent IS 'TRUE = WhatsApp API accepted the 3-day reminder. Not guaranteed patient delivery.';
+COMMENT ON COLUMN appointments.reminder_1d_sent IS 'TRUE = WhatsApp API accepted the 1-day reminder. Not guaranteed patient delivery.';
+COMMENT ON COLUMN appointments.reminder_4h_sent IS 'TRUE = WhatsApp API accepted the 4-hour reminder. Not guaranteed patient delivery.';
+COMMENT ON COLUMN appointments.reminder_1h_sent IS 'TRUE = WhatsApp API accepted the 1-hour reminder. Not guaranteed patient delivery.';

@@ -653,7 +653,7 @@
       ],
       "parameters": {
         "operation": "executeQuery",
-        "query": "\nUPDATE appointments\nSET status = 'CANCELLED',\n    updated_at = NOW(),\n    reminder_3d_sent = TRUE,\n    reminder_1d_sent = TRUE,\n    reminder_4h_sent = TRUE,\n    reminder_1h_sent = TRUE\nWHERE appointment_id = $1\n  AND status IN ('PENDING', 'CONFIRMED', 'RESCHEDULED')\nRETURNING *;\n",
+        "query": "\nUPDATE appointments\nSET status = 'CANCELLED',\n    calendar_event_id = NULL,\n    updated_at = NOW(),\n    reminder_3d_sent = TRUE,\n    reminder_1d_sent = TRUE,\n    reminder_4h_sent = TRUE,\n    reminder_1h_sent = TRUE\nWHERE appointment_id = $1\n  AND status IN ('PENDING', 'CONFIRMED', 'RESCHEDULED')\nRETURNING *;\n",
         "queryParameters": "={{ [$('Postgres_Fetch_Appt_For_Cancel').item.json.appointment_id] }}"
       },
       "credentials": {
