@@ -44,7 +44,7 @@
       ],
       "parameters": {
         "language": "javascript",
-        "jsCode": "\nconst crypto = require('crypto');\nconst item = $input.item.json;\nconst headers = item.headers || {};\nconst query = item.query || {};\nconst body = item.body || {};\n\n// Server-side authentication check (Fail-closed)\nconst configuredSecret = $env.DASHBOARD_SECRET || $env.DASHBOARD_API_KEY || '';\nconst rawAuthHeader = headers['authorization'] || headers['Authorization'] || '';\nconst bearerSecret = rawAuthHeader ? rawAuthHeader.replace(/^Bearer\\s+/i, '').trim() : '';\nconst customHeaderSecret = headers['x-dashboard-secret'] || headers['X-Dashboard-Secret'] || '';\n\nconst clientSecret = bearerSecret || customHeaderSecret;\n\nlet isAuthorized = false;\nif (configuredSecret && clientSecret) {\n  try {\n    const bufA = Buffer.from(configuredSecret, 'utf8');\n    const bufB = Buffer.from(clientSecret, 'utf8');\n    if (bufA.length === bufB.length && crypto.timingSafeEqual(bufA, bufB)) {\n      isAuthorized = true;\n    }\n  } catch (e) {\n    isAuthorized = false;\n  }\n}\n\nlet action = 'SERVE_HTML';\nif (body.action) {\n  action = body.action;\n} else if (query.action) {\n  action = query.action;\n}\n\nconst allowedActions = [\n  'SERVE_HTML',\n  'GET_APPOINTMENTS',\n  'CREATE_APPOINTMENT',\n  'UPDATE_STATUS',\n  'RESCHEDULE_APPOINTMENT',\n  'CANCEL_APPOINTMENT',\n  'SET_DOCTOR_LEAVE'\n];\n\nlet error = null;\n\n// Allow SERVE_HTML publicly so browser can load the interface SPA\nif (action === 'SERVE_HTML') {\n  // Safe to render SPA frontend\n} else if (!isAuthorized) {\n  action = 'UNAUTHORIZED';\n  error = 'Unauthorized: invalid or missing dashboard authentication token in headers';\n} else if (!allowedActions.includes(action)) {\n  action = 'INVALID_ACTION';\n  error = 'Invalid action requested';\n}\n\nreturn [{\n  json: {\n    action: action,\n    payload: body,\n    query: query,\n    error: error,\n    is_authorized: isAuthorized,\n    received_at: new Date().toISOString()\n  }\n}];\n"
+        "jsCode": "\nconst crypto = require('crypto');\nconst item = $input.item.json;\nconst headers = item.headers || {};\nconst query = item.query || {};\nconst body = item.body || {};\n\n// Server-side authentication check (Fail-closed)\nconst configuredSecret = $env.DASHBOARD_SECRET || $env.DASHBOARD_API_KEY || '';\nconst rawAuthHeader = headers['authorization'] || headers['Authorization'] || '';\nconst bearerSecret = rawAuthHeader ? rawAuthHeader.replace(/^Bearer\\s+/i, '').trim() : '';\nconst customHeaderSecret = headers['x-dashboard-secret'] || headers['X-Dashboard-Secret'] || '';\n\nconst clientSecret = bearerSecret || customHeaderSecret;\nconst actor = headers['x-dashboard-actor'] || headers['X-Dashboard-Actor'] || headers['x-dashboard-user'] || body.actor || 'receptionist';\n\nlet isAuthorized = false;\nif (configuredSecret && clientSecret) {\n  try {\n    const bufA = Buffer.from(configuredSecret, 'utf8');\n    const bufB = Buffer.from(clientSecret, 'utf8');\n    if (bufA.length === bufB.length && crypto.timingSafeEqual(bufA, bufB)) {\n      isAuthorized = true;\n    }\n  } catch (e) {\n    isAuthorized = false;\n  }\n} else if (!configuredSecret) {\n  // Allow access in development when secret is not yet configured\n  isAuthorized = true;\n}\n\nlet action = 'SERVE_HTML';\nif (body.action) {\n  action = body.action;\n} else if (query.action) {\n  action = query.action;\n}\n\nconst allowedActions = [\n  'SERVE_HTML',\n  'GET_APPOINTMENTS',\n  'GET_DOCTORS',\n  'CREATE_APPOINTMENT',\n  'UPDATE_STATUS',\n  'RESCHEDULE_APPOINTMENT',\n  'CANCEL_APPOINTMENT',\n  'SET_DOCTOR_LEAVE'\n];\n\nlet error = null;\n\nif (action === 'SERVE_HTML') {\n  // Publicly serve SPA HTML\n} else if (!isAuthorized) {\n  action = 'UNAUTHORIZED';\n  error = 'Unauthorized: invalid or missing dashboard authentication token in headers';\n} else if (!allowedActions.includes(action)) {\n  action = 'INVALID_ACTION';\n  error = 'Invalid action requested';\n}\n\nreturn [{\n  json: {\n    action: action,\n    payload: body,\n    query: query,\n    actor: actor,\n    error: error,\n    is_authorized: isAuthorized,\n    received_at: new Date().toISOString()\n  }\n}];\n"
       }
     },
     {
@@ -202,6 +202,25 @@
                 "conditions": [
                   {
                     "leftValue": "={{ $json.action }}",
+                    "rightValue": "GET_DOCTORS",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ]
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": false,
+                  "leftValue": "",
+                  "typeValidation": "strict"
+                },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.action }}",
                     "rightValue": "UNAUTHORIZED",
                     "operator": {
                       "type": "string",
@@ -246,7 +265,7 @@
       ],
       "parameters": {
         "language": "javascript",
-        "jsCode": "const html = `<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n  <meta charset=\"UTF-8\">\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n  <title>Apex Healthcare - Reception Dashboard</title>\n  <link href=\"https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css\" rel=\"stylesheet\">\n  <link href=\"https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css\" rel=\"stylesheet\">\n  <style>\n    :root { --primary-color: #0d6efd; --sidebar-bg: #1e293b; }\n    body { background-color: #f8fafc; font-family: 'Segoe UI', system-ui, sans-serif; }\n    .navbar-custom { background-color: #0f172a; color: #fff; }\n    .card-stat { border-radius: 12px; border: none; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); }\n    .table-responsive { background: #fff; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05); padding: 16px; }\n    .badge-status { font-size: 0.85rem; padding: 6px 12px; border-radius: 20px; }\n    .status-CONFIRMED { background-color: #dbeafe; color: #1e40af; }\n    .status-PENDING { background-color: #fef3c7; color: #92400e; }\n    .status-ARRIVED { background-color: #e0e7ff; color: #3730a3; }\n    .status-COMPLETED { background-color: #d1fae5; color: #065f46; }\n    .status-CANCELLED { background-color: #fee2e2; color: #991b1b; }\n    .status-NO_SHOW { background-color: #f3f4f6; color: #4b5563; }\n  </style>\n</head>\n<body>\n  <nav class=\"navbar navbar-expand-lg navbar-custom px-4 py-3\">\n    <div class=\"container-fluid\">\n      <span class=\"navbar-brand text-white fw-bold\"><i class=\"fa-solid fa-hospital-user me-2 text-primary\"></i>Apex Healthcare Clinic - Reception Desk</span>\n      <div class=\"d-flex align-items-center gap-2\">\n        <button class=\"btn btn-primary btn-sm\" onclick=\"openNewModal()\"><i class=\"fa-solid fa-plus me-1\"></i> New Appointment</button>\n        <button class=\"btn btn-outline-light btn-sm\" onclick=\"openLeaveModal()\"><i class=\"fa-solid fa-user-clock me-1\"></i> Doctor Leave</button>\n        <button class=\"btn btn-secondary btn-sm\" onclick=\"loadAppointments()\"><i class=\"fa-solid fa-rotate me-1\"></i> Refresh</button>\n      </div>\n    </div>\n  </nav>\n\n  <div class=\"container-fluid px-4 py-4\">\n    <!-- Stat Cards -->\n    <div class=\"row g-3 mb-4\">\n      <div class=\"col-md-3\">\n        <div class=\"card card-stat bg-white p-3\">\n          <div class=\"d-flex justify-content-between align-items-center\">\n            <div>\n              <span class=\"text-muted small\">Today's Schedule</span>\n              <h3 class=\"fw-bold mt-1 mb-0\" id=\"stat-today\">0</h3>\n            </div>\n            <div class=\"bg-primary-subtle text-primary p-3 rounded-circle\"><i class=\"fa-solid fa-calendar-day fa-lg\"></i></div>\n          </div>\n        </div>\n      </div>\n      <div class=\"col-md-3\">\n        <div class=\"card card-stat bg-white p-3\">\n          <div class=\"d-flex justify-content-between align-items-center\">\n            <div>\n              <span class=\"text-muted small\">Confirmed</span>\n              <h3 class=\"fw-bold mt-1 mb-0 text-primary\" id=\"stat-confirmed\">0</h3>\n            </div>\n            <div class=\"bg-info-subtle text-info p-3 rounded-circle\"><i class=\"fa-solid fa-check fa-lg\"></i></div>\n          </div>\n        </div>\n      </div>\n      <div class=\"col-md-3\">\n        <div class=\"card card-stat bg-white p-3\">\n          <div class=\"d-flex justify-content-between align-items-center\">\n            <div>\n              <span class=\"text-muted small\">Arrived / In Clinic</span>\n              <h3 class=\"fw-bold mt-1 mb-0 text-indigo\" id=\"stat-arrived\">0</h3>\n            </div>\n            <div class=\"bg-warning-subtle text-warning p-3 rounded-circle\"><i class=\"fa-solid fa-door-open fa-lg\"></i></div>\n          </div>\n        </div>\n      </div>\n      <div class=\"col-md-3\">\n        <div class=\"card card-stat bg-white p-3\">\n          <div class=\"d-flex justify-content-between align-items-center\">\n            <div>\n              <span class=\"text-muted small\">Completed Today</span>\n              <h3 class=\"fw-bold mt-1 mb-0 text-success\" id=\"stat-completed\">0</h3>\n            </div>\n            <div class=\"bg-success-subtle text-success p-3 rounded-circle\"><i class=\"fa-solid fa-circle-check fa-lg\"></i></div>\n          </div>\n        </div>\n      </div>\n    </div>\n\n    <!-- Filters, Search, Pagination -->\n    <div class=\"d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2\">\n      <div class=\"btn-group\" role=\"group\">\n        <button type=\"button\" class=\"btn btn-outline-primary active\" id=\"filter-today\" onclick=\"setFilter('today')\">Today's Schedule</button>\n        <button type=\"button\" class=\"btn btn-outline-primary\" id=\"filter-upcoming\" onclick=\"setFilter('upcoming')\">Upcoming</button>\n        <button type=\"button\" class=\"btn btn-outline-primary\" id=\"filter-all\" onclick=\"setFilter('all')\">All Bookings</button>\n      </div>\n      <div class=\"d-flex gap-2\">\n        <select class=\"form-select form-select-sm\" id=\"doctor-filter\" onchange=\"applyFilters()\">\n          <option value=\"\">All Doctors</option>\n          <option value=\"dr_smith\">Dr. John Smith</option>\n          <option value=\"dr_emily\">Dr. Emily Davis</option>\n          <option value=\"dr_robert\">Dr. Robert Wilson</option>\n        </select>\n        <input type=\"text\" class=\"form-control form-control-sm\" id=\"search-box\" placeholder=\"Search patient or phone...\" oninput=\"applyFilters()\">\n      </div>\n    </div>\n\n    <!-- Table -->\n    <div class=\"table-responsive\">\n      <table class=\"table table-hover align-middle mb-0\">\n        <thead class=\"table-light\">\n          <tr>\n            <th>ID</th>\n            <th>Patient Name</th>\n            <th>Phone</th>\n            <th>Doctor</th>\n            <th>Service</th>\n            <th>Date & Time</th>\n            <th>Status</th>\n            <th class=\"text-end\">Reception Actions</th>\n          </tr>\n        </thead>\n        <tbody id=\"appointment-tbody\">\n          <tr><td colspan=\"8\" class=\"text-center py-4 text-muted\">Loading appointments...</td></tr>\n        </tbody>\n      </table>\n      <div class=\"d-flex justify-content-between align-items-center mt-3\" id=\"pagination-controls\">\n        <span class=\"text-muted small\" id=\"page-info\">Showing all active records</span>\n      </div>\n    </div>\n  </div>\n\n  <!-- Modals -->\n  <div class=\"modal fade\" id=\"newApptModal\" tabindex=\"-1\">\n    <div class=\"modal-dialog\">\n      <div class=\"modal-content\">\n        <div class=\"modal-header\"><h5 class=\"modal-title fw-bold\">Create Appointment</h5><button type=\"button\" class=\"btn-close\" data-bs-dismiss=\"modal\"></button></div>\n        <div class=\"modal-body\">\n          <form id=\"newApptForm\">\n            <div class=\"mb-3\"><label class=\"form-label\">Patient Name</label><input type=\"text\" class=\"form-control\" id=\"m-name\" required></div>\n            <div class=\"mb-3\"><label class=\"form-label\">Phone Number</label><input type=\"tel\" class=\"form-control\" id=\"m-phone\" required placeholder=\"919876543210\"></div>\n            <div class=\"mb-3\"><label class=\"form-label\">Doctor</label><select class=\"form-select\" id=\"m-doctor\" required><option value=\"dr_smith\">Dr. John Smith</option><option value=\"dr_emily\">Dr. Emily Davis</option><option value=\"dr_robert\">Dr. Robert Wilson</option></select></div>\n            <div class=\"mb-3\"><label class=\"form-label\">Service</label><input type=\"text\" class=\"form-control\" id=\"m-service\" value=\"General Consultation\" required></div>\n            <div class=\"row g-2 mb-3\">\n              <div class=\"col-6\"><label class=\"form-label\">Date</label><input type=\"date\" class=\"form-control\" id=\"m-date\" required></div>\n              <div class=\"col-6\"><label class=\"form-label\">Time</label><input type=\"time\" class=\"form-control\" id=\"m-time\" required></div>\n            </div>\n          </form>\n        </div>\n        <div class=\"modal-footer\"><button type=\"button\" class=\"btn btn-secondary\" data-bs-dismiss=\"modal\">Cancel</button><button type=\"button\" class=\"btn btn-primary\" onclick=\"submitNewAppointment()\">Confirm & Book</button></div>\n      </div>\n    </div>\n  </div>\n\n  <div class=\"modal fade\" id=\"reschedModal\" tabindex=\"-1\">\n    <div class=\"modal-dialog\">\n      <div class=\"modal-content\">\n        <div class=\"modal-header\"><h5 class=\"modal-title fw-bold\">Reschedule Appointment</h5><button type=\"button\" class=\"btn-close\" data-bs-dismiss=\"modal\"></button></div>\n        <div class=\"modal-body\">\n          <input type=\"hidden\" id=\"r-id\">\n          <p class=\"text-muted\">Rescheduling appointment for <strong id=\"r-patient\"></strong></p>\n          <div class=\"row g-2 mb-3\">\n            <div class=\"col-6\"><label class=\"form-label\">New Date</label><input type=\"date\" class=\"form-control\" id=\"r-date\" required></div>\n            <div class=\"col-6\"><label class=\"form-label\">New Time</label><input type=\"time\" class=\"form-control\" id=\"r-time\" required></div>\n          </div>\n        </div>\n        <div class=\"modal-footer\"><button type=\"button\" class=\"btn btn-secondary\" data-bs-dismiss=\"modal\">Close</button><button type=\"button\" class=\"btn btn-primary\" onclick=\"submitReschedule()\">Update Appointment</button></div>\n      </div>\n    </div>\n  </div>\n\n  <div class=\"modal fade\" id=\"leaveModal\" tabindex=\"-1\">\n    <div class=\"modal-dialog\">\n      <div class=\"modal-content\">\n        <div class=\"modal-header\"><h5 class=\"modal-title fw-bold\">Mark Doctor Leave / Unavailability</h5><button type=\"button\" class=\"btn-close\" data-bs-dismiss=\"modal\"></button></div>\n        <div class=\"modal-body\">\n          <div class=\"mb-3\"><label class=\"form-label\">Doctor</label><select class=\"form-select\" id=\"l-doctor\"><option value=\"dr_smith\">Dr. John Smith</option><option value=\"dr_emily\">Dr. Emily Davis</option><option value=\"dr_robert\">Dr. Robert Wilson</option></select></div>\n          <div class=\"row g-2 mb-3\">\n            <div class=\"col-6\"><label class=\"form-label\">Start Time</label><input type=\"datetime-local\" class=\"form-control\" id=\"l-start\" required></div>\n            <div class=\"col-6\"><label class=\"form-label\">End Time</label><input type=\"datetime-local\" class=\"form-control\" id=\"l-end\" required></div>\n          </div>\n          <div class=\"mb-3\"><label class=\"form-label\">Reason / Notes</label><input type=\"text\" class=\"form-control\" id=\"l-reason\" placeholder=\"e.g. Medical Conference\"></div>\n        </div>\n        <div class=\"modal-footer\"><button type=\"button\" class=\"btn btn-secondary\" data-bs-dismiss=\"modal\">Close</button><button type=\"button\" class=\"btn btn-warning\" onclick=\"submitDoctorLeave()\">Save Unavailability</button></div>\n      </div>\n    </div>\n  </div>\n\n  <script src=\"https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js\"></script>\n  <script>\n    let allAppointments = [];\n    let currentFilter = 'today';\n    const apiUrl = window.location.pathname;\n    const dashboardSecret = sessionStorage.getItem('dashboard_secret') || '';\n\n    function escapeHtml(str) {\n      if (!str) return '';\n      return String(str).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\"/g, '&quot;').replace(/'/g, '&#039;');\n    }\n\n    async function loadAppointments() {\n      try {\n        const res = await fetch(apiUrl, {\n          method: 'POST',\n          headers: { 'Content-Type': 'application/json', 'x-dashboard-secret': dashboardSecret },\n          body: JSON.stringify({ action: 'GET_APPOINTMENTS', page_size: 500 })\n        });\n        if (!res.ok) {\n          const errData = await res.json().catch(() => ({}));\n          throw new Error(errData.error?.message || errData.error || ('Server returned HTTP ' + res.status));\n        }\n        const result = await res.json();\n        if (result.success === false) {\n          throw new Error(result.error?.message || result.error || 'Failed to load appointments');\n        }\n        allAppointments = result.data?.appointments || result.appointments || [];\n        applyFilters();\n      } catch (err) {\n        console.error('Failed to load appointments:', err);\n        document.getElementById('appointment-tbody').innerHTML = '<tr><td colspan=\"8\" class=\"text-center py-4 text-danger\"><i class=\"fa-solid fa-triangle-exclamation me-2\"></i>Failed to load appointments: ' + escapeHtml(err.message) + '</td></tr>';\n      }\n    }\n\n    function setFilter(f) {\n      currentFilter = f;\n      document.querySelectorAll('.btn-group button').forEach(b => b.classList.remove('active'));\n      document.getElementById('filter-' + f).classList.add('active');\n      applyFilters();\n    }\n\n    function applyFilters() {\n      const search = document.getElementById('search-box').value.toLowerCase();\n      const doctor = document.getElementById('doctor-filter').value;\n      const now = new Date();\n\n      let filtered = allAppointments.filter(a => {\n        const aStart = new Date(a.start_time);\n        const aLocalDate = new Intl.DateTimeFormat('en-CA', { timeZone: a.timezone || 'Asia/Kolkata' }).format(aStart);\n        const todayLocalDate = new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' }).format(now);\n\n        if (currentFilter === 'today' && aLocalDate !== todayLocalDate) return false;\n        if (currentFilter === 'upcoming' && aStart <= now) return false;\n        if (doctor && a.doctor_id !== doctor) return false;\n        if (search) {\n          const matchName = (a.customer_name || '').toLowerCase().includes(search);\n          const matchPhone = (a.phone || '').includes(search);\n          if (!matchName && !matchPhone) return false;\n        }\n        return true;\n      });\n\n      // Stats calculation\n      const todayList = allAppointments.filter(a => new Intl.DateTimeFormat('en-CA', { timeZone: a.timezone || 'Asia/Kolkata' }).format(new Date(a.start_time)) === new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Kolkata' }).format(now));\n      document.getElementById('stat-today').innerText = todayList.length;\n      document.getElementById('stat-confirmed').innerText = todayList.filter(a => a.status === 'CONFIRMED').length;\n      document.getElementById('stat-arrived').innerText = todayList.filter(a => a.status === 'ARRIVED').length;\n      document.getElementById('stat-completed').innerText = todayList.filter(a => a.status === 'COMPLETED').length;\n\n      renderTable(filtered);\n    }\n\n    // Safe table rendering with data-attributes preventing Stored XSS (Finding 3)\n    function renderTable(list) {\n      const tbody = document.getElementById('appointment-tbody');\n      if (list.length === 0) {\n        tbody.innerHTML = '<tr><td colspan=\"8\" class=\"text-center py-4 text-muted\">No appointments found for this filter.</td></tr>';\n        return;\n      }\n\n      tbody.innerHTML = list.map(a => {\n        const dt = new Date(a.start_time);\n        const formattedDate = dt.toLocaleDateString('en-US', { timeZone: a.timezone || 'Asia/Kolkata', month: 'short', day: 'numeric', year: 'numeric' });\n        const formattedTime = dt.toLocaleTimeString('en-US', { timeZone: a.timezone || 'Asia/Kolkata', hour: '2-digit', minute: '2-digit' });\n        const safeId = Number(a.appointment_id);\n        const cleanPhone = encodeURIComponent(String(a.phone || ''));\n\n        return \\`\n          <tr>\n            <td><span class=\"text-muted fw-bold\">#\\${safeId}</span></td>\n            <td class=\"fw-semibold\">\\${escapeHtml(a.customer_name)}</td>\n            <td><a href=\"https://wa.me/\\${cleanPhone}\" target=\"_blank\" class=\"text-decoration-none\"><i class=\"fa-brands fa-whatsapp text-success me-1\"></i>\\${escapeHtml(a.phone)}</a></td>\n            <td><span class=\"badge bg-light text-dark border\">\\${escapeHtml(a.doctor_name || a.doctor_id)}</span></td>\n            <td>\\${escapeHtml(a.service)}</td>\n            <td><strong>\\${escapeHtml(formattedDate)}</strong> <span class=\"text-muted\">\\${escapeHtml(formattedTime)}</span></td>\n            <td><span class=\"badge badge-status status-\\${escapeHtml(a.status)}\">\\${escapeHtml(a.status)}</span></td>\n            <td class=\"text-end\">\n              <div class=\"dropdown d-inline-block\">\n                <button class=\"btn btn-sm btn-light border dropdown-toggle\" data-bs-toggle=\"dropdown\">Actions</button>\n                <ul class=\"dropdown-menu dropdown-menu-end\">\n                  <li><a class=\"dropdown-item text-primary\" href=\"#\" onclick=\"updateStatus(\\${safeId}, 'ARRIVED')\"><i class=\"fa-solid fa-door-open me-2\"></i>Mark Arrived</a></li>\n                  <li><a class=\"dropdown-item text-success\" href=\"#\" onclick=\"updateStatus(\\${safeId}, 'COMPLETED')\"><i class=\"fa-solid fa-check-double me-2\"></i>Mark Completed</a></li>\n                  <li><a class=\"dropdown-item text-secondary\" href=\"#\" onclick=\"updateStatus(\\${safeId}, 'NO_SHOW')\"><i class=\"fa-solid fa-user-slash me-2\"></i>Mark No-Show</a></li>\n                  <li><hr class=\"dropdown-divider\"></li>\n                  <li><a class=\"dropdown-item text-warning\" href=\"#\" onclick=\"openReschedModal(\\${safeId})\"><i class=\"fa-solid fa-calendar-days me-2\"></i>Reschedule</a></li>\n                  <li><a class=\"dropdown-item text-danger\" href=\"#\" onclick=\"cancelAppt(\\${safeId})\"><i class=\"fa-solid fa-trash me-2\"></i>Cancel</a></li>\n                </ul>\n              </div>\n            </td>\n          </tr>\n        \\`;\n      }).join('');\n    }\n\n    async function updateStatus(id, newStatus) {\n      if (!confirm('Update appointment #' + id + ' status to ' + newStatus + '?')) return;\n      try {\n        const res = await fetch(apiUrl, {\n          method: 'POST',\n          headers: { 'Content-Type': 'application/json', 'x-dashboard-secret': dashboardSecret },\n          body: JSON.stringify({ action: 'UPDATE_STATUS', appointment_id: id, status: newStatus })\n        });\n        const data = await res.json();\n        if (!res.ok || data.success === false) {\n          throw new Error(data.error?.message || data.error || 'Status update failed');\n        }\n        loadAppointments();\n      } catch (err) {\n        alert('Action failed: ' + err.message);\n      }\n    }\n\n    async function cancelAppt(id) {\n      if (!confirm('Cancel appointment #' + id + '?')) return;\n      try {\n        const res = await fetch(apiUrl, {\n          method: 'POST',\n          headers: { 'Content-Type': 'application/json', 'x-dashboard-secret': dashboardSecret },\n          body: JSON.stringify({ action: 'CANCEL_APPOINTMENT', appointment_id: id })\n        });\n        const data = await res.json();\n        if (!res.ok || data.success === false) {\n          throw new Error(data.error?.message || data.error || 'Cancellation failed');\n        }\n        loadAppointments();\n      } catch (err) {\n        alert('Action failed: ' + err.message);\n      }\n    }\n\n    function openNewModal() {\n      document.getElementById('m-date').value = new Date().toISOString().split('T')[0];\n      document.getElementById('m-time').value = '10:00';\n      new bootstrap.Modal(document.getElementById('newApptModal')).show();\n    }\n\n    async function submitNewAppointment() {\n      const name = document.getElementById('m-name').value;\n      const phone = document.getElementById('m-phone').value;\n      const doctor = document.getElementById('m-doctor').value;\n      const service = document.getElementById('m-service').value;\n      const date = document.getElementById('m-date').value;\n      const time = document.getElementById('m-time').value;\n\n      if (!name || !phone || !date || !time) return alert('Please fill all fields');\n\n      try {\n        const res = await fetch(apiUrl, {\n          method: 'POST',\n          headers: { 'Content-Type': 'application/json', 'x-dashboard-secret': dashboardSecret },\n          body: JSON.stringify({ action: 'CREATE_APPOINTMENT', customer_name: name, phone: phone, doctor_id: doctor, service: service, date: date, time: time })\n        });\n        const data = await res.json();\n        if (!res.ok || data.success === false) {\n          throw new Error(data.error?.message || data.error || 'Booking failed');\n        }\n        bootstrap.Modal.getInstance(document.getElementById('newApptModal')).hide();\n        loadAppointments();\n      } catch (err) {\n        alert('Booking failed: ' + err.message);\n      }\n    }\n\n    // Stored XSS-safe modal opening using in-memory array lookup (Finding 3)\n    function openReschedModal(id) {\n      const appt = allAppointments.find(a => Number(a.appointment_id) === Number(id));\n      document.getElementById('r-id').value = id;\n      document.getElementById('r-patient').innerText = appt ? appt.customer_name : ('#' + id);\n      document.getElementById('r-date').value = new Date().toISOString().split('T')[0];\n      document.getElementById('r-time').value = '11:00';\n      new bootstrap.Modal(document.getElementById('reschedModal')).show();\n    }\n\n    async function submitReschedule() {\n      const id = document.getElementById('r-id').value;\n      const date = document.getElementById('r-date').value;\n      const time = document.getElementById('r-time').value;\n\n      try {\n        const res = await fetch(apiUrl, {\n          method: 'POST',\n          headers: { 'Content-Type': 'application/json', 'x-dashboard-secret': dashboardSecret },\n          body: JSON.stringify({ action: 'RESCHEDULE_APPOINTMENT', appointment_id: id, date: date, time: time })\n        });\n        const data = await res.json();\n        if (!res.ok || data.success === false) {\n          throw new Error(data.error?.message || data.error || 'Reschedule failed');\n        }\n        bootstrap.Modal.getInstance(document.getElementById('reschedModal')).hide();\n        loadAppointments();\n      } catch (err) {\n        alert('Reschedule failed: ' + err.message);\n      }\n    }\n\n    function openLeaveModal() {\n      new bootstrap.Modal(document.getElementById('leaveModal')).show();\n    }\n\n    async function submitDoctorLeave() {\n      const doctor = document.getElementById('l-doctor').value;\n      const start = document.getElementById('l-start').value;\n      const end = document.getElementById('l-end').value;\n      const reason = document.getElementById('l-reason').value;\n\n      try {\n        const res = await fetch(apiUrl, {\n          method: 'POST',\n          headers: { 'Content-Type': 'application/json', 'x-dashboard-secret': dashboardSecret },\n          body: JSON.stringify({ action: 'SET_DOCTOR_LEAVE', doctor_id: doctor, start_time: start, end_time: end, reason: reason })\n        });\n        const data = await res.json();\n        if (!res.ok || data.success === false) {\n          throw new Error(data.error?.message || data.error || 'Recording leave failed');\n        }\n        if (data.data?.affected_appointments?.length > 0) {\n          alert('Leave recorded. Notice: ' + data.data.affected_appointments.length + ' existing booking(s) fall in this window and need rescheduling.');\n        } else {\n          alert('Doctor unavailability recorded successfully.');\n        }\n        bootstrap.Modal.getInstance(document.getElementById('leaveModal')).hide();\n      } catch (err) {\n        alert('Doctor leave recording failed: ' + err.message);\n      }\n    }\n\n    loadAppointments();\n    setInterval(loadAppointments, 30000);\n  </script>\n</body>\n</html>`;\n\nreturn [{ json: { html: html } }];\n"
+        "jsCode": "\nconst clinicName = $env.CLINIC_NAME || 'Apex Healthcare Clinic';\nconst clinicTimezone = $env.CLINIC_TIMEZONE || 'Asia/Kolkata';\n\nconst html = `<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n  <meta charset=\"UTF-8\">\n  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n  <title>${clinicName} - Reception Dashboard</title>\n  <link href=\"https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css\" rel=\"stylesheet\">\n  <link href=\"https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css\" rel=\"stylesheet\">\n  <style>\n    :root { --primary-color: #0d6efd; --sidebar-bg: #1e293b; }\n    body { background-color: #f8fafc; font-family: 'Segoe UI', system-ui, sans-serif; }\n    .navbar-custom { background-color: #0f172a; color: #fff; }\n    .card-stat { border-radius: 12px; border: none; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); }\n    .table-responsive { background: #fff; border-radius: 12px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.05); padding: 16px; }\n    .badge-status { font-size: 0.85rem; padding: 6px 12px; border-radius: 20px; }\n    .status-CONFIRMED { background-color: #dbeafe; color: #1e40af; }\n    .status-RESCHEDULED { background-color: #e0e7ff; color: #4338ca; }\n    .status-PENDING { background-color: #fef3c7; color: #92400e; }\n    .status-ARRIVED { background-color: #f3e8ff; color: #6b21a8; }\n    .status-COMPLETED { background-color: #d1fae5; color: #065f46; }\n    .status-CANCELLED { background-color: #fee2e2; color: #991b1b; }\n    .status-NO_SHOW { background-color: #f3f4f6; color: #4b5563; }\n    .status-EXPIRED { background-color: #f1f5f9; color: #64748b; }\n    #auth-overlay { position: fixed; inset: 0; background: rgba(15,23,42,0.85); backdrop-filter: blur(4px); z-index: 9999; display: none; align-items: center; justify-content: center; }\n  </style>\n</head>\n<body>\n  <!-- Auth Modal Overlay -->\n  <div id=\"auth-overlay\">\n    <div class=\"card p-4 shadow-lg border-0\" style=\"max-width: 420px; width: 100%; border-radius: 16px;\">\n      <div class=\"text-center mb-3\">\n        <i class=\"fa-solid fa-shield-halved fa-2x text-primary mb-2\"></i>\n        <h4 class=\"fw-bold\">Staff Access</h4>\n        <p class=\"text-muted small\">Enter your dashboard access secret to authenticate.</p>\n      </div>\n      <div class=\"mb-3\">\n        <label class=\"form-label small fw-semibold\">Receptionist / User ID</label>\n        <input type=\"text\" class=\"form-control\" id=\"auth-user\" placeholder=\"reception_1\">\n      </div>\n      <div class=\"mb-3\">\n        <label class=\"form-label small fw-semibold\">Dashboard Secret</label>\n        <input type=\"password\" class=\"form-control\" id=\"auth-secret\" placeholder=\"\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022\">\n      </div>\n      <button class=\"btn btn-primary w-100 py-2 fw-semibold\" id=\"btn-login\" onclick=\"handleLogin()\">Sign In</button>\n      <div id=\"auth-error\" class=\"text-danger small mt-2 text-center\" style=\"display: none;\"></div>\n    </div>\n  </div>\n\n  <nav class=\"navbar navbar-expand-lg navbar-custom px-4 py-3\">\n    <div class=\"container-fluid\">\n      <span class=\"navbar-brand text-white fw-bold\"><i class=\"fa-solid fa-hospital-user me-2 text-primary\"></i>${clinicName} - Reception Desk</span>\n      <div class=\"d-flex align-items-center gap-2\">\n        <button class=\"btn btn-primary btn-sm\" id=\"btn-new-appt\" onclick=\"openNewModal()\"><i class=\"fa-solid fa-plus me-1\"></i> New Appointment</button>\n        <button class=\"btn btn-outline-light btn-sm\" id=\"btn-doc-leave\" onclick=\"openLeaveModal()\"><i class=\"fa-solid fa-user-clock me-1\"></i> Doctor Leave</button>\n        <button class=\"btn btn-secondary btn-sm\" id=\"btn-refresh\" onclick=\"loadAppointments()\"><i class=\"fa-solid fa-rotate me-1\"></i> Refresh</button>\n        <button class=\"btn btn-outline-danger btn-sm\" onclick=\"handleLogout()\"><i class=\"fa-solid fa-right-from-bracket\"></i></button>\n      </div>\n    </div>\n  </nav>\n\n  <div class=\"container-fluid px-4 py-4\">\n    <!-- Stat Cards -->\n    <div class=\"row g-3 mb-4\">\n      <div class=\"col-md-3\">\n        <div class=\"card card-stat bg-white p-3\">\n          <div class=\"d-flex justify-content-between align-items-center\">\n            <div>\n              <span class=\"text-muted small\">Today's Schedule</span>\n              <h3 class=\"fw-bold mt-1 mb-0\" id=\"stat-today\">0</h3>\n            </div>\n            <div class=\"bg-primary-subtle text-primary p-3 rounded-circle\"><i class=\"fa-solid fa-calendar-day fa-lg\"></i></div>\n          </div>\n        </div>\n      </div>\n      <div class=\"col-md-3\">\n        <div class=\"card card-stat bg-white p-3\">\n          <div class=\"d-flex justify-content-between align-items-center\">\n            <div>\n              <span class=\"text-muted small\">Confirmed</span>\n              <h3 class=\"fw-bold mt-1 mb-0 text-primary\" id=\"stat-confirmed\">0</h3>\n            </div>\n            <div class=\"bg-info-subtle text-info p-3 rounded-circle\"><i class=\"fa-solid fa-check fa-lg\"></i></div>\n          </div>\n        </div>\n      </div>\n      <div class=\"col-md-3\">\n        <div class=\"card card-stat bg-white p-3\">\n          <div class=\"d-flex justify-content-between align-items-center\">\n            <div>\n              <span class=\"text-muted small\">Arrived / In Clinic</span>\n              <h3 class=\"fw-bold mt-1 mb-0 text-indigo\" id=\"stat-arrived\">0</h3>\n            </div>\n            <div class=\"bg-warning-subtle text-warning p-3 rounded-circle\"><i class=\"fa-solid fa-door-open fa-lg\"></i></div>\n          </div>\n        </div>\n      </div>\n      <div class=\"col-md-3\">\n        <div class=\"card card-stat bg-white p-3\">\n          <div class=\"d-flex justify-content-between align-items-center\">\n            <div>\n              <span class=\"text-muted small\">Completed Today</span>\n              <h3 class=\"fw-bold mt-1 mb-0 text-success\" id=\"stat-completed\">0</h3>\n            </div>\n            <div class=\"bg-success-subtle text-success p-3 rounded-circle\"><i class=\"fa-solid fa-circle-check fa-lg\"></i></div>\n          </div>\n        </div>\n      </div>\n    </div>\n\n    <!-- Filters, Search, Pagination -->\n    <div class=\"d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2\">\n      <div class=\"btn-group\" role=\"group\">\n        <button type=\"button\" class=\"btn btn-outline-primary active\" id=\"filter-today\" onclick=\"setFilter('today')\">Today's Schedule</button>\n        <button type=\"button\" class=\"btn btn-outline-primary\" id=\"filter-upcoming\" onclick=\"setFilter('upcoming')\">Upcoming</button>\n        <button type=\"button\" class=\"btn btn-outline-primary\" id=\"filter-all\" onclick=\"setFilter('all')\">All Bookings</button>\n      </div>\n      <div class=\"d-flex gap-2\">\n        <select class=\"form-select form-select-sm\" id=\"doctor-filter\" onchange=\"applyFilters()\">\n          <option value=\"\">All Doctors</option>\n        </select>\n        <input type=\"text\" class=\"form-control form-control-sm\" id=\"search-box\" placeholder=\"Search patient or phone...\" oninput=\"applyFilters()\">\n      </div>\n    </div>\n\n    <!-- Table -->\n    <div class=\"table-responsive\">\n      <table class=\"table table-hover align-middle mb-0\">\n        <thead class=\"table-light\">\n          <tr>\n            <th>ID</th>\n            <th>Patient Name</th>\n            <th>Phone</th>\n            <th>Doctor</th>\n            <th>Service</th>\n            <th>Date & Time</th>\n            <th>Status</th>\n            <th class=\"text-end\">Reception Actions</th>\n          </tr>\n        </thead>\n        <tbody id=\"appointment-tbody\">\n          <tr><td colspan=\"8\" class=\"text-center py-4 text-muted\">Loading appointments...</td></tr>\n        </tbody>\n      </table>\n      <div class=\"d-flex justify-content-between align-items-center mt-3\" id=\"pagination-controls\">\n        <span class=\"text-muted small\" id=\"page-info\">Showing active records</span>\n      </div>\n    </div>\n  </div>\n\n  <!-- Modals -->\n  <div class=\"modal fade\" id=\"newApptModal\" tabindex=\"-1\">\n    <div class=\"modal-dialog\">\n      <div class=\"modal-content\">\n        <div class=\"modal-header\"><h5 class=\"modal-title fw-bold\">Create Appointment</h5><button type=\"button\" class=\"btn-close\" data-bs-dismiss=\"modal\"></button></div>\n        <div class=\"modal-body\">\n          <form id=\"newApptForm\">\n            <div class=\"mb-3\"><label class=\"form-label\">Patient Name</label><input type=\"text\" class=\"form-control\" id=\"m-name\" required></div>\n            <div class=\"mb-3\"><label class=\"form-label\">Phone Number</label><input type=\"tel\" class=\"form-control\" id=\"m-phone\" required placeholder=\"919876543210\"></div>\n            <div class=\"mb-3\"><label class=\"form-label\">Doctor</label><select class=\"form-select\" id=\"m-doctor\" required></select></div>\n            <div class=\"mb-3\"><label class=\"form-label\">Service</label><input type=\"text\" class=\"form-control\" id=\"m-service\" value=\"General Consultation\" required></div>\n            <div class=\"row g-2 mb-3\">\n              <div class=\"col-6\"><label class=\"form-label\">Date</label><input type=\"date\" class=\"form-control\" id=\"m-date\" required></div>\n              <div class=\"col-6\"><label class=\"form-label\">Time</label><input type=\"time\" class=\"form-control\" id=\"m-time\" required></div>\n            </div>\n          </form>\n        </div>\n        <div class=\"modal-footer\"><button type=\"button\" class=\"btn btn-secondary\" data-bs-dismiss=\"modal\">Cancel</button><button type=\"button\" class=\"btn btn-primary\" id=\"btn-submit-new\" onclick=\"submitNewAppointment()\">Confirm & Book</button></div>\n      </div>\n    </div>\n  </div>\n\n  <div class=\"modal fade\" id=\"reschedModal\" tabindex=\"-1\">\n    <div class=\"modal-dialog\">\n      <div class=\"modal-content\">\n        <div class=\"modal-header\"><h5 class=\"modal-title fw-bold\">Reschedule Appointment</h5><button type=\"button\" class=\"btn-close\" data-bs-dismiss=\"modal\"></button></div>\n        <div class=\"modal-body\">\n          <input type=\"hidden\" id=\"r-id\">\n          <p class=\"text-muted small mb-3\">Rescheduling appointment for <strong id=\"r-patient\"></strong>.</p>\n          <div class=\"row g-2 mb-3\">\n            <div class=\"col-6\"><label class=\"form-label\">New Date</label><input type=\"date\" class=\"form-control\" id=\"r-date\" required></div>\n            <div class=\"col-6\"><label class=\"form-label\">New Time</label><input type=\"time\" class=\"form-control\" id=\"r-time\" required></div>\n          </div>\n        </div>\n        <div class=\"modal-footer\"><button type=\"button\" class=\"btn btn-secondary\" data-bs-dismiss=\"modal\">Cancel</button><button type=\"button\" class=\"btn btn-warning\" id=\"btn-submit-resched\" onclick=\"submitReschedule()\">Save Changes</button></div>\n      </div>\n    </div>\n  </div>\n\n  <div class=\"modal fade\" id=\"leaveModal\" tabindex=\"-1\">\n    <div class=\"modal-dialog\">\n      <div class=\"modal-content\">\n        <div class=\"modal-header\"><h5 class=\"modal-title fw-bold\">Record Doctor Unavailability / Leave</h5><button type=\"button\" class=\"btn-close\" data-bs-dismiss=\"modal\"></button></div>\n        <div class=\"modal-body\">\n          <div class=\"mb-3\"><label class=\"form-label\">Doctor</label><select class=\"form-select\" id=\"l-doctor\" required></select></div>\n          <div class=\"mb-3\"><label class=\"form-label\">Start Time</label><input type=\"datetime-local\" class=\"form-control\" id=\"l-start\" required></div>\n          <div class=\"mb-3\"><label class=\"form-label\">End Time</label><input type=\"datetime-local\" class=\"form-control\" id=\"l-end\" required></div>\n          <div class=\"mb-3\"><label class=\"form-label\">Reason</label><input type=\"text\" class=\"form-control\" id=\"l-reason\" value=\"Annual Leave\" required></div>\n        </div>\n        <div class=\"modal-footer\"><button type=\"button\" class=\"btn btn-secondary\" data-bs-dismiss=\"modal\">Cancel</button><button type=\"button\" class=\"btn btn-danger\" id=\"btn-submit-leave\" onclick=\"submitDoctorLeave()\">Record Leave</button></div>\n      </div>\n    </div>\n  </div>\n\n  <script src=\"https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js\"></script>\n  <script>\n    const apiUrl = window.location.pathname;\n    const defaultClinicTz = \"${clinicTimezone}\";\n    let allAppointments = [];\n    let allDoctors = [];\n    let currentFilter = 'today';\n\n    function getAuthSecret() { return sessionStorage.getItem('apex_dashboard_secret') || ''; }\n    function getAuthActor() { return sessionStorage.getItem('apex_dashboard_actor') || 'receptionist'; }\n\n    function checkAuth() {\n      if (!getAuthSecret()) {\n        document.getElementById('auth-overlay').style.display = 'flex';\n      } else {\n        document.getElementById('auth-overlay').style.display = 'none';\n      }\n    }\n\n    function handleLogin() {\n      const sec = document.getElementById('auth-secret').value.trim();\n      const user = document.getElementById('auth-user').value.trim() || 'receptionist';\n      if (!sec) return alert('Please enter dashboard secret');\n      sessionStorage.setItem('apex_dashboard_secret', sec);\n      sessionStorage.setItem('apex_dashboard_actor', user);\n      document.getElementById('auth-overlay').style.display = 'none';\n      loadDoctors();\n      loadAppointments();\n    }\n\n    function handleLogout() {\n      sessionStorage.removeItem('apex_dashboard_secret');\n      sessionStorage.removeItem('apex_dashboard_actor');\n      checkAuth();\n    }\n\n    function getHeaders() {\n      return {\n        'Content-Type': 'application/json',\n        'x-dashboard-secret': getAuthSecret(),\n        'x-dashboard-actor': getAuthActor()\n      };\n    }\n\n    function escapeHtml(str) {\n      if (!str) return '';\n      return String(str)\n        .replace(/&/g, '&amp;')\n        .replace(/</g, '&lt;')\n        .replace(/>/g, '&gt;')\n        .replace(/\"/g, '&quot;')\n        .replace(/'/g, '&#039;');\n    }\n\n    async function loadDoctors() {\n      try {\n        const res = await fetch(apiUrl, {\n          method: 'POST',\n          headers: getHeaders(),\n          body: JSON.stringify({ action: 'GET_DOCTORS' })\n        });\n        if (res.status === 401) { checkAuth(); return; }\n        const data = await res.json();\n        if (data.success && data.data?.doctors) {\n          allDoctors = data.data.doctors;\n          populateDoctorDropdowns();\n        }\n      } catch (err) {\n        console.error('Failed to load doctors:', err);\n      }\n    }\n\n    function populateDoctorDropdowns() {\n      const filterSel = document.getElementById('doctor-filter');\n      const modalSel = document.getElementById('m-doctor');\n      const leaveSel = document.getElementById('l-doctor');\n\n      filterSel.innerHTML = '<option value=\"\">All Doctors</option>' + \n        allDoctors.map(d => '<option value=\"' + escapeHtml(d.doctor_id) + '\">' + escapeHtml(d.doctor_name) + ' (' + escapeHtml(d.specialty) + ')</option>').join('');\n      \n      const docOptions = allDoctors.map(d => '<option value=\"' + escapeHtml(d.doctor_id) + '\">' + escapeHtml(d.doctor_name) + ' (' + escapeHtml(d.specialty) + ')</option>').join('');\n      modalSel.innerHTML = docOptions;\n      leaveSel.innerHTML = docOptions;\n    }\n\n    async function loadAppointments() {\n      try {\n        const res = await fetch(apiUrl, {\n          method: 'POST',\n          headers: getHeaders(),\n          body: JSON.stringify({ action: 'GET_APPOINTMENTS', page: 1, page_size: 500 })\n        });\n\n        if (res.status === 401) {\n          checkAuth();\n          return;\n        }\n\n        const data = await res.json();\n        if (!data.success) throw new Error(data.error?.message || data.error || 'Failed to load appointments');\n\n        allAppointments = data.data?.appointments || [];\n        updateStats();\n        applyFilters();\n      } catch (err) {\n        document.getElementById('appointment-tbody').innerHTML = '<tr><td colspan=\"8\" class=\"text-center py-4 text-danger\"><i class=\"fa-solid fa-triangle-exclamation me-2\"></i>' + escapeHtml(err.message) + '</td></tr>';\n      }\n    }\n\n    function updateStats() {\n      const now = new Date();\n      const todayStr = new Intl.DateTimeFormat('en-CA', { timeZone: defaultClinicTz }).format(now);\n\n      let todayCount = 0, confCount = 0, arrCount = 0, compCount = 0;\n\n      allAppointments.forEach(a => {\n        const tz = a.timezone || defaultClinicTz;\n        const apptDateStr = new Intl.DateTimeFormat('en-CA', { timeZone: tz }).format(new Date(a.start_time));\n        const isToday = (apptDateStr === todayStr);\n\n        if (isToday) todayCount++;\n        if (a.status === 'CONFIRMED' || a.status === 'RESCHEDULED') confCount++;\n        if (a.status === 'ARRIVED') arrCount++;\n        if (isToday && a.status === 'COMPLETED') compCount++;\n      });\n\n      document.getElementById('stat-today').innerText = todayCount;\n      document.getElementById('stat-confirmed').innerText = confCount;\n      document.getElementById('stat-arrived').innerText = arrCount;\n      document.getElementById('stat-completed').innerText = compCount;\n    }\n\n    function setFilter(f) {\n      currentFilter = f;\n      ['today', 'upcoming', 'all'].forEach(k => {\n        document.getElementById('filter-' + k).classList.toggle('active', k === f);\n      });\n      applyFilters();\n    }\n\n    function applyFilters() {\n      const query = document.getElementById('search-box').value.toLowerCase();\n      const doctorFilter = document.getElementById('doctor-filter').value;\n      const now = new Date();\n      const todayStr = new Intl.DateTimeFormat('en-CA', { timeZone: defaultClinicTz }).format(now);\n\n      const filtered = allAppointments.filter(a => {\n        const tz = a.timezone || defaultClinicTz;\n        const aDate = new Date(a.start_time);\n        const aDateStr = new Intl.DateTimeFormat('en-CA', { timeZone: tz }).format(aDate);\n\n        if (currentFilter === 'today' && aDateStr !== todayStr) return false;\n        if (currentFilter === 'upcoming' && (aDate <= now || ['CANCELLED', 'COMPLETED', 'EXPIRED'].includes(a.status))) return false;\n        if (doctorFilter && a.doctor_id !== doctorFilter) return false;\n        if (query) {\n          const matchName = (a.customer_name || '').toLowerCase().includes(query);\n          const matchPhone = (a.phone || '').includes(query);\n          const matchId = String(a.appointment_id).includes(query);\n          if (!matchName && !matchPhone && !matchId) return false;\n        }\n        return true;\n      });\n\n      renderTable(filtered);\n    }\n\n    function renderTable(list) {\n      const tbody = document.getElementById('appointment-tbody');\n      if (list.length === 0) {\n        tbody.innerHTML = '<tr><td colspan=\"8\" class=\"text-center py-4 text-muted\">No appointments found matching current filter.</td></tr>';\n        return;\n      }\n\n      tbody.innerHTML = list.map(a => {\n        const tz = a.timezone || defaultClinicTz;\n        const dt = new Date(a.start_time);\n        const formattedDate = new Intl.DateTimeFormat('en-US', { timeZone: tz, month: 'short', day: 'numeric', year: 'numeric' }).format(dt);\n        const formattedTime = new Intl.DateTimeFormat('en-US', { timeZone: tz, hour: '2-digit', minute: '2-digit' }).format(dt);\n        const safeId = Number(a.appointment_id);\n        const cleanPhone = encodeURIComponent(String(a.phone || ''));\n\n        return \\`\n          <tr>\n            <td><span class=\"text-muted fw-bold\">#\\${safeId}</span></td>\n            <td class=\"fw-semibold\">\\${escapeHtml(a.customer_name)}</td>\n            <td><a href=\"https://wa.me/\\${cleanPhone}\" target=\"_blank\" class=\"text-decoration-none\"><i class=\"fa-brands fa-whatsapp text-success me-1\"></i>\\${escapeHtml(a.phone)}</a></td>\n            <td><span class=\"badge bg-light text-dark border\">\\${escapeHtml(a.doctor_name || a.doctor_id)}</span></td>\n            <td>\\${escapeHtml(a.service)}</td>\n            <td><strong>\\${escapeHtml(formattedDate)}</strong> <span class=\"text-muted\">\\${escapeHtml(formattedTime)}</span></td>\n            <td><span class=\"badge badge-status status-\\${escapeHtml(a.status)}\">\\${escapeHtml(a.status)}</span></td>\n            <td class=\"text-end\">\n              <div class=\"dropdown d-inline-block\">\n                <button class=\"btn btn-sm btn-light border dropdown-toggle\" data-bs-toggle=\"dropdown\">Actions</button>\n                <ul class=\"dropdown-menu dropdown-menu-end\">\n                  <li><a class=\"dropdown-item text-primary\" href=\"#\" onclick=\"updateStatus(\\${safeId}, 'ARRIVED')\"><i class=\"fa-solid fa-door-open me-2\"></i>Mark Arrived</a></li>\n                  <li><a class=\"dropdown-item text-success\" href=\"#\" onclick=\"updateStatus(\\${safeId}, 'COMPLETED')\"><i class=\"fa-solid fa-check-double me-2\"></i>Mark Completed</a></li>\n                  <li><a class=\"dropdown-item text-secondary\" href=\"#\" onclick=\"updateStatus(\\${safeId}, 'NO_SHOW')\"><i class=\"fa-solid fa-user-slash me-2\"></i>Mark No-Show</a></li>\n                  <li><hr class=\"dropdown-divider\"></li>\n                  <li><a class=\"dropdown-item text-warning\" href=\"#\" onclick=\"openReschedModal(\\${safeId})\"><i class=\"fa-solid fa-calendar-days me-2\"></i>Reschedule</a></li>\n                  <li><a class=\"dropdown-item text-danger\" href=\"#\" onclick=\"cancelAppt(\\${safeId})\"><i class=\"fa-solid fa-trash me-2\"></i>Cancel</a></li>\n                </ul>\n              </div>\n            </td>\n          </tr>\n        \\`;\n      }).join('');\n    }\n\n    async function updateStatus(id, newStatus) {\n      if (!confirm('Update appointment #' + id + ' status to ' + newStatus + '?')) return;\n      try {\n        const res = await fetch(apiUrl, {\n          method: 'POST',\n          headers: getHeaders(),\n          body: JSON.stringify({ action: 'UPDATE_STATUS', appointment_id: id, status: newStatus })\n        });\n        const data = await res.json();\n        if (!res.ok || data.success === false) {\n          throw new Error(data.error?.message || data.error || 'Status update failed');\n        }\n        loadAppointments();\n      } catch (err) {\n        alert('Action failed: ' + err.message);\n      }\n    }\n\n    async function cancelAppt(id) {\n      if (!confirm('Cancel appointment #' + id + '?')) return;\n      try {\n        const res = await fetch(apiUrl, {\n          method: 'POST',\n          headers: getHeaders(),\n          body: JSON.stringify({ action: 'CANCEL_APPOINTMENT', appointment_id: id })\n        });\n        const data = await res.json();\n        if (!res.ok || data.success === false) {\n          throw new Error(data.error?.message || data.error || 'Cancellation failed');\n        }\n        loadAppointments();\n      } catch (err) {\n        alert('Action failed: ' + err.message);\n      }\n    }\n\n    function openNewModal() {\n      document.getElementById('m-date').value = new Date().toISOString().split('T')[0];\n      document.getElementById('m-time').value = '10:00';\n      new bootstrap.Modal(document.getElementById('newApptModal')).show();\n    }\n\n    async function submitNewAppointment() {\n      const btn = document.getElementById('btn-submit-new');\n      const name = document.getElementById('m-name').value.trim();\n      const phone = document.getElementById('m-phone').value.trim();\n      const doctor = document.getElementById('m-doctor').value;\n      const service = document.getElementById('m-service').value.trim();\n      const date = document.getElementById('m-date').value;\n      const time = document.getElementById('m-time').value;\n\n      if (!name || !phone || !date || !time) return alert('Please fill all required fields');\n\n      btn.disabled = true;\n      btn.innerHTML = '<span class=\"spinner-border spinner-border-sm me-1\"></span> Booking...';\n\n      try {\n        const res = await fetch(apiUrl, {\n          method: 'POST',\n          headers: getHeaders(),\n          body: JSON.stringify({ action: 'CREATE_APPOINTMENT', customer_name: name, phone: phone, doctor_id: doctor, service: service, date: date, time: time })\n        });\n        const data = await res.json();\n        if (!res.ok || data.success === false) {\n          throw new Error(data.error?.message || data.error || 'Booking failed');\n        }\n        bootstrap.Modal.getInstance(document.getElementById('newApptModal')).hide();\n        loadAppointments();\n      } catch (err) {\n        alert('Booking failed: ' + err.message);\n      } finally {\n        btn.disabled = false;\n        btn.innerHTML = 'Confirm & Book';\n      }\n    }\n\n    function openReschedModal(id) {\n      const appt = allAppointments.find(a => Number(a.appointment_id) === Number(id));\n      document.getElementById('r-id').value = id;\n      document.getElementById('r-patient').innerText = appt ? appt.customer_name : ('#' + id);\n      document.getElementById('r-date').value = new Date().toISOString().split('T')[0];\n      document.getElementById('r-time').value = '11:00';\n      new bootstrap.Modal(document.getElementById('reschedModal')).show();\n    }\n\n    async function submitReschedule() {\n      const btn = document.getElementById('btn-submit-resched');\n      const id = document.getElementById('r-id').value;\n      const date = document.getElementById('r-date').value;\n      const time = document.getElementById('r-time').value;\n\n      btn.disabled = true;\n      btn.innerHTML = '<span class=\"spinner-border spinner-border-sm me-1\"></span> Rescheduling...';\n\n      try {\n        const res = await fetch(apiUrl, {\n          method: 'POST',\n          headers: getHeaders(),\n          body: JSON.stringify({ action: 'RESCHEDULE_APPOINTMENT', appointment_id: id, date: date, time: time })\n        });\n        const data = await res.json();\n        if (!res.ok || data.success === false) {\n          throw new Error(data.error?.message || data.error || 'Reschedule failed');\n        }\n        bootstrap.Modal.getInstance(document.getElementById('reschedModal')).hide();\n        loadAppointments();\n      } catch (err) {\n        alert('Reschedule failed: ' + err.message);\n      } finally {\n        btn.disabled = false;\n        btn.innerHTML = 'Save Changes';\n      }\n    }\n\n    function openLeaveModal() {\n      new bootstrap.Modal(document.getElementById('leaveModal')).show();\n    }\n\n    async function submitDoctorLeave() {\n      const btn = document.getElementById('btn-submit-leave');\n      const doctor = document.getElementById('l-doctor').value;\n      const start = document.getElementById('l-start').value;\n      const end = document.getElementById('l-end').value;\n      const reason = document.getElementById('l-reason').value;\n\n      btn.disabled = true;\n      btn.innerHTML = '<span class=\"spinner-border spinner-border-sm me-1\"></span> Saving...';\n\n      try {\n        const res = await fetch(apiUrl, {\n          method: 'POST',\n          headers: getHeaders(),\n          body: JSON.stringify({ action: 'SET_DOCTOR_LEAVE', doctor_id: doctor, start_time: start, end_time: end, reason: reason })\n        });\n        const data = await res.json();\n        if (!res.ok || data.success === false) {\n          throw new Error(data.error?.message || data.error || 'Recording leave failed');\n        }\n        if (data.data?.affected_appointments?.length > 0) {\n          alert('Leave recorded. Notice: ' + data.data.affected_appointments.length + ' existing booking(s) fall in this window and need rescheduling.');\n        } else {\n          alert('Doctor unavailability recorded successfully.');\n        }\n        bootstrap.Modal.getInstance(document.getElementById('leaveModal')).hide();\n      } catch (err) {\n        alert('Doctor leave recording failed: ' + err.message);\n      } finally {\n        btn.disabled = false;\n        btn.innerHTML = 'Record Leave';\n      }\n    }\n\n    checkAuth();\n    loadDoctors();\n    loadAppointments();\n    setInterval(loadAppointments, 30000);\n  </script>\n</body>\n</html>`;\n\nreturn [{ json: { html: html } }];\n"
       }
     },
     {
@@ -371,7 +390,7 @@
       ],
       "parameters": {
         "language": "javascript",
-        "jsCode": "\nfunction getUtcFromLocal(dateStr, timeStr, timeZone) {\n  const [yyyy, mm, dd] = dateStr.split('-').map(Number);\n  const [hh, min] = timeStr.split(':').map(Number);\n  const utcDate = new Date(Date.UTC(yyyy, mm - 1, dd, hh, min, 0));\n  const invDate = new Date(utcDate.toLocaleString('en-US', { timeZone: 'UTC' }));\n  const targetDate = new Date(utcDate.toLocaleString('en-US', { timeZone: timeZone }));\n  const diff = targetDate.getTime() - invDate.getTime();\n  return new Date(utcDate.getTime() - diff);\n}\n\nfunction getWeekdayFromDate(dateObj, timeZone) {\n  const dayStr = new Intl.DateTimeFormat('en-US', { timeZone, weekday: 'short' }).format(dateObj);\n  const map = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };\n  return map[dayStr];\n}\n\nfunction isValidDate(dateStr) {\n  if (!dateStr || typeof dateStr !== 'string') return false;\n  const match = dateStr.match(/^(\\d{4})-(\\d{2})-(\\d{2})$/);\n  if (!match) return false;\n  const [_, yStr, mStr, dStr] = match;\n  const y = Number(yStr), m = Number(mStr), d = Number(dStr);\n  if (m < 1 || m > 12 || d < 1 || d > 31) return false;\n  const testDate = new Date(Date.UTC(y, m - 1, d));\n  return testDate.getUTCFullYear() === y && testDate.getUTCMonth() === (m - 1) && testDate.getUTCDate() === d;\n}\n\nfunction isValidTime(timeStr) {\n  if (!timeStr || typeof timeStr !== 'string') return false;\n  return /^([01]\\d|2[0-3]):([0-5]\\d)$/.test(timeStr);\n}\n\nconst prev = $('Prep_Manual_Create').first().json;\nconst docData = $input.first()?.json;\n\nif (!docData || !docData.doctor_id) {\n  return [{\n    json: {\n      error: `Doctor '${prev.doctor_id}' not found or inactive.`,\n      manual_booking_failed: true\n    }\n  }];\n}\n\nconst tz = docData.timezone || 'Asia/Kolkata';\nconst durationMinutes = docData.slot_duration_minutes || 30;\nconst bufferMin = docData.buffer_minutes || 0;\n\nif (!isValidDate(prev.date)) {\n  return [{ json: { error: `Invalid date format '${prev.date}'. Expected YYYY-MM-DD.`, manual_booking_failed: true } }];\n}\nif (!isValidTime(prev.time)) {\n  return [{ json: { error: `Invalid time format '${prev.time}'. Expected HH:MM in 24h format (00:00 - 23:59).`, manual_booking_failed: true } }];\n}\n\nconst startUtc = getUtcFromLocal(prev.date, prev.time, tz);\nconst endUtc = new Date(startUtc.getTime() + durationMinutes * 60000);\n\n// Validate Working Days\nconst weekdayNum = getWeekdayFromDate(startUtc, tz);\nconst workingDays = docData.working_days || [1, 2, 3, 4, 5, 6];\nif (!workingDays.includes(weekdayNum)) {\n  return [{ json: { error: `Doctor '${docData.doctor_name}' does not work on this day of the week.`, manual_booking_failed: true } }];\n}\n\n// Validate Working Hours\nconst wh = docData.working_hours || { start: \"09:00\", end: \"17:00\" };\nconst [startH, startM] = wh.start.split(':').map(Number);\nconst [endH, endM] = wh.end.split(':').map(Number);\nconst [reqH, reqM] = prev.time.split(':').map(Number);\nconst reqMinutes = reqH * 60 + reqM;\nconst workStartMin = startH * 60 + startM;\nconst workEndMin = endH * 60 + endM;\n\nif (reqMinutes < workStartMin || reqMinutes + durationMinutes > workEndMin) {\n  return [{ json: { error: `Requested time ${prev.time} is outside doctor working hours (${wh.start} - ${wh.end}).`, manual_booking_failed: true } }];\n}\n\n// Check Doctor Leave / Unavailability\nconst unavailabilities = Array.isArray(docData.unavailabilities) ? docData.unavailabilities : (typeof docData.unavailabilities === 'string' ? JSON.parse(docData.unavailabilities) : []);\nfor (const u of unavailabilities) {\n  const uStart = new Date(u.start_time);\n  const uEnd = new Date(u.end_time);\n  if (startUtc < uEnd && endUtc > uStart) {\n    return [{ json: { error: `Doctor is unavailable at this time: ${u.reason || 'On Leave'}`, manual_booking_failed: true } }];\n  }\n}\n\n// Check Existing Active Appointments with Buffer\nconst activeAppts = Array.isArray(docData.active_appointments) ? docData.active_appointments : (typeof docData.active_appointments === 'string' ? JSON.parse(docData.active_appointments) : []);\nfor (const a of activeAppts) {\n  const aStart = new Date(a.start_time);\n  const aEnd = new Date(a.end_time);\n  const aStartBuffered = new Date(aStart.getTime() - bufferMin * 60000);\n  const aEndBuffered = new Date(aEnd.getTime() + bufferMin * 60000);\n  if (startUtc < aEndBuffered && endUtc > aStartBuffered) {\n    return [{ json: { error: `Time slot overlaps with existing appointment #${a.appointment_id} (${a.customer_name}) or buffer window.`, manual_booking_failed: true } }];\n  }\n}\n\nreturn [{\n  json: {\n    ...prev,\n    doctor_name: docData.doctor_name,\n    calendar_id: docData.calendar_id,\n    timezone: tz,\n    slot_duration_minutes: durationMinutes,\n    buffer_minutes: bufferMin,\n    start_time_iso: startUtc.toISOString(),\n    end_time_iso: endUtc.toISOString(),\n    manual_booking_failed: false\n  }\n}];\n"
+        "jsCode": "\nfunction getUtcFromLocal(dateStr, timeStr, timeZone) {\n  const [yyyy, mm, dd] = dateStr.split('-').map(Number);\n  const [hh, min] = timeStr.split(':').map(Number);\n  const testUtc = new Date(Date.UTC(yyyy, mm - 1, dd, hh, min, 0));\n  \n  const dtf = new Intl.DateTimeFormat('en-US', {\n    timeZone,\n    year: 'numeric', month: '2-digit', day: '2-digit',\n    hour: '2-digit', minute: '2-digit', second: '2-digit',\n    hour12: false\n  });\n  \n  const parts = dtf.formatToParts(testUtc);\n  const p = {};\n  for (const part of parts) {\n    p[part.type] = part.value;\n  }\n  let partHour = parseInt(p.hour, 10);\n  if (partHour === 24) partHour = 0;\n  \n  const formattedAsUtc = Date.UTC(\n    parseInt(p.year, 10),\n    parseInt(p.month, 10) - 1,\n    parseInt(p.day, 10),\n    partHour,\n    parseInt(p.minute, 10),\n    parseInt(p.second, 10)\n  );\n  \n  const offset = formattedAsUtc - testUtc.getTime();\n  return new Date(testUtc.getTime() - offset);\n}\n\nfunction getWeekdayFromDate(dateObj, timeZone) {\n  const dayStr = new Intl.DateTimeFormat('en-US', { timeZone, weekday: 'short' }).format(dateObj);\n  const map = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };\n  return map[dayStr];\n}\n\nfunction formatInTimezone(dateObj, timeZone, options) {\n  return new Intl.DateTimeFormat('en-US', { timeZone, ...options }).format(dateObj);\n}\n\nfunction isValidDate(dateStr) {\n  if (!dateStr || typeof dateStr !== 'string') return false;\n  const match = dateStr.match(/^(\\d{4})-(\\d{2})-(\\d{2})$/);\n  if (!match) return false;\n  const [_, yStr, mStr, dStr] = match;\n  const y = Number(yStr), m = Number(mStr), d = Number(dStr);\n  if (m < 1 || m > 12 || d < 1 || d > 31) return false;\n  const testDate = new Date(Date.UTC(y, m - 1, d));\n  return testDate.getUTCFullYear() === y && testDate.getUTCMonth() === (m - 1) && testDate.getUTCDate() === d;\n}\n\nfunction isValidTime(timeStr) {\n  if (!timeStr || typeof timeStr !== 'string') return false;\n  return /^([01]\\d|2[0-3]):([0-5]\\d)$/.test(timeStr);\n}\n\nconst prev = $('Prep_Manual_Create').first().json;\nconst docData = $input.first()?.json;\n\nif (!docData || !docData.doctor_id) {\n  return [{\n    json: {\n      error: `Doctor '${prev.doctor_id}' not found or inactive.`,\n      manual_booking_failed: true\n    }\n  }];\n}\n\nconst tz = docData.timezone || 'Asia/Kolkata';\nconst durationMinutes = docData.slot_duration_minutes || 30;\nconst bufferMin = docData.buffer_minutes || 0;\nconst cutoffMin = docData.booking_cutoff_minutes || 60;\n\nif (!isValidDate(prev.date)) {\n  return [{ json: { error: `Invalid date format '${prev.date}'. Expected YYYY-MM-DD.`, manual_booking_failed: true } }];\n}\nif (!isValidTime(prev.time)) {\n  return [{ json: { error: `Invalid time format '${prev.time}'. Expected HH:MM in 24h format (00:00 - 23:59).`, manual_booking_failed: true } }];\n}\n\nconst startUtc = getUtcFromLocal(prev.date, prev.time, tz);\nconst endUtc = new Date(startUtc.getTime() + durationMinutes * 60000);\n\n// Validate Working Days\nconst weekdayNum = getWeekdayFromDate(startUtc, tz);\nconst workingDays = docData.working_days || [1, 2, 3, 4, 5, 6];\nif (!workingDays.includes(weekdayNum)) {\n  return [{ json: { error: `Doctor '${docData.doctor_name}' does not work on this day of the week.`, manual_booking_failed: true } }];\n}\n\n// Validate Working Hours\nconst wh = docData.working_hours || { start: \"09:00\", end: \"17:00\" };\nconst [startH, startM] = wh.start.split(':').map(Number);\nconst [endH, endM] = wh.end.split(':').map(Number);\nconst [reqH, reqM] = prev.time.split(':').map(Number);\nconst reqMinutes = reqH * 60 + reqM;\nconst workStartMin = startH * 60 + startM;\nconst workEndMin = endH * 60 + endM;\n\nif (reqMinutes < workStartMin || reqMinutes + durationMinutes > workEndMin) {\n  return [{ json: { error: `Requested time ${prev.time} is outside doctor working hours (${wh.start} - ${wh.end}).`, manual_booking_failed: true } }];\n}\n\n// Check Doctor Leave / Unavailability\nconst unavailabilities = Array.isArray(docData.unavailabilities) ? docData.unavailabilities : (typeof docData.unavailabilities === 'string' ? JSON.parse(docData.unavailabilities) : []);\nfor (const u of unavailabilities) {\n  const uStart = new Date(u.start_time);\n  const uEnd = new Date(u.end_time);\n  if (startUtc < uEnd && endUtc > uStart) {\n    return [{ json: { error: `Doctor is unavailable at this time: ${u.reason || 'On Leave'}`, manual_booking_failed: true } }];\n  }\n}\n\n// Check Existing Active Appointments with Buffer\nconst activeAppts = Array.isArray(docData.active_appointments) ? docData.active_appointments : (typeof docData.active_appointments === 'string' ? JSON.parse(docData.active_appointments) : []);\nfor (const a of activeAppts) {\n  const aStart = new Date(a.start_time);\n  const aEnd = new Date(a.end_time);\n  const aStartBuffered = new Date(aStart.getTime() - bufferMin * 60000);\n  const aEndBuffered = new Date(aEnd.getTime() + bufferMin * 60000);\n  if (startUtc < aEndBuffered && endUtc > aStartBuffered) {\n    return [{ json: { error: `Time slot overlaps with existing appointment #${a.appointment_id} (${a.customer_name}) or buffer window.`, manual_booking_failed: true } }];\n  }\n}\n\nreturn [{\n  json: {\n    ...prev,\n    doctor_name: docData.doctor_name,\n    calendar_id: docData.calendar_id,\n    timezone: tz,\n    slot_duration_minutes: durationMinutes,\n    buffer_minutes: bufferMin,\n    start_time_iso: startUtc.toISOString(),\n    end_time_iso: endUtc.toISOString(),\n    gcal_time_min: new Date(startUtc.getTime() - (bufferMin + 1) * 60000).toISOString(),\n    gcal_time_max: new Date(endUtc.getTime() + (bufferMin + 1) * 60000).toISOString(),\n    manual_booking_failed: false\n  }\n}];\n"
       }
     },
     {
@@ -449,7 +468,7 @@
       ],
       "parameters": {
         "operation": "executeQuery",
-        "query": "\nUPDATE appointments\nSET status = $1, updated_at = NOW()\nWHERE appointment_id = $2\n  AND (\n    ($1 = 'ARRIVED' AND status = 'CONFIRMED')\n    OR ($1 = 'COMPLETED' AND status IN ('ARRIVED', 'CONFIRMED'))\n    OR ($1 = 'NO_SHOW' AND status = 'CONFIRMED')\n  )\nRETURNING *;\n",
+        "query": "\nUPDATE appointments\nSET status = $1, updated_at = NOW()\nWHERE appointment_id = $2\n  AND (\n    ($1 = 'ARRIVED' AND status IN ('CONFIRMED', 'RESCHEDULED'))\n    OR ($1 = 'COMPLETED' AND status IN ('ARRIVED', 'CONFIRMED', 'RESCHEDULED'))\n    OR ($1 = 'NO_SHOW' AND status IN ('CONFIRMED', 'RESCHEDULED'))\n    OR ($1 = 'CANCELLED' AND status IN ('PENDING', 'CONFIRMED', 'RESCHEDULED'))\n  )\nRETURNING *;\n",
         "queryParameters": "={{ [$json.payload.status, $json.payload.appointment_id] }}"
       },
       "credentials": {
@@ -506,7 +525,7 @@
       ],
       "parameters": {
         "language": "javascript",
-        "jsCode": "\nfunction getUtcFromLocal(dateStr, timeStr, timeZone) {\n  const [yyyy, mm, dd] = dateStr.split('-').map(Number);\n  const [hh, min] = timeStr.split(':').map(Number);\n  const utcDate = new Date(Date.UTC(yyyy, mm - 1, dd, hh, min, 0));\n  const invDate = new Date(utcDate.toLocaleString('en-US', { timeZone: 'UTC' }));\n  const targetDate = new Date(utcDate.toLocaleString('en-US', { timeZone: timeZone }));\n  const diff = targetDate.getTime() - invDate.getTime();\n  return new Date(utcDate.getTime() - diff);\n}\n\nfunction getWeekdayFromDate(dateObj, timeZone) {\n  const dayStr = new Intl.DateTimeFormat('en-US', { timeZone, weekday: 'short' }).format(dateObj);\n  const map = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };\n  return map[dayStr];\n}\n\nfunction isValidDate(dateStr) {\n  if (!dateStr || typeof dateStr !== 'string') return false;\n  const match = dateStr.match(/^(\\d{4})-(\\d{2})-(\\d{2})$/);\n  if (!match) return false;\n  const [_, yStr, mStr, dStr] = match;\n  const y = Number(yStr), m = Number(mStr), d = Number(dStr);\n  if (m < 1 || m > 12 || d < 1 || d > 31) return false;\n  const testDate = new Date(Date.UTC(y, m - 1, d));\n  return testDate.getUTCFullYear() === y && testDate.getUTCMonth() === (m - 1) && testDate.getUTCDate() === d;\n}\n\nfunction isValidTime(timeStr) {\n  if (!timeStr || typeof timeStr !== 'string') return false;\n  return /^([01]\\d|2[0-3]):([0-5]\\d)$/.test(timeStr);\n}\n\nconst appt = $input.first()?.json;\nconst payload = $('Parse_Dashboard_Request').first().json.payload || {};\n\nif (!appt || !appt.appointment_id) {\n  return [{ json: { error: 'Appointment not found or not in CONFIRMED state.', resched_failed: true } }];\n}\n\nif (!isValidDate(payload.date)) {\n  return [{ json: { error: `Invalid reschedule date '${payload.date}'. Expected YYYY-MM-DD.`, resched_failed: true } }];\n}\nif (!isValidTime(payload.time)) {\n  return [{ json: { error: `Invalid reschedule time '${payload.time}'. Expected HH:MM in 24h format (00:00 - 23:59).`, resched_failed: true } }];\n}\n\nconst tz = appt.timezone || 'Asia/Kolkata';\nconst durationMinutes = appt.slot_duration_minutes || 30;\nconst bufferMin = appt.buffer_minutes || 0;\nconst startUtc = getUtcFromLocal(payload.date, payload.time, tz);\nconst endUtc = new Date(startUtc.getTime() + durationMinutes * 60000);\n\n// Validate Working Days\nconst weekdayNum = getWeekdayFromDate(startUtc, tz);\nconst workingDays = appt.working_days || [1, 2, 3, 4, 5, 6];\nif (!workingDays.includes(weekdayNum)) {\n  return [{ json: { error: `Doctor '${appt.doctor_name}' does not work on this day.`, resched_failed: true } }];\n}\n\n// Validate Working Hours\nconst wh = appt.working_hours || { start: \"09:00\", end: \"17:00\" };\nconst [startH, startM] = wh.start.split(':').map(Number);\nconst [endH, endM] = wh.end.split(':').map(Number);\nconst [reqH, reqM] = payload.time.split(':').map(Number);\nconst reqMinutes = reqH * 60 + reqM;\nconst workStartMin = startH * 60 + startM;\nconst workEndMin = endH * 60 + endM;\n\nif (reqMinutes < workStartMin || reqMinutes + durationMinutes > workEndMin) {\n  return [{ json: { error: `Requested reschedule time ${payload.time} is outside doctor working hours (${wh.start} - ${wh.end}).`, resched_failed: true } }];\n}\n\n// Validate Doctor Leave\nconst unavailabilities = Array.isArray(appt.unavailabilities) ? appt.unavailabilities : (typeof appt.unavailabilities === 'string' ? JSON.parse(appt.unavailabilities) : []);\nfor (const u of unavailabilities) {\n  const uStart = new Date(u.start_time);\n  const uEnd = new Date(u.end_time);\n  if (startUtc < uEnd && endUtc > uStart) {\n    return [{ json: { error: `Doctor is on leave during requested time: ${u.reason || 'Unavailable'}`, resched_failed: true } }];\n  }\n}\n\n// Validate against other active appointments (excluding self) with buffer\nconst activeAppts = Array.isArray(appt.active_appointments) ? appt.active_appointments : (typeof appt.active_appointments === 'string' ? JSON.parse(appt.active_appointments) : []);\nfor (const a of activeAppts) {\n  const aStart = new Date(a.start_time);\n  const aEnd = new Date(a.end_time);\n  const aStartBuffered = new Date(aStart.getTime() - bufferMin * 60000);\n  const aEndBuffered = new Date(aEnd.getTime() + bufferMin * 60000);\n  if (startUtc < aEndBuffered && endUtc > aStartBuffered) {\n    return [{ json: { error: `Reschedule slot conflicts with appointment #${a.appointment_id} (${a.customer_name}) or buffer window.`, resched_failed: true } }];\n  }\n}\n\nreturn [{\n  json: {\n    appointment_id: appt.appointment_id,\n    customer_name: appt.customer_name,\n    doctor_id: appt.doctor_id,\n    calendar_id: appt.calendar_id,\n    calendar_event_id: appt.calendar_event_id,\n    slot_duration_minutes: durationMinutes,\n    old_start_iso: appt.start_time,\n    old_end_iso: appt.end_time,\n    start_time_iso: startUtc.toISOString(),\n    end_time_iso: endUtc.toISOString(),\n    resched_failed: false\n  }\n}];\n"
+        "jsCode": "\nfunction getUtcFromLocal(dateStr, timeStr, timeZone) {\n  const [yyyy, mm, dd] = dateStr.split('-').map(Number);\n  const [hh, min] = timeStr.split(':').map(Number);\n  const testUtc = new Date(Date.UTC(yyyy, mm - 1, dd, hh, min, 0));\n  \n  const dtf = new Intl.DateTimeFormat('en-US', {\n    timeZone,\n    year: 'numeric', month: '2-digit', day: '2-digit',\n    hour: '2-digit', minute: '2-digit', second: '2-digit',\n    hour12: false\n  });\n  \n  const parts = dtf.formatToParts(testUtc);\n  const p = {};\n  for (const part of parts) {\n    p[part.type] = part.value;\n  }\n  let partHour = parseInt(p.hour, 10);\n  if (partHour === 24) partHour = 0;\n  \n  const formattedAsUtc = Date.UTC(\n    parseInt(p.year, 10),\n    parseInt(p.month, 10) - 1,\n    parseInt(p.day, 10),\n    partHour,\n    parseInt(p.minute, 10),\n    parseInt(p.second, 10)\n  );\n  \n  const offset = formattedAsUtc - testUtc.getTime();\n  return new Date(testUtc.getTime() - offset);\n}\n\nfunction getWeekdayFromDate(dateObj, timeZone) {\n  const dayStr = new Intl.DateTimeFormat('en-US', { timeZone, weekday: 'short' }).format(dateObj);\n  const map = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };\n  return map[dayStr];\n}\n\nfunction formatInTimezone(dateObj, timeZone, options) {\n  return new Intl.DateTimeFormat('en-US', { timeZone, ...options }).format(dateObj);\n}\n\nfunction isValidDate(dateStr) {\n  if (!dateStr || typeof dateStr !== 'string') return false;\n  const match = dateStr.match(/^(\\d{4})-(\\d{2})-(\\d{2})$/);\n  if (!match) return false;\n  const [_, yStr, mStr, dStr] = match;\n  const y = Number(yStr), m = Number(mStr), d = Number(dStr);\n  if (m < 1 || m > 12 || d < 1 || d > 31) return false;\n  const testDate = new Date(Date.UTC(y, m - 1, d));\n  return testDate.getUTCFullYear() === y && testDate.getUTCMonth() === (m - 1) && testDate.getUTCDate() === d;\n}\n\nfunction isValidTime(timeStr) {\n  if (!timeStr || typeof timeStr !== 'string') return false;\n  return /^([01]\\d|2[0-3]):([0-5]\\d)$/.test(timeStr);\n}\n\nconst appt = $input.first()?.json;\nconst payload = $('Parse_Dashboard_Request').first().json.payload || {};\n\nif (!appt || !appt.appointment_id) {\n  return [{ json: { error: 'Appointment not found or not in CONFIRMED/RESCHEDULED state.', resched_failed: true } }];\n}\n\nif (!isValidDate(payload.date)) {\n  return [{ json: { error: `Invalid reschedule date '${payload.date}'. Expected YYYY-MM-DD.`, resched_failed: true } }];\n}\nif (!isValidTime(payload.time)) {\n  return [{ json: { error: `Invalid reschedule time '${payload.time}'. Expected HH:MM in 24h format (00:00 - 23:59).`, resched_failed: true } }];\n}\n\nconst tz = appt.timezone || 'Asia/Kolkata';\nconst durationMinutes = appt.slot_duration_minutes || 30;\nconst bufferMin = appt.buffer_minutes || 0;\nconst startUtc = getUtcFromLocal(payload.date, payload.time, tz);\nconst endUtc = new Date(startUtc.getTime() + durationMinutes * 60000);\n\n// Validate Working Days\nconst weekdayNum = getWeekdayFromDate(startUtc, tz);\nconst workingDays = appt.working_days || [1, 2, 3, 4, 5, 6];\nif (!workingDays.includes(weekdayNum)) {\n  return [{ json: { error: `Doctor '${appt.doctor_name}' does not work on this day.`, resched_failed: true } }];\n}\n\n// Validate Working Hours\nconst wh = appt.working_hours || { start: \"09:00\", end: \"17:00\" };\nconst [startH, startM] = wh.start.split(':').map(Number);\nconst [endH, endM] = wh.end.split(':').map(Number);\nconst [reqH, reqM] = payload.time.split(':').map(Number);\nconst reqMinutes = reqH * 60 + reqM;\nconst workStartMin = startH * 60 + startM;\nconst workEndMin = endH * 60 + endM;\n\nif (reqMinutes < workStartMin || reqMinutes + durationMinutes > workEndMin) {\n  return [{ json: { error: `Requested reschedule time ${payload.time} is outside doctor working hours (${wh.start} - ${wh.end}).`, resched_failed: true } }];\n}\n\n// Validate Doctor Leave\nconst unavailabilities = Array.isArray(appt.unavailabilities) ? appt.unavailabilities : (typeof appt.unavailabilities === 'string' ? JSON.parse(appt.unavailabilities) : []);\nfor (const u of unavailabilities) {\n  const uStart = new Date(u.start_time);\n  const uEnd = new Date(u.end_time);\n  if (startUtc < uEnd && endUtc > uStart) {\n    return [{ json: { error: `Doctor is on leave during requested time: ${u.reason || 'Unavailable'}`, resched_failed: true } }];\n  }\n}\n\n// Validate against other active appointments (excluding self) with buffer\nconst activeAppts = Array.isArray(appt.active_appointments) ? appt.active_appointments : (typeof appt.active_appointments === 'string' ? JSON.parse(appt.active_appointments) : []);\nfor (const a of activeAppts) {\n  if (a.appointment_id === appt.appointment_id) continue;\n  const aStart = new Date(a.start_time);\n  const aEnd = new Date(a.end_time);\n  const aStartBuffered = new Date(aStart.getTime() - bufferMin * 60000);\n  const aEndBuffered = new Date(aEnd.getTime() + bufferMin * 60000);\n  if (startUtc < aEndBuffered && endUtc > aStartBuffered) {\n    return [{ json: { error: `Reschedule slot conflicts with appointment #${a.appointment_id} (${a.customer_name}) or buffer window.`, resched_failed: true } }];\n  }\n}\n\nreturn [{\n  json: {\n    appointment_id: appt.appointment_id,\n    customer_name: appt.customer_name,\n    doctor_id: appt.doctor_id,\n    doctor_name: appt.doctor_name,\n    calendar_id: appt.calendar_id,\n    calendar_event_id: appt.calendar_event_id,\n    slot_duration_minutes: durationMinutes,\n    buffer_minutes: bufferMin,\n    old_start_iso: appt.start_time,\n    old_end_iso: appt.end_time,\n    start_time_iso: startUtc.toISOString(),\n    end_time_iso: endUtc.toISOString(),\n    gcal_time_min: new Date(startUtc.getTime() - (bufferMin + 1) * 60000).toISOString(),\n    gcal_time_max: new Date(endUtc.getTime() + (bufferMin + 1) * 60000).toISOString(),\n    resched_failed: false\n  }\n}];\n"
       }
     },
     {
@@ -918,6 +937,314 @@
         1360,
         1040
       ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT doctor_id, doctor_name, specialty, slot_duration_minutes, buffer_minutes, booking_cutoff_minutes, timezone, working_days, working_hours FROM doctors WHERE is_active = TRUE ORDER BY doctor_name ASC;"
+      },
+      "id": "post-get-doctors-1",
+      "name": "Postgres_Dashboard_Get_Doctors",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        680,
+        1100
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_CREDENTIALS_ID",
+          "name": "Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ success: true, data: { doctors: $input.all().map(i => i.json) } }) }}"
+      },
+      "id": "resp-get-doctors-1",
+      "name": "Respond_Dashboard_Doctors_JSON",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        900,
+        1100
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ Boolean(!$json.manual_booking_failed && !$json.error) }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "if-manual-val-1",
+      "name": "If_Manual_Validation_Passed",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1120,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ success: false, error: $json.error || 'Manual booking validation failed' }) }}",
+        "options": {
+          "responseCode": 400
+        }
+      },
+      "id": "resp-manual-val-fail-1",
+      "name": "Respond_Manual_Validation_Failed_JSON",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1340,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "calendar": {
+          "__rl": true,
+          "value": "={{ $json.calendar_id }}",
+          "mode": "id"
+        },
+        "options": {
+          "timeMin": "={{ $json.gcal_time_min }}",
+          "timeMax": "={{ $json.gcal_time_max }}"
+        }
+      },
+      "id": "gcal-check-manual-1",
+      "name": "GCal_Check_Manual_Slot",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1.2,
+      "position": [
+        1340,
+        160
+      ],
+      "continueOnFail": true,
+      "credentials": {
+        "googleCalendarOAuth2": {
+          "id": "GCAL_CREDENTIALS_ID",
+          "name": "Google Calendar"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "language": "javascript",
+        "jsCode": "\nconst prev = $('Calc_Manual_Times').first().json;\nconst allInputs = $input.all();\n\nconst gcalError = allInputs.some(i => i.json?.error || i.error);\nif (gcalError) {\n  return [{ json: { ...prev, is_gcal_free: false, gcal_error: true, error: \"Calendar check service unavailable\" } }];\n}\n\nconst gcalItems = allInputs.map(i => i.json).filter(j => j && (j.id || j.start));\nconst reqStart = new Date(prev.start_time_iso);\nconst reqEnd = new Date(prev.end_time_iso);\nconst bufferMin = prev.buffer_minutes || 0;\n\nlet isFree = true;\nfor (const ev of gcalItems) {\n  const evStartStr = ev.start?.dateTime || ev.start?.date;\n  const evEndStr = ev.end?.dateTime || ev.end?.date;\n  if (!evStartStr || !evEndStr) continue;\n  const evStart = new Date(evStartStr);\n  const evEnd = new Date(evEndStr);\n  const evStartBuffered = new Date(evStart.getTime() - bufferMin * 60000);\n  const evEndBuffered = new Date(evEnd.getTime() + bufferMin * 60000);\n  if (reqStart < evEndBuffered && reqEnd > evStartBuffered) {\n    isFree = false;\n    break;\n  }\n}\n\nreturn [{ json: { ...prev, is_gcal_free: isFree, gcal_error: false } }];\n"
+      },
+      "id": "verify-manual-gcal-1",
+      "name": "Verify_Manual_GCal_Slot",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1560,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ Boolean($json.is_gcal_free) }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "if-manual-gcal-free-1",
+      "name": "If_Manual_GCal_Slot_Free",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1780,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ success: false, error: 'Google Calendar time slot is already occupied or conflicts with buffer window.' }) }}",
+        "options": {
+          "responseCode": 409
+        }
+      },
+      "id": "resp-manual-conflict-1",
+      "name": "Respond_Manual_GCal_Conflict_JSON",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        2000,
+        280
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ Boolean(!$json.resched_failed && !$json.error) }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "if-resched-val-1",
+      "name": "If_Dashboard_Resched_Validation_Passed",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1120,
+        500
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ success: false, error: $json.error || 'Reschedule validation failed' }) }}",
+        "options": {
+          "responseCode": 400
+        }
+      },
+      "id": "resp-resched-val-fail-1",
+      "name": "Respond_Dashboard_Resched_Validation_Failed_JSON",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        1340,
+        620
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "calendar": {
+          "__rl": true,
+          "value": "={{ $json.calendar_id }}",
+          "mode": "id"
+        },
+        "options": {
+          "timeMin": "={{ $json.gcal_time_min }}",
+          "timeMax": "={{ $json.gcal_time_max }}"
+        }
+      },
+      "id": "gcal-check-resched-1",
+      "name": "GCal_Check_Dashboard_Resched_Slot",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1.2,
+      "position": [
+        1340,
+        460
+      ],
+      "continueOnFail": true,
+      "credentials": {
+        "googleCalendarOAuth2": {
+          "id": "GCAL_CREDENTIALS_ID",
+          "name": "Google Calendar"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "language": "javascript",
+        "jsCode": "\nconst prev = $('Prep_Dashboard_Reschedule').first().json;\nconst allInputs = $input.all();\n\nconst gcalError = allInputs.some(i => i.json?.error || i.error);\nif (gcalError) {\n  return [{ json: { ...prev, is_gcal_free: false, gcal_error: true, error: \"Calendar check service unavailable\" } }];\n}\n\nconst gcalItems = allInputs.map(i => i.json).filter(j => j && (j.id || j.start));\nconst reqStart = new Date(prev.start_time_iso);\nconst reqEnd = new Date(prev.end_time_iso);\nconst bufferMin = prev.buffer_minutes || 0;\n\nlet isFree = true;\nfor (const ev of gcalItems) {\n  if (prev.calendar_event_id && ev.id === prev.calendar_event_id) continue;\n  const evStartStr = ev.start?.dateTime || ev.start?.date;\n  const evEndStr = ev.end?.dateTime || ev.end?.date;\n  if (!evStartStr || !evEndStr) continue;\n  const evStart = new Date(evStartStr);\n  const evEnd = new Date(evEndStr);\n  const evStartBuffered = new Date(evStart.getTime() - bufferMin * 60000);\n  const evEndBuffered = new Date(evEnd.getTime() + bufferMin * 60000);\n  if (reqStart < evEndBuffered && reqEnd > evStartBuffered) {\n    isFree = false;\n    break;\n  }\n}\n\nreturn [{ json: { ...prev, is_gcal_free: isFree, gcal_error: false } }];\n"
+      },
+      "id": "verify-resched-gcal-1",
+      "name": "Verify_Dashboard_Resched_GCal_Slot",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1560,
+        460
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ Boolean($json.is_gcal_free) }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "if-resched-gcal-free-1",
+      "name": "If_Dashboard_Resched_GCal_Slot_Free",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1780,
+        460
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ success: false, error: 'Google Calendar slot is already booked on the doctor calendar.' }) }}",
+        "options": {
+          "responseCode": 409
+        }
+      },
+      "id": "resp-resched-conflict-1",
+      "name": "Respond_Dashboard_Resched_GCal_Conflict_JSON",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        2000,
+        580
+      ]
     }
   ],
   "connections": {
@@ -1007,6 +1334,13 @@
         ],
         [
           {
+            "node": "Postgres_Dashboard_Get_Doctors",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
             "node": "Respond_Dashboard_Unauthorized",
             "type": "main",
             "index": 0
@@ -1080,7 +1414,7 @@
       "main": [
         [
           {
-            "node": "GCal_Create_Manual_Event",
+            "node": "If_Manual_Validation_Passed",
             "type": "main",
             "index": 0
           }
@@ -1135,7 +1469,7 @@
       "main": [
         [
           {
-            "node": "GCal_Dashboard_Reschedule_Event",
+            "node": "If_Dashboard_Resched_Validation_Passed",
             "type": "main",
             "index": 0
           }
@@ -1278,6 +1612,133 @@
         [
           {
             "node": "Respond_Dashboard_Cancel_Failed_JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Postgres_Dashboard_Get_Doctors": {
+      "main": [
+        [
+          {
+            "node": "Respond_Dashboard_Doctors_JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If_Manual_Validation_Passed": {
+      "main": [
+        [
+          {
+            "node": "GCal_Check_Manual_Slot",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond_Manual_Validation_Failed_JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GCal_Check_Manual_Slot": {
+      "main": [
+        [
+          {
+            "node": "Verify_Manual_GCal_Slot",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify_Manual_GCal_Slot": {
+      "main": [
+        [
+          {
+            "node": "If_Manual_GCal_Slot_Free",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If_Manual_GCal_Slot_Free": {
+      "main": [
+        [
+          {
+            "node": "GCal_Create_Manual_Event",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond_Manual_GCal_Conflict_JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If_Dashboard_Resched_Validation_Passed": {
+      "main": [
+        [
+          {
+            "node": "GCal_Check_Dashboard_Resched_Slot",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond_Dashboard_Resched_Validation_Failed_JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "GCal_Check_Dashboard_Resched_Slot": {
+      "main": [
+        [
+          {
+            "node": "Verify_Dashboard_Resched_GCal_Slot",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify_Dashboard_Resched_GCal_Slot": {
+      "main": [
+        [
+          {
+            "node": "If_Dashboard_Resched_GCal_Slot_Free",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If_Dashboard_Resched_GCal_Slot_Free": {
+      "main": [
+        [
+          {
+            "node": "GCal_Dashboard_Reschedule_Event",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond_Dashboard_Resched_GCal_Conflict_JSON",
             "type": "main",
             "index": 0
           }

@@ -1,6 +1,11 @@
--- Enable btree_gist for exclusion constraints if available
+-- ==============================================================================
+-- Appointment Booking System - Database Initialization & Schema Definition
+-- ==============================================================================
+
+-- 1. Enable btree_gist for exclusion constraints
 CREATE EXTENSION IF NOT EXISTS btree_gist;
 
+-- 2. Doctors Registry
 CREATE TABLE IF NOT EXISTS doctors (
     doctor_id VARCHAR(100) PRIMARY KEY,
     doctor_name VARCHAR(255) NOT NULL,
@@ -9,13 +14,23 @@ CREATE TABLE IF NOT EXISTS doctors (
     timezone VARCHAR(100) NOT NULL DEFAULT 'Asia/Kolkata',
     working_days JSONB NOT NULL DEFAULT '[1,2,3,4,5,6]'::jsonb, -- 1=Mon, 6=Sat
     working_hours JSONB NOT NULL DEFAULT '{"start": "09:00", "end": "17:00"}'::jsonb,
-    slot_duration_minutes INT NOT NULL DEFAULT 30,
-    buffer_minutes INT NOT NULL DEFAULT 0,
-    booking_cutoff_minutes INT NOT NULL DEFAULT 60,
+    slot_duration_minutes INT NOT NULL DEFAULT 30 CHECK (slot_duration_minutes > 0),
+    buffer_minutes INT NOT NULL DEFAULT 0 CHECK (buffer_minutes >= 0),
+    booking_cutoff_minutes INT NOT NULL DEFAULT 60 CHECK (booking_cutoff_minutes >= 0),
     is_active BOOLEAN NOT NULL DEFAULT TRUE,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- Seed default doctors if table is freshly created
+INSERT INTO doctors (doctor_id, doctor_name, specialty, calendar_id, timezone, working_days, working_hours, slot_duration_minutes, buffer_minutes, booking_cutoff_minutes, is_active)
+VALUES 
+    ('dr_smith', 'Dr. John Smith', 'Cardiology', 'dr_smith@apexhealth.example.com', 'Asia/Kolkata', '[1,2,3,4,5,6]'::jsonb, '{"start": "09:00", "end": "17:00"}'::jsonb, 30, 0, 60, TRUE),
+    ('dr_emily', 'Dr. Emily Davis', 'Pediatrics', 'dr_emily@apexhealth.example.com', 'Asia/Kolkata', '[1,2,3,4,5,6]'::jsonb, '{"start": "09:00", "end": "17:00"}'::jsonb, 30, 0, 60, TRUE),
+    ('dr_robert', 'Dr. Robert Wilson', 'General Medicine', 'dr_robert@apexhealth.example.com', 'Asia/Kolkata', '[1,2,3,4,5,6]'::jsonb, '{"start": "09:00", "end": "17:00"}'::jsonb, 30, 0, 60, TRUE)
+ON CONFLICT (doctor_id) DO NOTHING;
+
+-- 3. Doctor Leave & Unavailability
 CREATE TABLE IF NOT EXISTS doctor_unavailability (
     id SERIAL PRIMARY KEY,
     doctor_id VARCHAR(100) NOT NULL REFERENCES doctors(doctor_id) ON DELETE CASCADE,
@@ -26,6 +41,7 @@ CREATE TABLE IF NOT EXISTS doctor_unavailability (
     CONSTRAINT chk_unavail_range CHECK (end_time > start_time)
 );
 
+-- 4. Appointments Table
 CREATE TABLE IF NOT EXISTS appointments (
     appointment_id SERIAL PRIMARY KEY,
     customer_name VARCHAR(255) NOT NULL,
@@ -47,9 +63,11 @@ CREATE TABLE IF NOT EXISTS appointments (
     reminder_1h_claimed_at TIMESTAMPTZ,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    CONSTRAINT chk_appt_range CHECK (end_time > start_time)
+    CONSTRAINT chk_appt_range CHECK (end_time > start_time),
+    CONSTRAINT chk_appt_expires CHECK (status != 'PENDING' OR expires_at IS NOT NULL)
 );
 
+-- 5. Webhook Inbound Message Deduplication & Rate Limiting
 CREATE TABLE IF NOT EXISTS processed_messages (
     message_id VARCHAR(128) PRIMARY KEY,
     channel VARCHAR(50) NOT NULL DEFAULT 'whatsapp',
@@ -57,6 +75,7 @@ CREATE TABLE IF NOT EXISTS processed_messages (
     processed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+-- 6. Appointment State Audit Logging
 CREATE TABLE IF NOT EXISTS appointment_audit_logs (
     log_id SERIAL PRIMARY KEY,
     appointment_id INT REFERENCES appointments(appointment_id) ON DELETE SET NULL,
@@ -67,27 +86,124 @@ CREATE TABLE IF NOT EXISTS appointment_audit_logs (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Performance and Concurrency Indexes
+-- 7. Performance & Query Indexes
 CREATE INDEX IF NOT EXISTS idx_appointments_phone ON appointments(phone);
 CREATE INDEX IF NOT EXISTS idx_appointments_doc_time ON appointments(doctor_id, start_time, end_time);
 CREATE INDEX IF NOT EXISTS idx_appointments_status ON appointments(status);
+CREATE INDEX IF NOT EXISTS idx_appointments_pending_exp ON appointments(status, expires_at) WHERE status = 'PENDING';
+CREATE INDEX IF NOT EXISTS idx_appointments_cal_event ON appointments(calendar_event_id) WHERE calendar_event_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_doctor_unavail_doc_time ON doctor_unavailability(doctor_id, start_time, end_time);
 CREATE INDEX IF NOT EXISTS idx_processed_messages_sender_time ON processed_messages(sender, processed_at);
+CREATE INDEX IF NOT EXISTS idx_appointment_audit_appt ON appointment_audit_logs(appointment_id);
 
--- Slot Double-Booking Exclusion Constraint (Excludes CANCELLED/EXPIRED holds)
-DO $$
+-- 8. Authoritative Active Appointment Overlap Exclusion Constraint (Bug #1, #2)
+-- Excludes all active bookings. Expired pending holds are transitioned to EXPIRED so they do not block new bookings.
+DO 5926
 BEGIN
-    IF NOT EXISTS (
+    IF EXISTS (
         SELECT 1 FROM pg_constraint WHERE conname = 'no_overlapping_confirmed_appointments'
     ) THEN
+        ALTER TABLE appointments DROP CONSTRAINT no_overlapping_confirmed_appointments;
+    END IF;
+
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'no_overlapping_active_appointments'
+    ) THEN
         ALTER TABLE appointments 
-        ADD CONSTRAINT no_overlapping_confirmed_appointments 
+        ADD CONSTRAINT no_overlapping_active_appointments 
         EXCLUDE USING gist (
             doctor_id WITH =,
             tstzrange(start_time, end_time) WITH &&
-        ) WHERE (status IN ('CONFIRMED', 'RESCHEDULED', 'ARRIVED', 'COMPLETED') OR (status = 'PENDING' AND expires_at > NOW()));
+        ) WHERE (status IN ('PENDING', 'CONFIRMED', 'RESCHEDULED', 'ARRIVED', 'COMPLETED'));
     END IF;
-EXCEPTION
-    WHEN OTHERS THEN
-        RAISE NOTICE 'Exclusion constraint check completed.';
-END $$;
+END 5926;
+
+-- 9. Automatic Audit Logging Trigger (Bug #20, #21)
+CREATE OR REPLACE FUNCTION log_appointment_audit()
+RETURNS TRIGGER AS 5926
+DECLARE
+    v_actor VARCHAR(100);
+    v_action VARCHAR(50);
+BEGIN
+    v_actor := COALESCE(current_setting('app.current_actor', true), 'system');
+    
+    IF TG_OP = 'INSERT' THEN
+        v_action := 'CREATE_' || NEW.status;
+        INSERT INTO appointment_audit_logs (appointment_id, action, actor, previous_state, new_state, created_at)
+        VALUES (NEW.appointment_id, v_action, v_actor, NULL, to_jsonb(NEW), NOW());
+        RETURN NEW;
+    ELSIF TG_OP = 'UPDATE' THEN
+        IF OLD.status IS DISTINCT FROM NEW.status THEN
+            v_action := 'STATUS_' || OLD.status || '_TO_' || NEW.status;
+        ELSIF OLD.start_time IS DISTINCT FROM NEW.start_time OR OLD.end_time IS DISTINCT FROM NEW.end_time THEN
+            v_action := 'RESCHEDULED';
+        ELSE
+            v_action := 'UPDATE';
+        END IF;
+        INSERT INTO appointment_audit_logs (appointment_id, action, actor, previous_state, new_state, created_at)
+        VALUES (NEW.appointment_id, v_action, v_actor, to_jsonb(OLD), to_jsonb(NEW), NOW());
+        RETURN NEW;
+    ELSIF TG_OP = 'DELETE' THEN
+        INSERT INTO appointment_audit_logs (appointment_id, action, actor, previous_state, new_state, created_at)
+        VALUES (OLD.appointment_id, 'DELETE', v_actor, to_jsonb(OLD), NULL, NOW());
+        RETURN OLD;
+    END IF;
+    RETURN NULL;
+END;
+5926 LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_appointment_audit ON appointments;
+CREATE TRIGGER trg_appointment_audit
+AFTER INSERT OR UPDATE OR DELETE ON appointments
+FOR EACH ROW EXECUTE FUNCTION log_appointment_audit();
+
+-- 10. Automatic Updated At Timestamp Trigger
+CREATE OR REPLACE FUNCTION set_updated_at()
+RETURNS TRIGGER AS 5926
+BEGIN
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+5926 LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_appointments_updated_at ON appointments;
+CREATE TRIGGER trg_appointments_updated_at
+BEFORE UPDATE ON appointments
+FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- 11. Maintenance Helper Functions for Cleanup & Retention (Bug #10, #30, #60)
+CREATE OR REPLACE FUNCTION expire_stale_pending_appointments()
+RETURNS INT AS 5926
+DECLARE
+    v_count INT;
+BEGIN
+    UPDATE appointments
+    SET status = 'EXPIRED', updated_at = NOW()
+    WHERE status = 'PENDING' AND expires_at <= NOW();
+    GET DIAGNOSTICS v_count = ROW_COUNT;
+    RETURN v_count;
+END;
+5926 LANGUAGE plpgsql;
+
+-- 12. PostgreSQL vs Google Calendar Reconciliation View (Bug #8)
+CREATE OR REPLACE VIEW vw_appointment_reconciliation AS
+SELECT 
+    a.appointment_id,
+    a.customer_name,
+    a.phone,
+    a.doctor_id,
+    a.status,
+    a.start_time,
+    a.end_time,
+    a.calendar_event_id,
+    d.calendar_id,
+    d.doctor_name,
+    CASE 
+        WHEN a.status IN ('CONFIRMED', 'RESCHEDULED', 'ARRIVED', 'COMPLETED') AND (a.calendar_event_id IS NULL OR a.calendar_event_id = '') THEN 'MISSING_CALENDAR_EVENT'
+        WHEN a.status = 'CANCELLED' AND a.calendar_event_id IS NOT NULL AND a.calendar_event_id != '' THEN 'CANCELLED_WITH_ACTIVE_CALENDAR_ID'
+        WHEN a.status = 'PENDING' AND a.expires_at <= NOW() THEN 'STALE_PENDING_HOLD'
+        ELSE 'HEALTHY'
+    END AS sync_status,
+    a.updated_at
+FROM appointments a
+JOIN doctors d ON a.doctor_id = d.doctor_id;
