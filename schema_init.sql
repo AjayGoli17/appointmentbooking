@@ -845,23 +845,31 @@ BEGIN
             END IF;
 
         -- ── CANCELLED transition ──
-        -- Queue GCAL_DELETE only if there is a known Calendar event to delete.
-        ELSIF OLD.status != 'CANCELLED' AND NEW.status = 'CANCELLED'
-              AND OLD.calendar_event_id IS NOT NULL AND OLD.calendar_event_id != '' THEN
+        -- Always queue GCAL_DELETE. This supersedes any pending GCAL_CREATE.
+        -- If calendar_event_id is NULL, Calendar Worker will handle gracefully.
+        ELSIF OLD.status != 'CANCELLED' AND NEW.status = 'CANCELLED' THEN
             INSERT INTO integration_operations
                 (appointment_id, operation_type, status, payload, created_at, updated_at)
             VALUES
                 (NEW.appointment_id, 'GCAL_DELETE', 'PENDING', to_jsonb(NEW), NOW(), NOW());
 
         -- ── TIME CHANGED on active appointment ──
-        -- Queue GCAL_UPDATE if times changed and a Calendar event exists.
         ELSIF (OLD.start_time IS DISTINCT FROM NEW.start_time OR OLD.end_time IS DISTINCT FROM NEW.end_time)
-              AND NEW.status IN ('CONFIRMED', 'RESCHEDULED')
-              AND NEW.calendar_event_id IS NOT NULL AND NEW.calendar_event_id != '' THEN
-            INSERT INTO integration_operations
-                (appointment_id, operation_type, status, payload, created_at, updated_at)
-            VALUES
-                (NEW.appointment_id, 'GCAL_UPDATE', 'PENDING', to_jsonb(NEW), NOW(), NOW());
+              AND NEW.status IN ('CONFIRMED', 'RESCHEDULED') THEN
+            IF NEW.calendar_event_id IS NOT NULL AND NEW.calendar_event_id != '' THEN
+                INSERT INTO integration_operations
+                    (appointment_id, operation_type, status, payload, created_at, updated_at)
+                VALUES
+                    (NEW.appointment_id, 'GCAL_UPDATE', 'PENDING', to_jsonb(NEW), NOW(), NOW());
+            ELSE
+                -- Update pending GCAL_CREATE payload to new times
+                -- Avoid blindly creating GCAL_UPDATE before Calendar event exists
+                UPDATE integration_operations
+                SET payload = to_jsonb(NEW), updated_at = NOW()
+                WHERE appointment_id = NEW.appointment_id
+                  AND operation_type = 'GCAL_CREATE'
+                  AND status IN ('PENDING', 'FAILED');
+            END IF;
 
         END IF;
     END IF;
