@@ -394,34 +394,6 @@
       }
     },
     {
-      "id": "9736fa0d-a76c-4d09-b52e-8416b1435d2f",
-      "name": "GCal_Create_Manual_Event",
-      "type": "n8n-nodes-base.googleCalendar",
-      "typeVersion": 1.2,
-      "position": [
-        1460,
-        420
-      ],
-      "parameters": {
-        "operation": "create",
-        "calendar": {
-          "__rl": true,
-          "value": "={{ $json.calendar_id }}",
-          "mode": "id"
-        },
-        "start": "={{ $json.start_time_iso }}",
-        "end": "={{ $json.end_time_iso }}",
-        "summary": "={{ 'Appointment (Manual): ' + $json.customer_name + ' (' + $json.doctor_id + ')' }}",
-        "description": "={{ 'Patient Phone: ' + $json.phone + '\\nService: ' + $json.service + '\\nStatus: CONFIRMED' }}"
-      },
-      "credentials": {
-        "googleCalendarOAuth2": {
-          "id": "google_calendar_credentials_id",
-          "name": "Google Calendar Account"
-        }
-      }
-    },
-    {
       "id": "83207d51-c421-42cf-9f67-cace84d2e613",
       "name": "Postgres_Manual_Insert",
       "type": "n8n-nodes-base.postgres",
@@ -432,8 +404,8 @@
       ],
       "parameters": {
         "operation": "executeQuery",
-        "query": "\n    INSERT INTO appointments (customer_name, phone, doctor_id, service, start_time, end_time, status, calendar_event_id, created_at, updated_at)\n    VALUES ($1, $2, $3, $4, $5, $6, 'CONFIRMED', $7, NOW(), NOW())\n    RETURNING *;\n    ",
-        "queryParameters": "={{ [$('Calc_Manual_Times').item.json.customer_name, $('Calc_Manual_Times').item.json.phone, $('Calc_Manual_Times').item.json.doctor_id, $('Calc_Manual_Times').item.json.service, $('Calc_Manual_Times').item.json.start_time_iso, $('Calc_Manual_Times').item.json.end_time_iso, $json.id] }}"
+        "query": "\n    -- Set actor for audit trail (finding #58)\n    SELECT set_config('app.current_actor', 'system:dashboard', true);\n\n    INSERT INTO appointments (customer_name, phone, doctor_id, service, start_time, end_time, status, appointment_source, created_at, updated_at)\n    VALUES ($1, $2, $3, $4, $5, $6, 'CONFIRMED', 'DASHBOARD', NOW(), NOW())\n    RETURNING *;\n",
+        "queryParameters": "={{ [$json.customer_name, $json.phone, $json.doctor.doctor_id, $json.service, $json.start_time_iso, $json.end_time_iso] }}"
       },
       "credentials": {
         "postgres": {
@@ -469,7 +441,7 @@
       ],
       "parameters": {
         "operation": "executeQuery",
-        "query": "\nUPDATE appointments\nSET status = $1, updated_at = NOW()\nWHERE appointment_id = $2\n  AND (\n    ($1 = 'ARRIVED' AND status IN ('CONFIRMED', 'RESCHEDULED'))\n    OR ($1 = 'COMPLETED' AND status IN ('ARRIVED', 'CONFIRMED', 'RESCHEDULED'))\n    OR ($1 = 'NO_SHOW' AND status IN ('CONFIRMED', 'RESCHEDULED'))\n    OR ($1 = 'CANCELLED' AND status IN ('PENDING', 'CONFIRMED', 'RESCHEDULED'))\n  )\nRETURNING *;\n",
+        "query": "\n    -- Set actor for audit trail (finding #58)\n    SELECT set_config('app.current_actor', 'system:dashboard', true);\n\n    UPDATE appointments\nSET status = $1, updated_at = NOW()\nWHERE appointment_id = $2\n  AND (\n    ($1 = 'ARRIVED' AND status IN ('CONFIRMED', 'RESCHEDULED'))\n    OR ($1 = 'COMPLETED' AND status IN ('ARRIVED', 'CONFIRMED', 'RESCHEDULED'))\n    OR ($1 = 'NO_SHOW' AND status IN ('CONFIRMED', 'RESCHEDULED'))\n    OR ($1 = 'CANCELLED' AND status IN ('PENDING', 'CONFIRMED', 'RESCHEDULED'))\n  )\nRETURNING *;",
         "queryParameters": "={{ [$json.payload.status, $json.payload.appointment_id] }}"
       },
       "credentials": {
@@ -531,33 +503,6 @@
       }
     },
     {
-      "id": "26b6f692-b3c0-4a63-bc20-3c5e882191da",
-      "name": "GCal_Dashboard_Reschedule_Event",
-      "type": "n8n-nodes-base.googleCalendar",
-      "typeVersion": 1.2,
-      "position": [
-        1240,
-        740
-      ],
-      "parameters": {
-        "operation": "update",
-        "calendar": {
-          "__rl": true,
-          "value": "={{ $json.calendar_id }}",
-          "mode": "id"
-        },
-        "eventId": "={{ $json.calendar_event_id }}",
-        "start": "={{ $json.start_time_iso }}",
-        "end": "={{ $json.end_time_iso }}"
-      },
-      "credentials": {
-        "googleCalendarOAuth2": {
-          "id": "google_calendar_credentials_id",
-          "name": "Google Calendar Account"
-        }
-      }
-    },
-    {
       "id": "942043f9-0325-48c8-9e92-6b4bb5ad7de4",
       "name": "Postgres_Dashboard_Update_Resched",
       "type": "n8n-nodes-base.postgres",
@@ -568,7 +513,7 @@
       ],
       "parameters": {
         "operation": "executeQuery",
-        "query": "\n    UPDATE appointments\n    SET start_time = $1,\n        end_time = $2,\n        status = 'CONFIRMED',\n        updated_at = NOW(),\n        reminder_3d_sent = FALSE,\n        reminder_1d_sent = FALSE,\n        reminder_4h_sent = FALSE,\n        reminder_1h_sent = FALSE,\n        reminder_3d_claimed_at = NULL,\n        reminder_1d_claimed_at = NULL,\n        reminder_4h_claimed_at = NULL,\n        reminder_1h_claimed_at = NULL\n    WHERE appointment_id = $3\n      AND status = 'CONFIRMED'\n    RETURNING *;\n",
+        "query": "\n    -- Set actor for audit trail (finding #58)\n    SELECT set_config('app.current_actor', 'system:dashboard', true);\n\n    UPDATE appointments\n    SET start_time = $1,\n        end_time = $2,\n        status = 'CONFIRMED',\n        updated_at = NOW(),\n        reminder_3d_sent = FALSE,\n        reminder_1d_sent = FALSE,\n        reminder_4h_sent = FALSE,\n        reminder_1h_sent = FALSE,\n        reminder_3d_claimed_at = NULL,\n        reminder_1d_claimed_at = NULL,\n        reminder_4h_claimed_at = NULL,\n        reminder_1h_claimed_at = NULL\n    WHERE appointment_id = $3\n      AND status IN ('CONFIRMED', 'RESCHEDULED')\n    RETURNING *;\n",
         "queryParameters": "={{ [$('Prep_Dashboard_Reschedule').item.json.start_time_iso, $('Prep_Dashboard_Reschedule').item.json.end_time_iso, $('Prep_Dashboard_Reschedule').item.json.appointment_id] }}"
       },
       "credentials": {
@@ -617,32 +562,6 @@
       "continueOnFail": true
     },
     {
-      "id": "0917b2ed-9b5a-4829-aef3-ed22bfcf5fdd",
-      "name": "GCal_Dashboard_Delete_Cancel",
-      "type": "n8n-nodes-base.googleCalendar",
-      "typeVersion": 1.2,
-      "position": [
-        1020,
-        900
-      ],
-      "parameters": {
-        "operation": "delete",
-        "calendar": {
-          "__rl": true,
-          "value": "={{ $json.calendar_id }}",
-          "mode": "id"
-        },
-        "eventId": "={{ $json.calendar_event_id }}"
-      },
-      "credentials": {
-        "googleCalendarOAuth2": {
-          "id": "google_calendar_credentials_id",
-          "name": "Google Calendar Account"
-        }
-      },
-      "continueOnFail": true
-    },
-    {
       "id": "31ee0fc9-d46d-4826-994e-51fad4f52484",
       "name": "Postgres_Dashboard_Update_Cancel",
       "type": "n8n-nodes-base.postgres",
@@ -653,7 +572,7 @@
       ],
       "parameters": {
         "operation": "executeQuery",
-        "query": "\nUPDATE appointments\nSET status = 'CANCELLED',\n    calendar_event_id = NULL,\n    updated_at = NOW(),\n    reminder_3d_sent = TRUE,\n    reminder_1d_sent = TRUE,\n    reminder_4h_sent = TRUE,\n    reminder_1h_sent = TRUE\nWHERE appointment_id = $1\n  AND status IN ('PENDING', 'CONFIRMED', 'RESCHEDULED')\nRETURNING *;\n",
+        "query": "\n    -- Set actor for audit trail (finding #58)\n    SELECT set_config('app.current_actor', 'system:dashboard', true);\n\n    UPDATE appointments\n    SET status = 'CANCELLED',\n        updated_at = NOW(),\n        reminder_3d_sent = TRUE,\n        reminder_1d_sent = TRUE,\n        reminder_4h_sent = TRUE,\n        reminder_1h_sent = TRUE\n    WHERE appointment_id = $1\n      AND status IN ('PENDING', 'CONFIRMED', 'RESCHEDULED')\n    RETURNING *;\n",
         "queryParameters": "={{ [$('Postgres_Fetch_Appt_For_Cancel').item.json.appointment_id] }}"
       },
       "credentials": {
@@ -780,32 +699,6 @@
     },
     {
       "parameters": {
-        "operation": "delete",
-        "calendar": {
-          "__rl": true,
-          "value": "={{ $('Calc_Manual_Times').item.json.calendar_id }}",
-          "mode": "id"
-        },
-        "eventId": "={{ $('GCal_Create_Manual_Event').item.json.id }}"
-      },
-      "continueOnFail": true,
-      "id": "w3-gcal-rollback-manual",
-      "name": "GCal_Rollback_Manual_Event",
-      "type": "n8n-nodes-base.googleCalendar",
-      "typeVersion": 1.2,
-      "position": [
-        2100,
-        420
-      ],
-      "credentials": {
-        "googleCalendarOAuth2": {
-          "id": "google_calendar_credentials_id",
-          "name": "Google Calendar account"
-        }
-      }
-    },
-    {
-      "parameters": {
         "respondWith": "json",
         "responseBody": "={{ JSON.stringify({ success: false, error: 'Database insert failed. Calendar event has been rolled back.' }) }}",
         "options": {
@@ -820,34 +713,6 @@
         2300,
         420
       ]
-    },
-    {
-      "id": "w3-rollback-dashboard-resched",
-      "name": "GCal_Rollback_Dashboard_Resched",
-      "type": "n8n-nodes-base.googleCalendar",
-      "typeVersion": 1.2,
-      "position": [
-        1350,
-        480
-      ],
-      "parameters": {
-        "operation": "update",
-        "calendar": {
-          "__rl": true,
-          "value": "={{ $('Prep_Dashboard_Reschedule').item.json.calendar_id }}",
-          "mode": "id"
-        },
-        "eventId": "={{ $('Prep_Dashboard_Reschedule').item.json.calendar_event_id }}",
-        "start": "={{ $('Prep_Dashboard_Reschedule').item.json.old_start_iso }}",
-        "end": "={{ $('Prep_Dashboard_Reschedule').item.json.old_end_iso }}"
-      },
-      "credentials": {
-        "googleCalendarOAuth2": {
-          "id": "google_calendar_credentials",
-          "name": "Google Calendar account"
-        }
-      },
-      "continueOnFail": true
     },
     {
       "id": "w3-if-resched-db-success",
@@ -895,53 +760,6 @@
           "responseCode": 500
         }
       }
-    },
-    {
-      "parameters": {
-        "conditions": {
-          "options": {
-            "caseSensitive": true,
-            "leftValue": "",
-            "typeValidation": "strict"
-          },
-          "conditions": [
-            {
-              "leftValue": "={{ Boolean(!$json.error) }}",
-              "rightValue": true,
-              "operator": {
-                "type": "boolean",
-                "operation": "equals"
-              }
-            }
-          ],
-          "combinator": "and"
-        }
-      },
-      "id": "w3-if-cancel-gcal-success",
-      "name": "If_Dashboard_Cancel_GCal_Success",
-      "type": "n8n-nodes-base.if",
-      "typeVersion": 2,
-      "position": [
-        1140,
-        900
-      ]
-    },
-    {
-      "parameters": {
-        "respondWith": "json",
-        "responseBody": "={{ JSON.stringify({ success: false, error: 'Google Calendar event deletion failed. Database cancellation aborted to prevent system desynchronization.', calendar_error: $json.error || 'Unknown calendar error' }) }}",
-        "options": {
-          "responseCode": 502
-        }
-      },
-      "id": "w3-respond-cancel-failed",
-      "name": "Respond_Dashboard_Cancel_Failed_JSON",
-      "type": "n8n-nodes-base.respondToWebhook",
-      "typeVersion": 1.1,
-      "position": [
-        1360,
-        1040
-      ]
     },
     {
       "parameters": {
@@ -1026,96 +844,6 @@
     },
     {
       "parameters": {
-        "operation": "getAll",
-        "calendar": {
-          "__rl": true,
-          "value": "={{ $json.calendar_id }}",
-          "mode": "id"
-        },
-        "options": {
-          "timeMin": "={{ $json.gcal_time_min }}",
-          "timeMax": "={{ $json.gcal_time_max }}"
-        }
-      },
-      "id": "gcal-check-manual-1",
-      "name": "GCal_Check_Manual_Slot",
-      "type": "n8n-nodes-base.googleCalendar",
-      "typeVersion": 1.2,
-      "position": [
-        1340,
-        160
-      ],
-      "continueOnFail": true,
-      "credentials": {
-        "googleCalendarOAuth2": {
-          "id": "GCAL_CREDENTIALS_ID",
-          "name": "Google Calendar"
-        }
-      }
-    },
-    {
-      "parameters": {
-        "language": "javascript",
-        "jsCode": "\nconst prev = $('Calc_Manual_Times').first().json;\nconst allInputs = $input.all();\n\nconst gcalError = allInputs.some(i => i.json?.error || i.error);\nif (gcalError) {\n  return [{ json: { ...prev, is_gcal_free: false, gcal_error: true, error: \"Calendar check service unavailable\" } }];\n}\n\nconst gcalItems = allInputs.map(i => i.json).filter(j => j && (j.id || j.start));\nconst reqStart = new Date(prev.start_time_iso);\nconst reqEnd = new Date(prev.end_time_iso);\nconst bufferMin = prev.buffer_minutes || 0;\n\nlet isFree = true;\nfor (const ev of gcalItems) {\n  const evStartStr = ev.start?.dateTime || ev.start?.date;\n  const evEndStr = ev.end?.dateTime || ev.end?.date;\n  if (!evStartStr || !evEndStr) continue;\n  const evStart = new Date(evStartStr);\n  const evEnd = new Date(evEndStr);\n  const evStartBuffered = new Date(evStart.getTime() - bufferMin * 60000);\n  const evEndBuffered = new Date(evEnd.getTime() + bufferMin * 60000);\n  if (reqStart < evEndBuffered && reqEnd > evStartBuffered) {\n    isFree = false;\n    break;\n  }\n}\n\nreturn [{ json: { ...prev, is_gcal_free: isFree, gcal_error: false } }];\n"
-      },
-      "id": "verify-manual-gcal-1",
-      "name": "Verify_Manual_GCal_Slot",
-      "type": "n8n-nodes-base.code",
-      "typeVersion": 2,
-      "position": [
-        1560,
-        160
-      ]
-    },
-    {
-      "parameters": {
-        "conditions": {
-          "options": {
-            "caseSensitive": true,
-            "leftValue": "",
-            "typeValidation": "strict"
-          },
-          "conditions": [
-            {
-              "leftValue": "={{ Boolean($json.is_gcal_free) }}",
-              "rightValue": true,
-              "operator": {
-                "type": "boolean",
-                "operation": "equals"
-              }
-            }
-          ],
-          "combinator": "and"
-        }
-      },
-      "id": "if-manual-gcal-free-1",
-      "name": "If_Manual_GCal_Slot_Free",
-      "type": "n8n-nodes-base.if",
-      "typeVersion": 2.2,
-      "position": [
-        1780,
-        160
-      ]
-    },
-    {
-      "parameters": {
-        "respondWith": "json",
-        "responseBody": "={{ JSON.stringify({ success: false, error: 'Google Calendar time slot is already occupied or conflicts with buffer window.' }) }}",
-        "options": {
-          "responseCode": 409
-        }
-      },
-      "id": "resp-manual-conflict-1",
-      "name": "Respond_Manual_GCal_Conflict_JSON",
-      "type": "n8n-nodes-base.respondToWebhook",
-      "typeVersion": 1.1,
-      "position": [
-        2000,
-        280
-      ]
-    },
-    {
-      "parameters": {
         "conditions": {
           "options": {
             "caseSensitive": true,
@@ -1159,96 +887,6 @@
       "position": [
         1340,
         620
-      ]
-    },
-    {
-      "parameters": {
-        "operation": "getAll",
-        "calendar": {
-          "__rl": true,
-          "value": "={{ $json.calendar_id }}",
-          "mode": "id"
-        },
-        "options": {
-          "timeMin": "={{ $json.gcal_time_min }}",
-          "timeMax": "={{ $json.gcal_time_max }}"
-        }
-      },
-      "id": "gcal-check-resched-1",
-      "name": "GCal_Check_Dashboard_Resched_Slot",
-      "type": "n8n-nodes-base.googleCalendar",
-      "typeVersion": 1.2,
-      "position": [
-        1340,
-        460
-      ],
-      "continueOnFail": true,
-      "credentials": {
-        "googleCalendarOAuth2": {
-          "id": "GCAL_CREDENTIALS_ID",
-          "name": "Google Calendar"
-        }
-      }
-    },
-    {
-      "parameters": {
-        "language": "javascript",
-        "jsCode": "\nconst prev = $('Prep_Dashboard_Reschedule').first().json;\nconst allInputs = $input.all();\n\nconst gcalError = allInputs.some(i => i.json?.error || i.error);\nif (gcalError) {\n  return [{ json: { ...prev, is_gcal_free: false, gcal_error: true, error: \"Calendar check service unavailable\" } }];\n}\n\nconst gcalItems = allInputs.map(i => i.json).filter(j => j && (j.id || j.start));\nconst reqStart = new Date(prev.start_time_iso);\nconst reqEnd = new Date(prev.end_time_iso);\nconst bufferMin = prev.buffer_minutes || 0;\n\nlet isFree = true;\nfor (const ev of gcalItems) {\n  if (prev.calendar_event_id && ev.id === prev.calendar_event_id) continue;\n  const evStartStr = ev.start?.dateTime || ev.start?.date;\n  const evEndStr = ev.end?.dateTime || ev.end?.date;\n  if (!evStartStr || !evEndStr) continue;\n  const evStart = new Date(evStartStr);\n  const evEnd = new Date(evEndStr);\n  const evStartBuffered = new Date(evStart.getTime() - bufferMin * 60000);\n  const evEndBuffered = new Date(evEnd.getTime() + bufferMin * 60000);\n  if (reqStart < evEndBuffered && reqEnd > evStartBuffered) {\n    isFree = false;\n    break;\n  }\n}\n\nreturn [{ json: { ...prev, is_gcal_free: isFree, gcal_error: false } }];\n"
-      },
-      "id": "verify-resched-gcal-1",
-      "name": "Verify_Dashboard_Resched_GCal_Slot",
-      "type": "n8n-nodes-base.code",
-      "typeVersion": 2,
-      "position": [
-        1560,
-        460
-      ]
-    },
-    {
-      "parameters": {
-        "conditions": {
-          "options": {
-            "caseSensitive": true,
-            "leftValue": "",
-            "typeValidation": "strict"
-          },
-          "conditions": [
-            {
-              "leftValue": "={{ Boolean($json.is_gcal_free) }}",
-              "rightValue": true,
-              "operator": {
-                "type": "boolean",
-                "operation": "equals"
-              }
-            }
-          ],
-          "combinator": "and"
-        }
-      },
-      "id": "if-resched-gcal-free-1",
-      "name": "If_Dashboard_Resched_GCal_Slot_Free",
-      "type": "n8n-nodes-base.if",
-      "typeVersion": 2.2,
-      "position": [
-        1780,
-        460
-      ]
-    },
-    {
-      "parameters": {
-        "respondWith": "json",
-        "responseBody": "={{ JSON.stringify({ success: false, error: 'Google Calendar slot is already booked on the doctor calendar.' }) }}",
-        "options": {
-          "responseCode": 409
-        }
-      },
-      "id": "resp-resched-conflict-1",
-      "name": "Respond_Dashboard_Resched_GCal_Conflict_JSON",
-      "type": "n8n-nodes-base.respondToWebhook",
-      "typeVersion": 1.1,
-      "position": [
-        2000,
-        580
       ]
     }
   ],
@@ -1426,17 +1064,6 @@
         ]
       ]
     },
-    "GCal_Create_Manual_Event": {
-      "main": [
-        [
-          {
-            "node": "Postgres_Manual_Insert",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
     "Postgres_Manual_Insert": {
       "main": [
         [
@@ -1481,17 +1108,6 @@
         ]
       ]
     },
-    "GCal_Dashboard_Reschedule_Event": {
-      "main": [
-        [
-          {
-            "node": "Postgres_Dashboard_Update_Resched",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
     "Postgres_Dashboard_Update_Resched": {
       "main": [
         [
@@ -1507,18 +1123,7 @@
       "main": [
         [
           {
-            "node": "GCal_Dashboard_Delete_Cancel",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "GCal_Dashboard_Delete_Cancel": {
-      "main": [
-        [
-          {
-            "node": "If_Dashboard_Cancel_GCal_Success",
+            "node": "Postgres_Dashboard_Update_Cancel",
             "type": "main",
             "index": 0
           }
@@ -1558,17 +1163,6 @@
         ],
         [
           {
-            "node": "GCal_Rollback_Manual_Event",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "GCal_Rollback_Manual_Event": {
-      "main": [
-        [
-          {
             "node": "Respond_Manual_Create_Failed_JSON",
             "type": "main",
             "index": 0
@@ -1587,36 +1181,7 @@
         ],
         [
           {
-            "node": "GCal_Rollback_Dashboard_Resched",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "GCal_Rollback_Dashboard_Resched": {
-      "main": [
-        [
-          {
             "node": "Respond_Dashboard_Resched_Failed_JSON",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "If_Dashboard_Cancel_GCal_Success": {
-      "main": [
-        [
-          {
-            "node": "Postgres_Dashboard_Update_Cancel",
-            "type": "main",
-            "index": 0
-          }
-        ],
-        [
-          {
-            "node": "Respond_Dashboard_Cancel_Failed_JSON",
             "type": "main",
             "index": 0
           }
@@ -1638,7 +1203,7 @@
       "main": [
         [
           {
-            "node": "GCal_Check_Manual_Slot",
+            "node": "Postgres_Manual_Insert",
             "type": "main",
             "index": 0
           }
@@ -1652,51 +1217,11 @@
         ]
       ]
     },
-    "GCal_Check_Manual_Slot": {
-      "main": [
-        [
-          {
-            "node": "Verify_Manual_GCal_Slot",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Verify_Manual_GCal_Slot": {
-      "main": [
-        [
-          {
-            "node": "If_Manual_GCal_Slot_Free",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "If_Manual_GCal_Slot_Free": {
-      "main": [
-        [
-          {
-            "node": "GCal_Create_Manual_Event",
-            "type": "main",
-            "index": 0
-          }
-        ],
-        [
-          {
-            "node": "Respond_Manual_GCal_Conflict_JSON",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
     "If_Dashboard_Resched_Validation_Passed": {
       "main": [
         [
           {
-            "node": "GCal_Check_Dashboard_Resched_Slot",
+            "node": "Postgres_Dashboard_Update_Resched",
             "type": "main",
             "index": 0
           }
@@ -1709,53 +1234,13 @@
           }
         ]
       ]
-    },
-    "GCal_Check_Dashboard_Resched_Slot": {
-      "main": [
-        [
-          {
-            "node": "Verify_Dashboard_Resched_GCal_Slot",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Verify_Dashboard_Resched_GCal_Slot": {
-      "main": [
-        [
-          {
-            "node": "If_Dashboard_Resched_GCal_Slot_Free",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "If_Dashboard_Resched_GCal_Slot_Free": {
-      "main": [
-        [
-          {
-            "node": "GCal_Dashboard_Reschedule_Event",
-            "type": "main",
-            "index": 0
-          }
-        ],
-        [
-          {
-            "node": "Respond_Dashboard_Resched_GCal_Conflict_JSON",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
     }
   },
   "active": false,
   "settings": {
     "executionOrder": "v1"
   },
-  "versionId": "5eb95377-ae6b-45f9-8fff-cfbd69ba05ff",
+  "versionId": "03-dashboard-v2-prompt1",
   "meta": {
     "templateCredsSetupCompleted": false,
     "instanceId": "03_Reception_Dashboard"

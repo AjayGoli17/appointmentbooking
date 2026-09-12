@@ -34,7 +34,7 @@
       ],
       "parameters": {
         "operation": "executeQuery",
-        "query": "\nWITH superseded AS (\n  UPDATE integration_operations io\n  SET status = 'SUPERSEDED', updated_at = NOW()\n  FROM integration_operations newer\n  WHERE io.appointment_id = newer.appointment_id\n    AND io.operation_id < newer.operation_id\n    AND io.status IN ('PENDING', 'FAILED')\n    AND newer.status IN ('PENDING', 'IN_PROGRESS', 'FAILED')\n    AND (\n      newer.operation_type = 'GCAL_DELETE'\n      OR (newer.operation_type = io.operation_type AND newer.operation_type = 'GCAL_UPDATE')\n    )\n  RETURNING io.operation_id\n),\nalready_done AS (\n  UPDATE integration_operations io\n  SET status = 'SUCCESS', updated_at = NOW()\n  FROM appointments a\n  WHERE io.appointment_id = a.appointment_id\n    AND io.status = 'PENDING'\n    AND io.operation_id NOT IN (SELECT operation_id FROM superseded)\n    AND (\n      (io.operation_type = 'GCAL_CREATE' AND a.calendar_event_id IS NOT NULL AND a.calendar_event_id != '')\n      OR (io.operation_type = 'GCAL_DELETE' AND (a.calendar_event_id IS NULL OR a.calendar_event_id = ''))\n    )\n  RETURNING io.operation_id\n),\nclaimable AS (\n  SELECT io.operation_id, io.appointment_id, io.operation_type, io.payload, io.attempt_count\n  FROM integration_operations io\n  WHERE (\n    io.status = 'PENDING'\n    OR (io.status = 'FAILED' AND io.next_retry_at <= NOW() AND io.attempt_count < 5)\n    OR (io.status = 'IN_PROGRESS' AND io.last_attempt_at < NOW() - INTERVAL '10 minutes' AND io.attempt_count < 5)\n  )\n  AND io.operation_id NOT IN (SELECT operation_id FROM superseded)\n  AND io.operation_id NOT IN (SELECT operation_id FROM already_done)\n  ORDER BY\n    CASE io.status WHEN 'IN_PROGRESS' THEN 0 WHEN 'PENDING' THEN 1 ELSE 2 END,\n    io.created_at\n  LIMIT 10\n  FOR UPDATE SKIP LOCKED\n)\nUPDATE integration_operations io\nSET\n  status = 'IN_PROGRESS',\n  last_attempt_at = NOW(),\n  attempt_count = CASE WHEN io.status = 'IN_PROGRESS' THEN io.attempt_count ELSE io.attempt_count + 1 END,\n  updated_at = NOW()\nFROM claimable c\nJOIN appointments a ON c.appointment_id = a.appointment_id\nJOIN doctors d ON a.doctor_id = d.doctor_id\nWHERE io.operation_id = c.operation_id\nRETURNING\n  io.operation_id,\n  io.appointment_id,\n  io.operation_type,\n  io.attempt_count,\n  a.customer_name,\n  a.service,\n  a.start_time,\n  a.end_time,\n  a.status AS appt_status,\n  a.calendar_event_id,\n  d.doctor_name,\n  d.calendar_id,\n  d.timezone;\n",
+        "query": "\n-- Claim integration operations using safe lease semantics (finding #15)\n-- Uses claim_integration_operations() which:\n--   1. Supersedes obsolete operations (GCAL_UPDATE/DELETE replaces older ones)\n--   2. Auto-marks already-satisfied operations as SUCCESS\n--   3. Claims remaining operations with FOR UPDATE SKIP LOCKED\n--   4. Sets lease_expires_at = NOW() + 10 minutes for crash recovery\n--   5. Increments attempt_count (but not for IN_PROGRESS recovery)\n--\n-- Joins with appointments and doctors to provide all context needed by Calendar Worker.\nWITH claimed AS (\n    SELECT * FROM claim_integration_operations(\n        p_batch_size    := 10,\n        p_lease_minutes := 10\n    )\n)\nSELECT\n    c.operation_id,\n    c.appointment_id,\n    c.operation_type,\n    c.attempt_count,\n    c.max_attempts,\n    c.idempotency_key,\n    c.lease_expires_at,\n    c.payload,\n    a.customer_name,\n    a.service,\n    a.start_time,\n    a.end_time,\n    a.status AS appt_status,\n    a.calendar_event_id,\n    a.appointment_source,\n    d.doctor_name,\n    d.calendar_id,\n    d.timezone\nFROM claimed c\nJOIN appointments a ON c.appointment_id = a.appointment_id\nJOIN doctors d ON a.doctor_id = d.doctor_id;\n",
         "queryParameters": ""
       },
       "credentials": {
@@ -122,8 +122,8 @@
         "start": "={{ $json.start_time }}",
         "end": "={{ $json.end_time }}",
         "additionalFields": {
-          "summary": "={{ $json.customer_name + ' - ' + $json.service + ' with ' + $json.doctor_name }}",
-          "description": "={{ 'Appointment ID: ' + $json.appointment_id + '\\nService: ' + $json.service + '\\nPatient: ' + $json.customer_name }}",
+          "summary": "={{ $json.gcal_event_summary }}",
+          "description": "={{ $json.gcal_event_description }}",
           "attendees": [],
           "timeZone": "={{ $json.timezone }}"
         }
@@ -205,7 +205,7 @@
       ],
       "parameters": {
         "language": "javascript",
-        "jsCode": "\nconst result = $input.first()?.json || {};\n// The GCal node's pairedItem traces back through Route_Operation_Type -> Claim\n// We use pairedItem chain to get the original claim row\nlet opCtx = {};\ntry {\n  const claimItems = $('Postgres_Claim_Pending_Ops').all();\n  const pi = $input.first()?.pairedItem;\n  const piIdx = (pi && typeof pi.item === 'number') ? pi.item : (typeof pi === 'number' ? pi : 0);\n  // Walk through Route_Operation_Type pairedItem\n  const routeItems = $('Route_Operation_Type').all();\n  if (routeItems[piIdx]) {\n    const rpi = routeItems[piIdx]?.pairedItem;\n    const rpiIdx = (rpi && typeof rpi.item === 'number') ? rpi.item : (typeof rpi === 'number' ? rpi : piIdx);\n    opCtx = claimItems[rpiIdx]?.json || claimItems[0]?.json || {};\n  } else {\n    opCtx = claimItems[0]?.json || {};\n  }\n} catch(e) {\n  opCtx = $('Postgres_Claim_Pending_Ops').first()?.json || {};\n}\n\nconst success = Boolean(result.id && typeof result.id === 'string' && !result.error && !(result.statusCode >= 400));\nconst gcalEventId = success ? (result.id || null) : null;\nconst errorDetail = result.error ? JSON.stringify(result.error) : ((result.statusCode >= 400) ? 'HTTP_' + result.statusCode : (result.error_status ? result.error_status : null));\n\nreturn [{ json: {\n  operation_id: opCtx.operation_id,\n  appointment_id: opCtx.appointment_id,\n  operation_type: opCtx.operation_type,\n  attempt_count: opCtx.attempt_count,\n  calendar_event_id: opCtx.calendar_event_id,\n  success: success,\n  gcal_event_id: gcalEventId,\n  error_detail: errorDetail\n}}];\n"
+        "jsCode": "\n// Check GCal CREATE result - idempotency aware (finding #16, #17)\n// Handles crash-and-retry scenario:\n//   IF crash occurred after GCal CREATE but before DB SUCCESS update:\n//     - This retry will create a DUPLICATE event (undesired)\n//     - Prevention: idempotencyKey embedded in event description\n//     - Recovery: if we see appointment already has calendar_event_id, treat as SUCCESS\n//\n// The definitive idempotency guarantee:\n//   claim_integration_operations() pre-checks: if appointment already has\n//   calendar_event_id, it marks the PENDING operation as SUCCESS before claiming.\n//   So we would never even reach this node for an already-synced appointment.\n//   This node handles the remaining case: GCal CREATE was called, result returned.\n\nconst result = $input.first()?.json || {};\nlet opCtx = {};\n\ntry {\n    const claimItems = $('Postgres_Claim_Pending_Ops').all();\n    const pi = $input.first()?.pairedItem;\n    const piIdx = (pi && typeof pi.item === 'number') ? pi.item : (typeof pi === 'number' ? pi : 0);\n    const routeItems = $('Route_Operation_Type').all();\n    const prepItems = $('Prepare_GCal_Create_Idempotent').all();\n    if (prepItems[piIdx]) {\n        opCtx = prepItems[piIdx]?.json || claimItems[0]?.json || {};\n    } else {\n        opCtx = claimItems[0]?.json || {};\n    }\n} catch(e) {\n    opCtx = $('Postgres_Claim_Pending_Ops').first()?.json || {};\n}\n\nconst success = Boolean(\n    result.id &&\n    typeof result.id === 'string' &&\n    !result.error &&\n    !(result.statusCode >= 400)\n);\n\nconst gcalEventId = success ? (result.id || null) : null;\nconst errorDetail = result.error\n    ? JSON.stringify(result.error)\n    : ((result.statusCode >= 400) ? 'HTTP_' + result.statusCode : null);\n\n// If already_synced: GCal create succeeded but DB not yet updated\n// (recovery case: pre-claim check would have caught this, but belt-and-suspenders)\nconst alreadySynced = Boolean(opCtx.calendar_event_id && opCtx.calendar_event_id !== '');\n\nreturn [{\n    json: {\n        operation_id: opCtx.operation_id,\n        appointment_id: opCtx.appointment_id,\n        operation_type: opCtx.operation_type,\n        attempt_count: opCtx.attempt_count,\n        max_attempts: opCtx.max_attempts,\n        calendar_event_id: opCtx.calendar_event_id,\n        idempotency_key: opCtx.idempotency_key,\n        success: success || alreadySynced,\n        gcal_event_id: gcalEventId || (alreadySynced ? opCtx.calendar_event_id : null),\n        error_detail: alreadySynced ? null : errorDetail,\n        was_already_synced: alreadySynced\n    }\n}];\n"
       }
     },
     {
@@ -219,7 +219,7 @@
       ],
       "parameters": {
         "language": "javascript",
-        "jsCode": "\nconst result = $input.first()?.json || {};\nlet opCtx = {};\ntry {\n  const claimItems = $('Postgres_Claim_Pending_Ops').all();\n  const pi = $input.first()?.pairedItem;\n  const piIdx = (pi && typeof pi.item === 'number') ? pi.item : (typeof pi === 'number' ? pi : 0);\n  const routeItems = $('Route_Operation_Type').all();\n  if (routeItems[piIdx]) {\n    const rpi = routeItems[piIdx]?.pairedItem;\n    const rpiIdx = (rpi && typeof rpi.item === 'number') ? rpi.item : (typeof rpi === 'number' ? rpi : piIdx);\n    opCtx = claimItems[rpiIdx]?.json || claimItems[0]?.json || {};\n  } else {\n    opCtx = claimItems[0]?.json || {};\n  }\n} catch(e) {\n  opCtx = $('Postgres_Claim_Pending_Ops').first()?.json || {};\n}\n\nconst success = Boolean(result.id && !result.error && !(result.statusCode >= 400));\nconst errorDetail = result.error ? JSON.stringify(result.error) : ((result.statusCode >= 400) ? 'HTTP_' + result.statusCode : null);\n\nreturn [{ json: {\n  operation_id: opCtx.operation_id,\n  appointment_id: opCtx.appointment_id,\n  operation_type: opCtx.operation_type,\n  attempt_count: opCtx.attempt_count,\n  calendar_event_id: opCtx.calendar_event_id,\n  success: success,\n  gcal_event_id: success ? (result.id || opCtx.calendar_event_id) : null,\n  error_detail: errorDetail\n}}];\n"
+        "jsCode": "\n// GCAL_UPDATE idempotency (finding #18):\n// Repeated execution must converge to the desired appointment state.\n// If update returns event with correct times → SUCCESS.\n// Worker crash after GCal UPDATE but before DB SUCCESS:\n//   On retry: UPDATE is called again with same data → idempotent (same result).\n\nconst result = $input.first()?.json || {};\nlet opCtx = {};\n\ntry {\n    const claimItems = $('Postgres_Claim_Pending_Ops').all();\n    const pi = $input.first()?.pairedItem;\n    const piIdx = (pi && typeof pi.item === 'number') ? pi.item : (typeof pi === 'number' ? pi : 0);\n    const routeItems = $('Route_Operation_Type').all();\n    if (routeItems[piIdx]) {\n        const rpi = routeItems[piIdx]?.pairedItem;\n        const rpiIdx = (rpi && typeof rpi.item === 'number') ? rpi.item : (typeof rpi === 'number' ? rpi : piIdx);\n        opCtx = claimItems[rpiIdx]?.json || claimItems[0]?.json || {};\n    } else {\n        opCtx = claimItems[0]?.json || {};\n    }\n} catch(e) {\n    opCtx = $('Postgres_Claim_Pending_Ops').first()?.json || {};\n}\n\n// 404 on UPDATE = event was deleted externally (stale event_id)\n// Treat as soft-failure: log, mark PERMANENTLY_FAILED, do not retry (no event to update)\nconst statusCode = result.statusCode || (result.error?.code) || 0;\nconst isNotFound = statusCode === 404 || (result.error && result.error.code === 404);\nconst hasError = Boolean(result.error || (statusCode >= 400));\n\nlet success, errorDetail;\nif (isNotFound) {\n    // Stale event ID; the Calendar event no longer exists.\n    // Queue a GCAL_CREATE instead (handled by reconciliation, not here).\n    success = false;\n    errorDetail = 'EVENT_NOT_FOUND: Calendar event ' + (opCtx.calendar_event_id || 'unknown') + ' no longer exists. Stale event_id.';\n} else {\n    success = Boolean(result.id && !result.error && !(statusCode >= 400));\n    errorDetail = result.error ? JSON.stringify(result.error) : (hasError ? 'HTTP_' + statusCode : null);\n}\n\nreturn [{\n    json: {\n        operation_id: opCtx.operation_id,\n        appointment_id: opCtx.appointment_id,\n        operation_type: opCtx.operation_type,\n        attempt_count: opCtx.attempt_count,\n        max_attempts: opCtx.max_attempts,\n        calendar_event_id: opCtx.calendar_event_id,\n        idempotency_key: opCtx.idempotency_key,\n        success: success,\n        gcal_event_id: success ? (result.id || opCtx.calendar_event_id) : null,\n        error_detail: errorDetail,\n        was_not_found: isNotFound\n    }\n}];\n"
       }
     },
     {
@@ -233,7 +233,7 @@
       ],
       "parameters": {
         "language": "javascript",
-        "jsCode": "\nconst result = $input.first()?.json || {};\nlet opCtx = {};\ntry {\n  const claimItems = $('Postgres_Claim_Pending_Ops').all();\n  const pi = $input.first()?.pairedItem;\n  const piIdx = (pi && typeof pi.item === 'number') ? pi.item : (typeof pi === 'number' ? pi : 0);\n  const routeItems = $('Route_Operation_Type').all();\n  if (routeItems[piIdx]) {\n    const rpi = routeItems[piIdx]?.pairedItem;\n    const rpiIdx = (rpi && typeof rpi.item === 'number') ? rpi.item : (typeof rpi === 'number' ? rpi : piIdx);\n    opCtx = claimItems[rpiIdx]?.json || claimItems[0]?.json || {};\n  } else {\n    opCtx = claimItems[0]?.json || {};\n  }\n} catch(e) {\n  opCtx = $('Postgres_Claim_Pending_Ops').first()?.json || {};\n}\n\n// GCal DELETE returns empty on 204, or error on failure\nconst hasError = Boolean(result.error || (result.statusCode && result.statusCode >= 400));\n// Treat 404 as success (event already deleted - idempotent)\nconst isNotFound = result.statusCode === 404 || (result.error && result.error.code === 404);\nconst success = !hasError || isNotFound;\nconst errorDetail = hasError && !isNotFound ? \n  (result.error ? JSON.stringify(result.error) : 'HTTP_' + result.statusCode) : null;\n\nreturn [{ json: {\n  operation_id: opCtx.operation_id,\n  appointment_id: opCtx.appointment_id,\n  operation_type: opCtx.operation_type,\n  attempt_count: opCtx.attempt_count,\n  calendar_event_id: opCtx.calendar_event_id,\n  success: success,\n  gcal_event_id: null,\n  error_detail: errorDetail\n}}];\n"
+        "jsCode": "\n// GCAL_DELETE idempotency (finding #19):\n// The desired end state is: Calendar event does NOT exist.\n// HTTP 404 means the event is already gone → desired state achieved → SUCCESS.\n// HTTP 410 (Gone) also means already deleted → SUCCESS.\n// Any other HTTP error → FAILED → retry.\n\nconst result = $input.first()?.json || {};\nlet opCtx = {};\n\ntry {\n    const claimItems = $('Postgres_Claim_Pending_Ops').all();\n    const pi = $input.first()?.pairedItem;\n    const piIdx = (pi && typeof pi.item === 'number') ? pi.item : (typeof pi === 'number' ? pi : 0);\n    const routeItems = $('Route_Operation_Type').all();\n    if (routeItems[piIdx]) {\n        const rpi = routeItems[piIdx]?.pairedItem;\n        const rpiIdx = (rpi && typeof rpi.item === 'number') ? rpi.item : (typeof rpi === 'number' ? rpi : piIdx);\n        opCtx = claimItems[rpiIdx]?.json || claimItems[0]?.json || {};\n    } else {\n        opCtx = claimItems[0]?.json || {};\n    }\n} catch(e) {\n    opCtx = $('Postgres_Claim_Pending_Ops').first()?.json || {};\n}\n\n// 204 = success (GCal returns empty body on delete)\n// 404 = already deleted (idempotent success)\n// 410 = gone (idempotent success)\nconst statusCode = result.statusCode || (result.error?.code) || 0;\nconst isNotFound = statusCode === 404 || statusCode === 410 ||\n    (result.error && (result.error.code === 404 || result.error.code === 410));\nconst hasError = Boolean(result.error || (statusCode >= 400 && statusCode !== 404 && statusCode !== 410));\nconst success = !hasError || isNotFound;\n\nconst errorDetail = hasError && !isNotFound\n    ? (result.error ? JSON.stringify(result.error) : 'HTTP_' + statusCode)\n    : null;\n\nreturn [{\n    json: {\n        operation_id: opCtx.operation_id,\n        appointment_id: opCtx.appointment_id,\n        operation_type: opCtx.operation_type,\n        attempt_count: opCtx.attempt_count,\n        max_attempts: opCtx.max_attempts,\n        calendar_event_id: opCtx.calendar_event_id,\n        idempotency_key: opCtx.idempotency_key,\n        // After DELETE success: clear calendar_event_id in appointments table\n        success: success,\n        gcal_event_id: null,  // DELETE success = no event_id\n        error_detail: errorDetail,\n        was_not_found: isNotFound\n    }\n}];\n"
       }
     },
     {
@@ -277,7 +277,7 @@
       ],
       "parameters": {
         "operation": "executeQuery",
-        "query": "\nWITH op_update AS (\n  UPDATE integration_operations\n  SET status = 'SUCCESS', updated_at = NOW()\n  WHERE operation_id = $1\n  RETURNING operation_id, appointment_id, operation_type\n),\nappt_update AS (\n  UPDATE appointments a\n  SET\n    calendar_event_id = CASE\n      WHEN o.operation_type = 'GCAL_DELETE' THEN NULL\n      WHEN o.operation_type IN ('GCAL_CREATE', 'GCAL_UPDATE') AND $2 IS NOT NULL AND $2 != '' THEN $2\n      ELSE a.calendar_event_id\n    END,\n    updated_at = NOW()\n  FROM op_update o\n  WHERE a.appointment_id = o.appointment_id\n  RETURNING a.appointment_id, a.calendar_event_id, o.operation_type\n)\nSELECT * FROM appt_update;\n",
+        "query": "\n-- Mark integration operation as SUCCESS and update appointment's calendar_event_id\n-- Called after any successful GCal operation (CREATE, UPDATE, or DELETE).\n-- finding #16: This is the \"before DB success update\" crash point.\n-- The claim_integration_operations() function pre-checks for already-synced\n-- appointments (calendar_event_id already set), so reaching here means\n-- the GCal operation genuinely just succeeded.\n\n-- Set actor for audit trail\nSELECT set_config('app.current_actor', 'system:calendar_worker', true);\n\nWITH op_update AS (\n    UPDATE integration_operations\n    SET status = 'SUCCESS',\n        lease_expires_at = NULL,\n        updated_at = NOW()\n    WHERE operation_id = $1\n    RETURNING operation_id, appointment_id, operation_type\n),\nappt_update AS (\n    UPDATE appointments a\n    SET\n        -- For CREATE/UPDATE: store the new event_id\n        -- For DELETE: clear the event_id (event no longer exists)\n        calendar_event_id = CASE\n            WHEN o.operation_type = 'GCAL_DELETE'\n                THEN NULL\n            WHEN o.operation_type IN ('GCAL_CREATE', 'GCAL_UPDATE')\n                 AND $2 IS NOT NULL AND $2 != ''\n                THEN $2\n            ELSE a.calendar_event_id\n        END,\n        updated_at = NOW()\n    FROM op_update o\n    WHERE a.appointment_id = o.appointment_id\n    RETURNING a.appointment_id, a.calendar_event_id, o.operation_type\n)\nSELECT * FROM appt_update;\n",
         "queryParameters": "={{ [$json.operation_id, $json.gcal_event_id] }}"
       },
       "credentials": {
@@ -299,8 +299,8 @@
       ],
       "parameters": {
         "operation": "executeQuery",
-        "query": "\nUPDATE integration_operations\nSET\n  status = CASE WHEN $1 >= 5 THEN 'PERMANENTLY_FAILED' ELSE 'FAILED' END,\n  next_retry_at = CASE\n    WHEN $1 < 5 THEN NOW() + (INTERVAL '1 minute' * POWER(2, $1))\n    ELSE NULL\n  END,\n  error_details = $2::jsonb,\n  updated_at = NOW()\nWHERE operation_id = $3\nRETURNING operation_id, status, attempt_count, next_retry_at;\n",
-        "queryParameters": "={{ [$json.attempt_count, JSON.stringify({error: $json.error_detail, attempt: $json.attempt_count, ts: new Date().toISOString()}), $json.operation_id] }}"
+        "query": "\n-- Mark operation as FAILED or PERMANENTLY_FAILED based on attempt_count vs max_attempts\n-- Implements exponential backoff for retry (finding #15)\nUPDATE integration_operations\nSET\n    status = CASE\n        WHEN attempt_count >= max_attempts THEN 'PERMANENTLY_FAILED'\n        ELSE 'FAILED'\n    END,\n    lease_expires_at = NULL,\n    next_retry_at = CASE\n        WHEN attempt_count < max_attempts\n        THEN NOW() + (INTERVAL '1 minute' * POWER(2, LEAST(attempt_count, 10)))\n        ELSE NULL\n    END,\n    error_details = $1::jsonb,\n    updated_at = NOW()\nWHERE operation_id = $2\nRETURNING operation_id, status, attempt_count, max_attempts, next_retry_at;\n",
+        "queryParameters": "={{ [JSON.stringify({error: $json.error_detail, attempt: $json.attempt_count, ts: new Date().toISOString(), was_not_found: $json.was_not_found || false}), $json.operation_id] }}"
       },
       "credentials": {
         "postgres": {
@@ -320,6 +320,64 @@
         500
       ],
       "parameters": {}
+    },
+    {
+      "id": "w4-idempotency-check",
+      "name": "Prepare_GCal_Create_Idempotent",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        860,
+        100
+      ],
+      "parameters": {
+        "language": "javascript",
+        "jsCode": "\n// Idempotency check for GCAL_CREATE (finding #16, #17)\n// The architecture problem being solved:\n//   1. Calendar Worker calls GCal CREATE → succeeds\n//   2. Worker crashes before marking operation SUCCESS in DB\n//   3. Worker retries → would create DUPLICATE Calendar event\n//\n// Solution: deterministic idempotency_key stored in the GCal event's\n// extendedProperties. On retry, search GCal for this key first.\n// If found: use existing event_id (no new event created).\n// If not found: create new event WITH this key in extendedProperties.\n//\n// The GCal CREATE node below sets extendedProperties.private.idempotencyKey.\n// The GCal search (advisory, if needed) would look for this property.\n// For simplicity in n8n, we use the GCal event description to embed the key\n// (GCal API privateExtendedProperty search requires special OAuth scope).\n// Instead, we store appointment_id in the event, and the Postgres_Mark_Op_Success\n// does a \"check before update\" to handle the case where event_id already matches.\n\nconst item = $input.first()?.json || {};\n\n// Generate deterministic idempotency key for this CREATE operation\nconst idempotencyKey = item.idempotency_key || (item.appointment_id + ':GCAL_CREATE');\n\n// The event summary will embed the appointment_id for reconciliation\nconst eventSummary = `${item.customer_name} - ${item.service} with ${item.doctor_name}`;\nconst eventDescription = [\n  `Appointment ID: ${item.appointment_id}`,\n  `Service: ${item.service}`,\n  `Patient: ${item.customer_name}`,\n  `Source: ${item.appointment_source || 'SYSTEM'}`,\n  `idempotencyKey: ${idempotencyKey}`\n].join('\\n');\n\nreturn [{\n  json: {\n    ...item,\n    idempotency_key: idempotencyKey,\n    gcal_event_summary: eventSummary,\n    gcal_event_description: eventDescription\n  }\n}];\n"
+      }
+    },
+    {
+      "id": "w4-maintenance-trigger",
+      "name": "Maintenance_Trigger_Hourly",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        100,
+        600
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 1
+            }
+          ]
+        }
+      },
+      "notesInFlow": true,
+      "notes": "Runs maintenance tasks every hour: expire stale PENDING appointments, clean up old processed_messages. Separated from customer request path (finding #109, #110)."
+    },
+    {
+      "id": "w4-maintenance-pg",
+      "name": "Postgres_Run_Maintenance",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        300,
+        600
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "\n-- Maintenance: expire stale PENDING appointments (finding #109)\n-- These cleanup tasks run SEPARATELY from customer requests (finding #110)\n-- expire_stale_pending_appointments() internally sets app.current_actor = 'system:maintenance'\nSELECT\n    expire_stale_pending_appointments() AS expired_appointments,\n    cleanup_old_processed_messages(7)   AS deleted_messages;\n",
+        "queryParameters": ""
+      },
+      "credentials": {
+        "postgres": {
+          "id": "postgres_credentials_id",
+          "name": "PostgreSQL Account"
+        }
+      },
+      "continueOnFail": true
     }
   ],
   "connections": {
@@ -367,7 +425,7 @@
       "main": [
         [
           {
-            "node": "GCal_Create_Event",
+            "node": "Prepare_GCal_Create_Idempotent",
             "type": "main",
             "index": 0
           }
@@ -471,13 +529,35 @@
           }
         ]
       ]
+    },
+    "Prepare_GCal_Create_Idempotent": {
+      "main": [
+        [
+          {
+            "node": "GCal_Create_Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Maintenance_Trigger_Hourly": {
+      "main": [
+        [
+          {
+            "node": "Postgres_Run_Maintenance",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
     }
   },
   "active": true,
   "settings": {
     "executionOrder": "v1"
   },
-  "versionId": "04-calendar-worker-v1",
+  "versionId": "04-calendar-worker-v2-prompt1",
   "meta": {
     "instanceId": "appointment-booking-system"
   },

@@ -25,7 +25,7 @@
       ],
       "parameters": {
         "operation": "executeQuery",
-        "query": "-- ==============================================================================\n-- Appointment Booking System - Database Initialization & Schema Definition\n-- ==============================================================================\n\n-- 1. Enable btree_gist for exclusion constraints\nCREATE EXTENSION IF NOT EXISTS btree_gist;\n\n-- 2. Doctors Registry\nCREATE TABLE IF NOT EXISTS doctors (\n    doctor_id VARCHAR(100) PRIMARY KEY,\n    doctor_name VARCHAR(255) NOT NULL,\n    specialty VARCHAR(255) NOT NULL,\n    calendar_id VARCHAR(255) NOT NULL,\n    timezone VARCHAR(100) NOT NULL DEFAULT 'Asia/Kolkata',\n    working_days JSONB NOT NULL DEFAULT '[1,2,3,4,5,6]'::jsonb, -- 1=Mon, 6=Sat\n    working_hours JSONB NOT NULL DEFAULT '{\"start\": \"09:00\", \"end\": \"17:00\"}'::jsonb,\n    slot_duration_minutes INT NOT NULL DEFAULT 30 CHECK (slot_duration_minutes > 0),\n    buffer_minutes INT NOT NULL DEFAULT 0 CHECK (buffer_minutes >= 0),\n    booking_cutoff_minutes INT NOT NULL DEFAULT 60 CHECK (booking_cutoff_minutes >= 0),\n    is_active BOOLEAN NOT NULL DEFAULT TRUE,\n    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),\n    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()\n);\n\n-- Seed default doctors if table is freshly created\nINSERT INTO doctors (doctor_id, doctor_name, specialty, calendar_id, timezone, working_days, working_hours, slot_duration_minutes, buffer_minutes, booking_cutoff_minutes, is_active)\nVALUES \n    ('dr_smith', 'Dr. John Smith', 'Cardiology', 'dr_smith@apexhealth.example.com', 'Asia/Kolkata', '[1,2,3,4,5,6]'::jsonb, '{\"start\": \"09:00\", \"end\": \"17:00\"}'::jsonb, 30, 0, 60, TRUE),\n    ('dr_emily', 'Dr. Emily Davis', 'Pediatrics', 'dr_emily@apexhealth.example.com', 'Asia/Kolkata', '[1,2,3,4,5,6]'::jsonb, '{\"start\": \"09:00\", \"end\": \"17:00\"}'::jsonb, 30, 0, 60, TRUE),\n    ('dr_robert', 'Dr. Robert Wilson', 'General Medicine', 'dr_robert@apexhealth.example.com', 'Asia/Kolkata', '[1,2,3,4,5,6]'::jsonb, '{\"start\": \"09:00\", \"end\": \"17:00\"}'::jsonb, 30, 0, 60, TRUE)\nON CONFLICT (doctor_id) DO NOTHING;\n\n-- 3. Doctor Leave & Unavailability\nCREATE TABLE IF NOT EXISTS doctor_unavailability (\n    id SERIAL PRIMARY KEY,\n    doctor_id VARCHAR(100) NOT NULL REFERENCES doctors(doctor_id) ON DELETE CASCADE,\n    start_time TIMESTAMPTZ NOT NULL,\n    end_time TIMESTAMPTZ NOT NULL,\n    reason VARCHAR(255),\n    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),\n    CONSTRAINT chk_unavail_range CHECK (end_time > start_time)\n);\n\n-- 4. Appointments Table\nCREATE TABLE IF NOT EXISTS appointments (\n    appointment_id SERIAL PRIMARY KEY,\n    customer_name VARCHAR(255) NOT NULL,\n    phone VARCHAR(50) NOT NULL,\n    doctor_id VARCHAR(100) NOT NULL REFERENCES doctors(doctor_id) ON DELETE RESTRICT,\n    service VARCHAR(255) NOT NULL,\n    start_time TIMESTAMPTZ NOT NULL,\n    end_time TIMESTAMPTZ NOT NULL,\n    status VARCHAR(50) NOT NULL DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'CONFIRMED', 'RESCHEDULED', 'ARRIVED', 'COMPLETED', 'NO_SHOW', 'CANCELLED', 'EXPIRED')),\n    calendar_event_id VARCHAR(255),\n    expires_at TIMESTAMPTZ,\n    reminder_3d_sent BOOLEAN NOT NULL DEFAULT FALSE,\n    reminder_1d_sent BOOLEAN NOT NULL DEFAULT FALSE,\n    reminder_4h_sent BOOLEAN NOT NULL DEFAULT FALSE,\n    reminder_1h_sent BOOLEAN NOT NULL DEFAULT FALSE,\n    reminder_3d_claimed_at TIMESTAMPTZ,\n    reminder_1d_claimed_at TIMESTAMPTZ,\n    reminder_4h_claimed_at TIMESTAMPTZ,\n    reminder_1h_claimed_at TIMESTAMPTZ,\n    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),\n    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),\n    CONSTRAINT chk_appt_range CHECK (end_time > start_time),\n    CONSTRAINT chk_appt_expires CHECK (status != 'PENDING' OR expires_at IS NOT NULL)\n);\n\n-- 5. Webhook Inbound Message Deduplication & Rate Limiting\nCREATE TABLE IF NOT EXISTS processed_messages (\n    message_id VARCHAR(128) PRIMARY KEY,\n    channel VARCHAR(50) NOT NULL DEFAULT 'whatsapp',\n    sender VARCHAR(100) NOT NULL,\n    processed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()\n);\n\n-- 6. Appointment State Audit Logging\nCREATE TABLE IF NOT EXISTS appointment_audit_logs (\n    log_id SERIAL PRIMARY KEY,\n    appointment_id INT REFERENCES appointments(appointment_id) ON DELETE SET NULL,\n    action VARCHAR(50) NOT NULL,\n    actor VARCHAR(100) NOT NULL,\n    previous_state JSONB,\n    new_state JSONB,\n    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()\n);\n\n-- 7. Performance & Query Indexes\nCREATE INDEX IF NOT EXISTS idx_appointments_phone ON appointments(phone);\nCREATE INDEX IF NOT EXISTS idx_appointments_doc_time ON appointments(doctor_id, start_time, end_time);\nCREATE INDEX IF NOT EXISTS idx_appointments_status ON appointments(status);\nCREATE INDEX IF NOT EXISTS idx_appointments_pending_exp ON appointments(status, expires_at) WHERE status = 'PENDING';\nCREATE INDEX IF NOT EXISTS idx_appointments_cal_event ON appointments(calendar_event_id) WHERE calendar_event_id IS NOT NULL;\nCREATE INDEX IF NOT EXISTS idx_doctor_unavail_doc_time ON doctor_unavailability(doctor_id, start_time, end_time);\nCREATE INDEX IF NOT EXISTS idx_processed_messages_sender_time ON processed_messages(sender, processed_at);\nCREATE INDEX IF NOT EXISTS idx_appointment_audit_appt ON appointment_audit_logs(appointment_id);\n\n-- 8. Authoritative Active Appointment Overlap Exclusion Constraint (Bug #1, #2)\n-- Excludes all active bookings. Expired pending holds are transitioned to EXPIRED so they do not block new bookings.\nDO $$\nBEGIN\n    IF EXISTS (\n        SELECT 1 FROM pg_constraint WHERE conname = 'no_overlapping_confirmed_appointments'\n    ) THEN\n        ALTER TABLE appointments DROP CONSTRAINT no_overlapping_confirmed_appointments;\n    END IF;\n\n    IF NOT EXISTS (\n        SELECT 1 FROM pg_constraint WHERE conname = 'no_overlapping_active_appointments'\n    ) THEN\n        ALTER TABLE appointments \n        ADD CONSTRAINT no_overlapping_active_appointments \n        EXCLUDE USING gist (\n            doctor_id WITH =,\n            tstzrange(start_time, end_time) WITH &&\n        ) WHERE (status IN ('PENDING', 'CONFIRMED', 'RESCHEDULED', 'ARRIVED'));\n    END IF;\nEND $$;\n\n-- 9. Automatic Audit Logging Trigger (Bug #20, #21)\nCREATE OR REPLACE FUNCTION log_appointment_audit()\nRETURNS TRIGGER AS $$\nDECLARE\n    v_actor VARCHAR(100);\n    v_action VARCHAR(50);\nBEGIN\n    v_actor := COALESCE(current_setting('app.current_actor', true), 'system');\n    \n    IF TG_OP = 'INSERT' THEN\n        v_action := 'CREATE_' || NEW.status;\n        INSERT INTO appointment_audit_logs (appointment_id, action, actor, previous_state, new_state, created_at)\n        VALUES (NEW.appointment_id, v_action, v_actor, NULL, to_jsonb(NEW), NOW());\n        RETURN NEW;\n    ELSIF TG_OP = 'UPDATE' THEN\n        IF OLD.status IS DISTINCT FROM NEW.status THEN\n            v_action := 'STATUS_' || OLD.status || '_TO_' || NEW.status;\n        ELSIF OLD.start_time IS DISTINCT FROM NEW.start_time OR OLD.end_time IS DISTINCT FROM NEW.end_time THEN\n            v_action := 'RESCHEDULED';\n        ELSE\n            v_action := 'UPDATE';\n        END IF;\n        INSERT INTO appointment_audit_logs (appointment_id, action, actor, previous_state, new_state, created_at)\n        VALUES (NEW.appointment_id, v_action, v_actor, to_jsonb(OLD), to_jsonb(NEW), NOW());\n        RETURN NEW;\n    ELSIF TG_OP = 'DELETE' THEN\n        INSERT INTO appointment_audit_logs (appointment_id, action, actor, previous_state, new_state, created_at)\n        VALUES (OLD.appointment_id, 'DELETE', v_actor, to_jsonb(OLD), NULL, NOW());\n        RETURN OLD;\n    END IF;\n    RETURN NULL;\nEND;\n$$ LANGUAGE plpgsql;\n\nDROP TRIGGER IF EXISTS trg_appointment_audit ON appointments;\nCREATE TRIGGER trg_appointment_audit\nAFTER INSERT OR UPDATE OR DELETE ON appointments\nFOR EACH ROW EXECUTE FUNCTION log_appointment_audit();\n\n-- 10. Automatic Updated At Timestamp Trigger\nCREATE OR REPLACE FUNCTION set_updated_at()\nRETURNS TRIGGER AS $$\nBEGIN\n    NEW.updated_at = NOW();\n    RETURN NEW;\nEND;\n$$ LANGUAGE plpgsql;\n\nDROP TRIGGER IF EXISTS trg_appointments_updated_at ON appointments;\nCREATE TRIGGER trg_appointments_updated_at\nBEFORE UPDATE ON appointments\nFOR EACH ROW EXECUTE FUNCTION set_updated_at();\n\n-- 11. Maintenance Helper Functions for Cleanup & Retention (Bug #10, #30, #60)\nCREATE OR REPLACE FUNCTION expire_stale_pending_appointments()\nRETURNS INT AS $$\nDECLARE\n    v_count INT;\nBEGIN\n    UPDATE appointments\n    SET status = 'EXPIRED', updated_at = NOW()\n    WHERE status = 'PENDING' AND expires_at <= NOW();\n    GET DIAGNOSTICS v_count = ROW_COUNT;\n    RETURN v_count;\nEND;\n$$ LANGUAGE plpgsql;\n\n-- 12. PostgreSQL vs Google Calendar Reconciliation View (Bug #8)\nCREATE OR REPLACE VIEW vw_appointment_reconciliation AS\nSELECT \n    a.appointment_id,\n    a.customer_name,\n    a.phone,\n    a.doctor_id,\n    a.status,\n    a.start_time,\n    a.end_time,\n    a.calendar_event_id,\n    d.calendar_id,\n    d.doctor_name,\n    CASE \n        WHEN a.status IN ('CONFIRMED', 'RESCHEDULED', 'ARRIVED', 'COMPLETED') AND (a.calendar_event_id IS NULL OR a.calendar_event_id = '') THEN 'MISSING_CALENDAR_EVENT'\n        WHEN a.status = 'CANCELLED' AND a.calendar_event_id IS NOT NULL AND a.calendar_event_id != '' THEN 'CANCELLED_WITH_ACTIVE_CALENDAR_ID'\n        WHEN a.status = 'PENDING' AND a.expires_at <= NOW() THEN 'STALE_PENDING_HOLD'\n        ELSE 'HEALTHY'\n    END AS sync_status,\n    a.updated_at\nFROM appointments a\nJOIN doctors d ON a.doctor_id = d.doctor_id;\n"
+        "query": "-- ==============================================================================\n-- Appointment Booking System - Database Initialization & Schema Definition\n-- ==============================================================================\n-- Prompt 1 Architecture:\n--   PostgreSQL   = appointment authority (exclusion constraint decides conflicts)\n--   integration_operations = outbox / external Calendar side-effect queue\n--   Calendar Worker = ONLY component performing Google Calendar mutations\n-- ==============================================================================\n\n-- ──────────────────────────────────────────────────────────────────────────────\n-- 1. Enable btree_gist for exclusion constraints\n-- ──────────────────────────────────────────────────────────────────────────────\nCREATE EXTENSION IF NOT EXISTS btree_gist;\n\n-- ──────────────────────────────────────────────────────────────────────────────\n-- 2. Doctors Registry\n-- ──────────────────────────────────────────────────────────────────────────────\nCREATE TABLE IF NOT EXISTS doctors (\n    doctor_id              VARCHAR(100)  PRIMARY KEY,\n    doctor_name            VARCHAR(255)  NOT NULL,\n    specialty              VARCHAR(255)  NOT NULL,\n    -- calendar_id must be non-empty; shared calendars are explicitly allowed.\n    -- Multiple doctors may share one calendar_id if the clinic operates that way.\n    calendar_id            VARCHAR(255)  NOT NULL CHECK (length(trim(calendar_id)) > 0),\n    -- IANA timezone string – validated at application layer; DB enforces non-empty.\n    timezone               VARCHAR(100)  NOT NULL DEFAULT 'Asia/Kolkata'\n                               CHECK (length(trim(timezone)) > 0),\n    -- working_days: JSON array of ISO weekday integers 0 (Sun) – 6 (Sat).\n    -- DB enforces: must be an array, each element in [0,6], no duplicates enforced at DB (app validates).\n    working_days           JSONB         NOT NULL DEFAULT '[1,2,3,4,5,6]'::jsonb\n                               CHECK (jsonb_typeof(working_days) = 'array'),\n    -- working_hours: JSON object {start:\"HH:MM\", end:\"HH:MM\"} with start < end.\n    -- DB enforces: must be object with both keys present, start strictly before end.\n    working_hours          JSONB         NOT NULL DEFAULT '{\"start\": \"09:00\", \"end\": \"17:00\"}'::jsonb\n                               CHECK (\n                                   jsonb_typeof(working_hours) = 'object'\n                                   AND working_hours ? 'start'\n                                   AND working_hours ? 'end'\n                                   AND (working_hours->>'start') ~ '^([01]\\d|2[0-3]):[0-5]\\d$'\n                                   AND (working_hours->>'end')   ~ '^([01]\\d|2[0-3]):[0-5]\\d$'\n                                   AND (working_hours->>'start') < (working_hours->>'end')\n                               ),\n    -- slot_duration_minutes: the canonical booking unit. All appointments must\n    -- align to multiples of this value relative to working_hours.start.\n    -- The PostgreSQL exclusion constraint enforces the actual blocked interval\n    -- (start_time to end_time), which the application must set to\n    -- start_time + slot_duration_minutes + buffer_minutes for effective blocking.\n    slot_duration_minutes  INT           NOT NULL DEFAULT 30  CHECK (slot_duration_minutes > 0),\n    -- buffer_minutes: dead time added AFTER the appointment slot.\n    -- The exclusion range stored in appointments must be\n    --   [start_time, start_time + slot_duration_minutes + buffer_minutes)\n    -- so that the buffer is DB-enforced, not just application-enforced.\n    buffer_minutes         INT           NOT NULL DEFAULT 0   CHECK (buffer_minutes >= 0),\n    booking_cutoff_minutes INT           NOT NULL DEFAULT 60  CHECK (booking_cutoff_minutes >= 0),\n    is_active              BOOLEAN       NOT NULL DEFAULT TRUE,\n    created_at             TIMESTAMPTZ   NOT NULL DEFAULT NOW(),\n    updated_at             TIMESTAMPTZ   NOT NULL DEFAULT NOW()\n);\n\n-- Seed default doctors if table is freshly created\nINSERT INTO doctors (\n    doctor_id, doctor_name, specialty, calendar_id, timezone,\n    working_days, working_hours, slot_duration_minutes, buffer_minutes,\n    booking_cutoff_minutes, is_active\n)\nVALUES\n    ('dr_smith',  'Dr. John Smith',     'Cardiology',        'dr_smith@apexhealth.example.com',  'Asia/Kolkata', '[1,2,3,4,5,6]'::jsonb, '{\"start\": \"09:00\", \"end\": \"17:00\"}'::jsonb, 30, 0, 60, TRUE),\n    ('dr_emily',  'Dr. Emily Davis',    'Pediatrics',        'dr_emily@apexhealth.example.com',  'Asia/Kolkata', '[1,2,3,4,5,6]'::jsonb, '{\"start\": \"09:00\", \"end\": \"17:00\"}'::jsonb, 30, 0, 60, TRUE),\n    ('dr_robert', 'Dr. Robert Wilson',  'General Medicine',  'dr_robert@apexhealth.example.com', 'Asia/Kolkata', '[1,2,3,4,5,6]'::jsonb, '{\"start\": \"09:00\", \"end\": \"17:00\"}'::jsonb, 30, 0, 60, TRUE)\nON CONFLICT (doctor_id) DO NOTHING;\n\n-- ──────────────────────────────────────────────────────────────────────────────\n-- 3. Doctor Leave & Unavailability\n-- ──────────────────────────────────────────────────────────────────────────────\nCREATE TABLE IF NOT EXISTS doctor_unavailability (\n    id          SERIAL        PRIMARY KEY,\n    doctor_id   VARCHAR(100)  NOT NULL REFERENCES doctors(doctor_id) ON DELETE CASCADE,\n    start_time  TIMESTAMPTZ   NOT NULL,\n    end_time    TIMESTAMPTZ   NOT NULL,\n    reason      VARCHAR(255),\n    created_at  TIMESTAMPTZ   NOT NULL DEFAULT NOW(),\n    CONSTRAINT chk_unavail_range CHECK (end_time > start_time)\n);\n\n-- ──────────────────────────────────────────────────────────────────────────────\n-- 4. Appointments Table\n-- ──────────────────────────────────────────────────────────────────────────────\n-- APPOINTMENT SOURCE ENUM (finding #62)\n-- Records the origin channel of the appointment.\n-- Values: WHATSAPP (patient via WhatsApp AI agent)\n--         DASHBOARD (receptionist via web dashboard)\n--         API (external system via REST)\n--         SYSTEM (automated/internal, e.g. import)\n--         IMPORT (bulk data migration)\n-- Source is informational; it does NOT substitute for authenticated actor identity.\n-- Authentication/authorization is handled separately (Prompt 4).\nCREATE TABLE IF NOT EXISTS appointments (\n    appointment_id    SERIAL        PRIMARY KEY,\n    customer_name     VARCHAR(255)  NOT NULL,\n    phone             VARCHAR(50)   NOT NULL,\n    doctor_id         VARCHAR(100)  NOT NULL REFERENCES doctors(doctor_id) ON DELETE RESTRICT,\n    service           VARCHAR(255)  NOT NULL,\n    -- Appointment time semantics (finding #84, #85, #86):\n    --   start_time: exact start of patient appointment\n    --   end_time:   start_time + slot_duration_minutes + buffer_minutes\n    --               The buffer is stored inside end_time so the DB exclusion\n    --               constraint enforces the full blocked interval automatically.\n    -- Example: 30-min slot + 10-min buffer → end_time = start_time + 40 min.\n    -- This means \"next bookable slot\" = end_time, not end_time + buffer.\n    -- Application MUST compute end_time = start_time + (slot_duration + buffer).\n    start_time        TIMESTAMPTZ   NOT NULL,\n    end_time          TIMESTAMPTZ   NOT NULL,\n    -- STATUS STATE MACHINE (finding #101–108):\n    -- Legal transitions are enforced by validate_appointment_state_transition().\n    -- See that function for the transition table.\n    -- RESCHEDULED semantic: appointment retains CONFIRMED after reschedule.\n    -- RESCHEDULED is a transient signal state only — it transitions immediately\n    -- back to CONFIRMED when the new time is saved. The DB stores CONFIRMED;\n    -- any workflow setting RESCHEDULED must immediately follow with CONFIRMED.\n    -- This resolves the ambiguity: active rescheduled appointments ARE CONFIRMED.\n    status            VARCHAR(50)   NOT NULL DEFAULT 'PENDING'\n                          CHECK (status IN ('PENDING','CONFIRMED','RESCHEDULED','ARRIVED','COMPLETED','NO_SHOW','CANCELLED','EXPIRED')),\n    -- calendar_event_id: set by Calendar Worker ONLY after successful GCal CREATE.\n    -- Never set directly by business workflows.\n    -- Partial unique constraint ensures same GCal event cannot map to 2 appointments.\n    calendar_event_id VARCHAR(255),\n    -- appointment_source: stable origin of this appointment (finding #62)\n    appointment_source VARCHAR(50)  NOT NULL DEFAULT 'WHATSAPP'\n                          CHECK (appointment_source IN ('WHATSAPP','DASHBOARD','API','SYSTEM','IMPORT')),\n    expires_at        TIMESTAMPTZ,\n    reminder_3d_sent         BOOLEAN NOT NULL DEFAULT FALSE,\n    reminder_1d_sent         BOOLEAN NOT NULL DEFAULT FALSE,\n    reminder_4h_sent         BOOLEAN NOT NULL DEFAULT FALSE,\n    reminder_1h_sent         BOOLEAN NOT NULL DEFAULT FALSE,\n    reminder_3d_claimed_at   TIMESTAMPTZ,\n    reminder_1d_claimed_at   TIMESTAMPTZ,\n    reminder_4h_claimed_at   TIMESTAMPTZ,\n    reminder_1h_claimed_at   TIMESTAMPTZ,\n    created_at        TIMESTAMPTZ   NOT NULL DEFAULT NOW(),\n    updated_at        TIMESTAMPTZ   NOT NULL DEFAULT NOW(),\n    CONSTRAINT chk_appt_range   CHECK (end_time > start_time),\n    CONSTRAINT chk_appt_expires CHECK (status != 'PENDING' OR expires_at IS NOT NULL)\n);\n\nCOMMENT ON COLUMN appointments.end_time IS\n  'Stores start_time + slot_duration + buffer_minutes. The buffer is encoded in end_time so the DB exclusion constraint enforces the full blocked interval (slot + buffer).';\nCOMMENT ON COLUMN appointments.status IS\n  'State machine: PENDING→CONFIRMED→(ARRIVED|CANCELLED|RESCHEDULED→CONFIRMED). See validate_appointment_state_transition() for allowed transitions.';\nCOMMENT ON COLUMN appointments.calendar_event_id IS\n  'Set ONLY by Calendar Worker after successful GCAL_CREATE. Business workflows must never write this column directly.';\nCOMMENT ON COLUMN appointments.appointment_source IS\n  'Origin channel: WHATSAPP, DASHBOARD, API, SYSTEM, IMPORT. Informational only; not a security identity claim.';\nCOMMENT ON COLUMN appointments.reminder_3d_sent IS 'TRUE = WhatsApp API accepted the 3-day reminder. Not guaranteed patient delivery.';\nCOMMENT ON COLUMN appointments.reminder_1d_sent IS 'TRUE = WhatsApp API accepted the 1-day reminder. Not guaranteed patient delivery.';\nCOMMENT ON COLUMN appointments.reminder_4h_sent IS 'TRUE = WhatsApp API accepted the 4-hour reminder. Not guaranteed patient delivery.';\nCOMMENT ON COLUMN appointments.reminder_1h_sent IS 'TRUE = WhatsApp API accepted the 1-hour reminder. Not guaranteed patient delivery.';\n\n-- Add appointment_source column to existing tables without breaking them\nDO $$\nBEGIN\n    IF NOT EXISTS (\n        SELECT 1 FROM information_schema.columns\n        WHERE table_name = 'appointments' AND column_name = 'appointment_source'\n    ) THEN\n        ALTER TABLE appointments\n            ADD COLUMN appointment_source VARCHAR(50) NOT NULL DEFAULT 'WHATSAPP'\n            CHECK (appointment_source IN ('WHATSAPP','DASHBOARD','API','SYSTEM','IMPORT'));\n    END IF;\nEND $$;\n\n-- ──────────────────────────────────────────────────────────────────────────────\n-- 5. Webhook Inbound Message Deduplication & Rate Limiting\n-- ──────────────────────────────────────────────────────────────────────────────\nCREATE TABLE IF NOT EXISTS processed_messages (\n    message_id   VARCHAR(128) PRIMARY KEY,\n    channel      VARCHAR(50)  NOT NULL DEFAULT 'whatsapp',\n    sender       VARCHAR(100) NOT NULL,\n    processed_at TIMESTAMPTZ  NOT NULL DEFAULT NOW()\n);\n\n-- ──────────────────────────────────────────────────────────────────────────────\n-- 6. Appointment State Audit Logging (finding #58, #59, #60)\n-- ──────────────────────────────────────────────────────────────────────────────\n-- appointment_id uses ON DELETE SET NULL to preserve audit history when an\n-- appointment is deleted. Audit history must survive the appointment record.\nCREATE TABLE IF NOT EXISTS appointment_audit_logs (\n    log_id          SERIAL        PRIMARY KEY,\n    appointment_id  INT           REFERENCES appointments(appointment_id) ON DELETE SET NULL,\n    action          VARCHAR(100)  NOT NULL,\n    actor           VARCHAR(100)  NOT NULL,\n    -- Actor establishment semantics (finding #58):\n    --   System/background workers call: SET LOCAL app.current_actor = 'system:<worker_name>';\n    --   Dashboard operations will use server-side session identity (Prompt 4).\n    --   DO NOT trust client-supplied identity headers as proof of identity.\n    --   The 'system:' prefix is reserved for internal actors.\n    previous_state  JSONB,\n    new_state       JSONB,\n    created_at      TIMESTAMPTZ   NOT NULL DEFAULT NOW()\n);\n\nCOMMENT ON TABLE appointment_audit_logs IS\n  'Audit log of business-significant appointment changes. appointment_id = NULL means the appointment was hard-deleted (unusual; preserved for forensics).';\nCOMMENT ON COLUMN appointment_audit_logs.actor IS\n  'Authenticated or system-declared actor. System workers set app.current_actor = ''system:<worker>''. Dashboard will set server-side session identity (Prompt 4).';\n\n-- ──────────────────────────────────────────────────────────────────────────────\n-- 7. Performance & Query Indexes\n-- ──────────────────────────────────────────────────────────────────────────────\nCREATE INDEX IF NOT EXISTS idx_appointments_phone           ON appointments(phone);\nCREATE INDEX IF NOT EXISTS idx_appointments_doc_time        ON appointments(doctor_id, start_time, end_time);\nCREATE INDEX IF NOT EXISTS idx_appointments_status          ON appointments(status);\nCREATE INDEX IF NOT EXISTS idx_appointments_pending_exp     ON appointments(status, expires_at) WHERE status = 'PENDING';\nCREATE INDEX IF NOT EXISTS idx_appointments_source          ON appointments(appointment_source);\nCREATE INDEX IF NOT EXISTS idx_doctor_unavail_doc_time      ON doctor_unavailability(doctor_id, start_time, end_time);\nCREATE INDEX IF NOT EXISTS idx_processed_messages_sender_time ON processed_messages(sender, processed_at);\nCREATE INDEX IF NOT EXISTS idx_appointment_audit_appt       ON appointment_audit_logs(appointment_id);\nCREATE INDEX IF NOT EXISTS idx_appointment_audit_created    ON appointment_audit_logs(created_at);\n\n-- ──────────────────────────────────────────────────────────────────────────────\n-- 8. Partial Unique Index for calendar_event_id (finding #56)\n-- ──────────────────────────────────────────────────────────────────────────────\n-- Ensures one GCal event cannot be associated with two appointments.\n-- NULL calendar_event_id is allowed (appointment not yet synced to Calendar).\n-- Note: calendar_id uniqueness is NOT enforced here because the system explicitly\n-- supports a shared-calendar model (multiple doctors can share one calendar_id).\n-- Shared-calendar support is preserved intentionally.\nCREATE UNIQUE INDEX IF NOT EXISTS uidx_appointments_cal_event_id\n    ON appointments(calendar_event_id)\n    WHERE calendar_event_id IS NOT NULL;\n\n-- ──────────────────────────────────────────────────────────────────────────────\n-- 9. Authoritative PostgreSQL Booking Exclusion Constraint (finding #2, #84–86)\n-- ──────────────────────────────────────────────────────────────────────────────\n-- This constraint IS the final booking lock. Google Calendar is NOT involved.\n--\n-- Slot + Buffer semantics:\n--   end_time = start_time + slot_duration_minutes + buffer_minutes\n--   The exclusion range is [start_time, end_time), which covers the full\n--   blocked interval (slot + buffer). No separate buffer arithmetic needed.\n--\n-- The WHERE clause excludes terminal states so that CANCELLED/EXPIRED/COMPLETED\n-- appointments do not block future bookings for the same slot.\n--\n-- Concurrency guarantee: btree_gist + EXCLUDE prevents two simultaneous INSERTs\n-- from both succeeding. One will get a PostgreSQL constraint violation error.\n-- The application must handle that error and return a conflict message.\nDO $$\nBEGIN\n    -- Remove old constraint name if it exists (migration safety)\n    IF EXISTS (\n        SELECT 1 FROM pg_constraint WHERE conname = 'no_overlapping_confirmed_appointments'\n    ) THEN\n        ALTER TABLE appointments DROP CONSTRAINT no_overlapping_confirmed_appointments;\n    END IF;\n\n    IF NOT EXISTS (\n        SELECT 1 FROM pg_constraint WHERE conname = 'no_overlapping_active_appointments'\n    ) THEN\n        ALTER TABLE appointments\n        ADD CONSTRAINT no_overlapping_active_appointments\n        EXCLUDE USING gist (\n            doctor_id WITH =,\n            tstzrange(start_time, end_time) WITH &&\n        ) WHERE (status IN ('PENDING', 'CONFIRMED', 'RESCHEDULED', 'ARRIVED'));\n    END IF;\nEND $$;\n\n-- ──────────────────────────────────────────────────────────────────────────────\n-- 10. Slot Alignment Validation Function (finding #84–86)\n-- ──────────────────────────────────────────────────────────────────────────────\n-- Validates that a requested time aligns to the slot cadence for a doctor.\n-- Called by application before insert; can also be called from an additional\n-- trigger or stored proc for belt-and-suspenders enforcement.\nCREATE OR REPLACE FUNCTION validate_slot_alignment(\n    p_doctor_id     VARCHAR(100),\n    p_start_time    TIMESTAMPTZ,\n    p_end_time      TIMESTAMPTZ\n) RETURNS TEXT AS $$\n-- Returns NULL if valid, error message string if invalid.\nDECLARE\n    v_doc           doctors%ROWTYPE;\n    v_open_min      INT;\n    v_close_min     INT;\n    v_slot_total    INT;  -- slot_duration + buffer = total blocked minutes\n    v_req_start_min INT;  -- minutes since midnight in doctor's timezone\n    v_offset_min    INT;  -- minutes since working_hours.start\n    v_tz_offset_str TEXT;\nBEGIN\n    SELECT * INTO v_doc FROM doctors WHERE doctor_id = p_doctor_id;\n    IF NOT FOUND THEN\n        RETURN 'Doctor not found: ' || p_doctor_id;\n    END IF;\n\n    -- Parse working_hours\n    v_open_min  := (split_part(v_doc.working_hours->>'start', ':', 1)::INT * 60)\n                 + split_part(v_doc.working_hours->>'start', ':', 2)::INT;\n    v_close_min := (split_part(v_doc.working_hours->>'end', ':', 1)::INT * 60)\n                 + split_part(v_doc.working_hours->>'end', ':', 2)::INT;\n\n    v_slot_total := v_doc.slot_duration_minutes + v_doc.buffer_minutes;\n\n    -- Duration check\n    IF extract(epoch FROM (p_end_time - p_start_time)) / 60 != v_slot_total THEN\n        RETURN format(\n            'end_time must be exactly start_time + %s minutes (slot_duration=%s + buffer=%s). Got %s minutes.',\n            v_slot_total,\n            v_doc.slot_duration_minutes,\n            v_doc.buffer_minutes,\n            extract(epoch FROM (p_end_time - p_start_time)) / 60\n        );\n    END IF;\n\n    -- Slot alignment check: minutes since midnight (UTC approximation; full TZ\n    -- alignment is done in application layer). We use MOD to check alignment.\n    -- offset from open: (req_start - open_start) must be divisible by slot_total.\n    -- This check uses UTC minute-of-day; application does the full TZ check.\n    v_req_start_min := (extract(hour FROM p_start_time AT TIME ZONE 'UTC')::INT * 60)\n                     + extract(minute FROM p_start_time AT TIME ZONE 'UTC')::INT;\n    v_offset_min := (v_req_start_min - v_open_min + 1440) % 1440;\n\n    IF (v_offset_min % v_slot_total) != 0 THEN\n        RETURN format(\n            'Requested time does not align to %s-minute slot cadence for %s. Times must align to multiples of %s minutes after %s.',\n            v_slot_total, v_doc.doctor_name, v_slot_total, v_doc.working_hours->>'start'\n        );\n    END IF;\n\n    RETURN NULL;  -- valid\nEND;\n$$ LANGUAGE plpgsql;\n\nCOMMENT ON FUNCTION validate_slot_alignment IS\n  'Returns NULL if slot is valid, or an error string. Checks duration = slot+buffer and alignment to slot cadence. Application calls this before INSERT; exclusion constraint is the ultimate authority.';\n\n-- ──────────────────────────────────────────────────────────────────────────────\n-- 11. Appointment State Transition Guard (finding #101–108)\n-- ──────────────────────────────────────────────────────────────────────────────\n-- ALL workflows must use this function / call transitions through this guard.\n-- Returns NULL if transition is allowed, error message if not.\n--\n-- Legal transition table:\n--   PENDING   -> CONFIRMED   (patient confirms hold)\n--   PENDING   -> EXPIRED     (automatic expiry via maintenance job)\n--   PENDING   -> CANCELLED   (patient or staff cancels before confirming)\n--   CONFIRMED -> ARRIVED     (patient checked in)\n--   CONFIRMED -> RESCHEDULED (transition state; must be followed by CONFIRMED)\n--   CONFIRMED -> CANCELLED   (patient or staff cancels confirmed booking)\n--   CONFIRMED -> NO_SHOW     (patient did not arrive)\n--   CONFIRMED -> COMPLETED   (appointment concluded without ARRIVED step)\n--   RESCHEDULED -> CONFIRMED (rescheduled to new time; becomes CONFIRMED)\n--   RESCHEDULED -> CANCELLED (cancelled during reschedule)\n--   ARRIVED   -> COMPLETED   (appointment finished)\n--   ARRIVED   -> NO_SHOW     (edge case: marked arrived then absent)\n--   ARRIVED   -> CANCELLED   (cancellation after arrival, rare)\n--   COMPLETED -> (none)      terminal state\n--   NO_SHOW   -> (none)      terminal state\n--   CANCELLED -> (none)      terminal state\n--   EXPIRED   -> (none)      terminal state\n--\n-- RESCHEDULED semantics clarification (finding #101):\n--   RESCHEDULED is a TRANSIENT state used only to signal a reschedule operation\n--   in the audit log and integration_operations trigger. After rescheduling,\n--   the appointment MUST be in CONFIRMED status. Business workflows should\n--   atomically move CONFIRMED → CONFIRMED (at new time) and only ever write\n--   RESCHEDULED as an intermediate step in a single transaction if needed.\n--   The canonical post-reschedule state stored in the DB is CONFIRMED.\nCREATE OR REPLACE FUNCTION validate_appointment_state_transition(\n    p_from_status VARCHAR(50),\n    p_to_status   VARCHAR(50)\n) RETURNS TEXT AS $$\nBEGIN\n    -- Same state is always allowed (idempotent updates)\n    IF p_from_status = p_to_status THEN\n        RETURN NULL;\n    END IF;\n\n    CASE p_from_status\n        WHEN 'PENDING' THEN\n            IF p_to_status IN ('CONFIRMED', 'EXPIRED', 'CANCELLED') THEN\n                RETURN NULL;\n            END IF;\n        WHEN 'CONFIRMED' THEN\n            IF p_to_status IN ('ARRIVED', 'RESCHEDULED', 'CANCELLED', 'NO_SHOW', 'COMPLETED') THEN\n                RETURN NULL;\n            END IF;\n        WHEN 'RESCHEDULED' THEN\n            IF p_to_status IN ('CONFIRMED', 'CANCELLED') THEN\n                RETURN NULL;\n            END IF;\n        WHEN 'ARRIVED' THEN\n            IF p_to_status IN ('COMPLETED', 'NO_SHOW', 'CANCELLED') THEN\n                RETURN NULL;\n            END IF;\n        WHEN 'COMPLETED'  THEN NULL;  -- terminal\n        WHEN 'NO_SHOW'    THEN NULL;  -- terminal\n        WHEN 'CANCELLED'  THEN NULL;  -- terminal\n        WHEN 'EXPIRED'    THEN NULL;  -- terminal\n        ELSE NULL;\n    END CASE;\n\n    RETURN format(\n        'Invalid appointment state transition: %s -> %s. See validate_appointment_state_transition() for allowed transitions.',\n        p_from_status,\n        p_to_status\n    );\nEND;\n$$ LANGUAGE plpgsql;\n\nCOMMENT ON FUNCTION validate_appointment_state_transition IS\n  'Central state machine guard. Returns NULL if allowed, error string if not. All workflows must respect these transitions.';\n\n-- Trigger that enforces state transitions at the DB level\nCREATE OR REPLACE FUNCTION enforce_appointment_state_transition()\nRETURNS TRIGGER AS $$\nDECLARE\n    v_err TEXT;\nBEGIN\n    IF TG_OP = 'UPDATE' AND OLD.status IS DISTINCT FROM NEW.status THEN\n        v_err := validate_appointment_state_transition(OLD.status, NEW.status);\n        IF v_err IS NOT NULL THEN\n            RAISE EXCEPTION '%', v_err;\n        END IF;\n    END IF;\n    RETURN NEW;\nEND;\n$$ LANGUAGE plpgsql;\n\nDROP TRIGGER IF EXISTS trg_enforce_state_transition ON appointments;\nCREATE TRIGGER trg_enforce_state_transition\nBEFORE UPDATE ON appointments\nFOR EACH ROW EXECUTE FUNCTION enforce_appointment_state_transition();\n\n-- ──────────────────────────────────────────────────────────────────────────────\n-- 12. Automatic Updated_At Timestamp Trigger\n-- ──────────────────────────────────────────────────────────────────────────────\nCREATE OR REPLACE FUNCTION set_updated_at()\nRETURNS TRIGGER AS $$\nBEGIN\n    NEW.updated_at = NOW();\n    RETURN NEW;\nEND;\n$$ LANGUAGE plpgsql;\n\nDROP TRIGGER IF EXISTS trg_appointments_updated_at ON appointments;\nCREATE TRIGGER trg_appointments_updated_at\nBEFORE UPDATE ON appointments\nFOR EACH ROW EXECUTE FUNCTION set_updated_at();\n\n-- ──────────────────────────────────────────────────────────────────────────────\n-- 13. Audit Logging Trigger (finding #58, #59, #60)\n-- ──────────────────────────────────────────────────────────────────────────────\n-- Improved audit trigger:\n--  - Records full previous and new row for business-significant changes\n--  - Skips \"metadata churn\" updates (only updated_at / reminder_claimed_at changed)\n--    to reduce audit volume while preserving important changes\n--  - Actor is set via SET LOCAL app.current_actor = 'system:<name>' or\n--    SET LOCAL app.current_actor = 'dashboard:<session_id>'  (Prompt 4 will\n--    wire the dashboard session identity server-side; Prompt 1 establishes the\n--    mechanism so the DB is compatible).\nCREATE OR REPLACE FUNCTION log_appointment_audit()\nRETURNS TRIGGER AS $$\nDECLARE\n    v_actor  VARCHAR(100);\n    v_action VARCHAR(100);\n    v_is_metadata_only BOOLEAN;\nBEGIN\n    -- Actor resolution (finding #58):\n    -- Workflows and workers set app.current_actor at the session level.\n    -- System workers use 'system:<worker_name>' convention.\n    -- Fallback to 'system:unknown' rather than empty string for clarity.\n    v_actor := COALESCE(\n        NULLIF(trim(current_setting('app.current_actor', true)), ''),\n        'system:unknown'\n    );\n\n    IF TG_OP = 'INSERT' THEN\n        v_action := 'CREATE_' || NEW.status;\n        INSERT INTO appointment_audit_logs\n            (appointment_id, action, actor, previous_state, new_state, created_at)\n        VALUES\n            (NEW.appointment_id, v_action, v_actor, NULL, to_jsonb(NEW), NOW());\n        RETURN NEW;\n\n    ELSIF TG_OP = 'UPDATE' THEN\n        -- Determine action type\n        IF OLD.status IS DISTINCT FROM NEW.status THEN\n            v_action := 'STATUS_' || OLD.status || '_TO_' || NEW.status;\n        ELSIF OLD.start_time IS DISTINCT FROM NEW.start_time\n           OR OLD.end_time   IS DISTINCT FROM NEW.end_time THEN\n            v_action := 'TIME_CHANGED';\n        ELSIF OLD.calendar_event_id IS DISTINCT FROM NEW.calendar_event_id THEN\n            v_action := 'CALENDAR_EVENT_SYNCED';\n        ELSE\n            v_action := 'UPDATE';\n        END IF;\n\n        -- Skip metadata-only updates (finding #59, #60):\n        -- If the ONLY columns that changed are: updated_at, reminder_*_claimed_at\n        -- then this is a maintenance/heartbeat update with no business significance.\n        v_is_metadata_only := (\n            OLD.status              = NEW.status                AND\n            OLD.start_time          = NEW.start_time            AND\n            OLD.end_time            = NEW.end_time              AND\n            OLD.customer_name       = NEW.customer_name         AND\n            OLD.phone               = NEW.phone                 AND\n            OLD.doctor_id           = NEW.doctor_id             AND\n            OLD.service             = NEW.service               AND\n            OLD.calendar_event_id IS NOT DISTINCT FROM NEW.calendar_event_id AND\n            OLD.appointment_source  = NEW.appointment_source    AND\n            OLD.expires_at          IS NOT DISTINCT FROM NEW.expires_at AND\n            OLD.reminder_3d_sent    = NEW.reminder_3d_sent      AND\n            OLD.reminder_1d_sent    = NEW.reminder_1d_sent      AND\n            OLD.reminder_4h_sent    = NEW.reminder_4h_sent      AND\n            OLD.reminder_1h_sent    = NEW.reminder_1h_sent\n        );\n\n        -- Always log business-significant changes; skip pure metadata churn.\n        -- Reminder *_sent flag changes ARE business-significant (reminder was sent).\n        -- Reminder *_claimed_at changes alone are metadata churn (skip).\n        IF NOT v_is_metadata_only THEN\n            -- For STATUS changes and time changes, record full rows.\n            -- For CALENDAR_EVENT_SYNCED, record only the calendar_event_id delta.\n            IF v_action = 'CALENDAR_EVENT_SYNCED' THEN\n                INSERT INTO appointment_audit_logs\n                    (appointment_id, action, actor, previous_state, new_state, created_at)\n                VALUES (\n                    NEW.appointment_id, v_action, v_actor,\n                    jsonb_build_object('calendar_event_id', OLD.calendar_event_id),\n                    jsonb_build_object('calendar_event_id', NEW.calendar_event_id),\n                    NOW()\n                );\n            ELSE\n                INSERT INTO appointment_audit_logs\n                    (appointment_id, action, actor, previous_state, new_state, created_at)\n                VALUES\n                    (NEW.appointment_id, v_action, v_actor, to_jsonb(OLD), to_jsonb(NEW), NOW());\n            END IF;\n        END IF;\n        RETURN NEW;\n\n    ELSIF TG_OP = 'DELETE' THEN\n        INSERT INTO appointment_audit_logs\n            (appointment_id, action, actor, previous_state, new_state, created_at)\n        VALUES\n            (OLD.appointment_id, 'DELETE', v_actor, to_jsonb(OLD), NULL, NOW());\n        RETURN OLD;\n    END IF;\n\n    RETURN NULL;\nEND;\n$$ LANGUAGE plpgsql;\n\nDROP TRIGGER IF EXISTS trg_appointment_audit ON appointments;\nCREATE TRIGGER trg_appointment_audit\nAFTER INSERT OR UPDATE OR DELETE ON appointments\nFOR EACH ROW EXECUTE FUNCTION log_appointment_audit();\n\n-- ──────────────────────────────────────────────────────────────────────────────\n-- 14. Phone Normalization Trigger\n-- ──────────────────────────────────────────────────────────────────────────────\nCREATE OR REPLACE FUNCTION normalize_phone_number()\nRETURNS TRIGGER AS $$\nBEGIN\n    NEW.phone = regexp_replace(NEW.phone, '[^0-9]', '', 'g');\n    IF length(NEW.phone) = 10 THEN\n        NEW.phone = '91' || NEW.phone;\n    END IF;\n    RETURN NEW;\nEND;\n$$ LANGUAGE plpgsql;\n\nDROP TRIGGER IF EXISTS trg_normalize_phone ON appointments;\nCREATE TRIGGER trg_normalize_phone\nBEFORE INSERT OR UPDATE ON appointments\nFOR EACH ROW EXECUTE FUNCTION normalize_phone_number();\n\n-- ──────────────────────────────────────────────────────────────────────────────\n-- 15. Prevent Historical Appointments Trigger\n-- ──────────────────────────────────────────────────────────────────────────────\nCREATE OR REPLACE FUNCTION prevent_past_appointments()\nRETURNS TRIGGER AS $$\nBEGIN\n    IF TG_OP = 'INSERT' THEN\n        IF NEW.start_time < (NOW() - INTERVAL '5 minutes') THEN\n            RAISE EXCEPTION 'Cannot book an appointment in the past: %', NEW.start_time;\n        END IF;\n    ELSIF TG_OP = 'UPDATE' THEN\n        IF (NEW.start_time != OLD.start_time) AND (NEW.start_time < (NOW() - INTERVAL '5 minutes')) THEN\n            RAISE EXCEPTION 'Cannot reschedule an appointment to the past: %', NEW.start_time;\n        END IF;\n    END IF;\n    RETURN NEW;\nEND;\n$$ LANGUAGE plpgsql;\n\nDROP TRIGGER IF EXISTS trg_prevent_past_appts ON appointments;\nCREATE TRIGGER trg_prevent_past_appts\nBEFORE INSERT OR UPDATE ON appointments\nFOR EACH ROW EXECUTE FUNCTION prevent_past_appointments();\n\n-- ──────────────────────────────────────────────────────────────────────────────\n-- 16. Integration Operations (Outbox) Table (finding #14, #15, #16–20)\n-- ──────────────────────────────────────────────────────────────────────────────\n-- This table is the SOLE mechanism for scheduling external Calendar operations.\n-- Business workflows (WhatsApp agent, Dashboard) NEVER call Google Calendar directly.\n-- They only modify PostgreSQL. The DB trigger queues integration_operations entries.\n-- The Calendar Worker (Workflow 04) claims, executes, and marks operations.\n--\n-- HISTORY RETENTION (finding #14):\n--   appointment_id uses ON DELETE SET NULL, NOT CASCADE.\n--   This preserves integration history (proof that Calendar was synced) even\n--   when an appointment is hard-deleted (unusual case).\n--   The operation row becomes an orphan (appointment_id = NULL) which is\n--   intentional — it shows Calendar events were created/deleted for that slot.\nCREATE TABLE IF NOT EXISTS integration_operations (\n    operation_id      SERIAL        PRIMARY KEY,\n    appointment_id    INT           REFERENCES appointments(appointment_id) ON DELETE SET NULL,\n    operation_type    VARCHAR(50)   NOT NULL,\n    -- Status values (finding #15):\n    --   PENDING          = waiting to be claimed by a worker\n    --   IN_PROGRESS      = claimed; lease expires at lease_expires_at\n    --   SUCCESS          = completed successfully\n    --   FAILED           = failed; will retry if attempt_count < max_attempts\n    --   PERMANENTLY_FAILED = max retries exceeded; requires manual intervention\n    --   SUPERSEDED       = a newer operation for same appointment makes this obsolete\n    status            VARCHAR(50)   NOT NULL DEFAULT 'PENDING',\n    -- Lease semantics (finding #15):\n    --   When a worker claims an operation it sets:\n    --     status = IN_PROGRESS\n    --     lease_expires_at = NOW() + INTERVAL '10 minutes'  (configurable)\n    --     last_attempt_at = NOW()\n    --     attempt_count = attempt_count + 1\n    --   A crashed worker strands the operation in IN_PROGRESS.\n    --   Recovery query: status = 'IN_PROGRESS' AND lease_expires_at < NOW()\n    --   treats it as claimable again (safe because lease expired = worker dead).\n    lease_expires_at  TIMESTAMPTZ,\n    attempt_count     INT           NOT NULL DEFAULT 0,\n    max_attempts      INT           NOT NULL DEFAULT 5,\n    last_attempt_at   TIMESTAMPTZ,\n    next_retry_at     TIMESTAMPTZ,\n    error_details     JSONB,\n    payload           JSONB,\n    -- idempotency_key (finding #16, #17):\n    --   For GCAL_CREATE: set to '<appointment_id>:GCAL_CREATE:<attempt_nonce>'\n    --   where attempt_nonce is set when the CREATE is about to be attempted.\n    --   The Calendar Worker stores this as the GCal event's extendedProperties.privateProperties.idempotencyKey.\n    --   On retry: Worker first searches GCal for an event with this key before creating.\n    --   If found: marks operation SUCCESS with existing event_id.\n    --   If not found: creates new event with this key.\n    --   This ensures exactly-one Calendar event per appointment even across crashes.\n    idempotency_key   VARCHAR(255),\n    created_at        TIMESTAMPTZ   NOT NULL DEFAULT NOW(),\n    updated_at        TIMESTAMPTZ   NOT NULL DEFAULT NOW()\n);\n\nCOMMENT ON TABLE integration_operations IS\n  'Outbox for external Calendar operations. Only the Calendar Worker (Workflow 04) reads and executes these. Business workflows never call Google Calendar directly.';\nCOMMENT ON COLUMN integration_operations.appointment_id IS\n  'ON DELETE SET NULL: history is preserved when appointment is deleted. NULL = orphaned history (appointment was hard-deleted).';\nCOMMENT ON COLUMN integration_operations.lease_expires_at IS\n  'Set to NOW()+10min when claimed. Expired leases (IN_PROGRESS + lease_expires_at < NOW()) are recoverable by any worker.';\nCOMMENT ON COLUMN integration_operations.idempotency_key IS\n  'For GCAL_CREATE: a deterministic key stored in the GCal event. Used to detect duplicate creates after worker crash. Format: <appointment_id>:GCAL_CREATE.';\n\n-- Migrate existing table: add missing columns safely\nDO $$\nBEGIN\n    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='integration_operations' AND column_name='lease_expires_at') THEN\n        ALTER TABLE integration_operations ADD COLUMN lease_expires_at TIMESTAMPTZ;\n    END IF;\n    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='integration_operations' AND column_name='max_attempts') THEN\n        ALTER TABLE integration_operations ADD COLUMN max_attempts INT NOT NULL DEFAULT 5;\n    END IF;\n    IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='integration_operations' AND column_name='idempotency_key') THEN\n        ALTER TABLE integration_operations ADD COLUMN idempotency_key VARCHAR(255);\n    END IF;\nEND $$;\n\n-- Fix ON DELETE behavior if it was CASCADE (migration safety)\nDO $$\nDECLARE\n    v_confdeltype CHAR;\nBEGIN\n    SELECT confdeltype INTO v_confdeltype\n    FROM pg_constraint c\n    JOIN pg_class rel ON rel.oid = c.conrelid\n    WHERE c.conname = 'integration_operations_appointment_id_fkey'\n      AND rel.relname = 'integration_operations';\n\n    IF FOUND AND v_confdeltype = 'c' THEN  -- 'c' = CASCADE\n        ALTER TABLE integration_operations\n            DROP CONSTRAINT integration_operations_appointment_id_fkey;\n        ALTER TABLE integration_operations\n            ADD CONSTRAINT integration_operations_appointment_id_fkey\n            FOREIGN KEY (appointment_id)\n            REFERENCES appointments(appointment_id)\n            ON DELETE SET NULL;\n    END IF;\nEND $$;\n\n-- Status constraint\nDO $$\nBEGIN\n    IF NOT EXISTS (\n        SELECT 1 FROM pg_constraint WHERE conname = 'chk_integration_op_status'\n    ) THEN\n        ALTER TABLE integration_operations\n        ADD CONSTRAINT chk_integration_op_status\n        CHECK (status IN ('PENDING','IN_PROGRESS','SUCCESS','FAILED','PERMANENTLY_FAILED','SUPERSEDED'));\n    END IF;\nEND $$;\n\n-- Indexes\nCREATE INDEX IF NOT EXISTS idx_integration_ops_appt        ON integration_operations(appointment_id);\nCREATE INDEX IF NOT EXISTS idx_integration_ops_appt_status ON integration_operations(appointment_id, status, operation_id);\n-- Primary work queue index: PENDING and FAILED-retryable\nCREATE INDEX IF NOT EXISTS idx_integration_ops_pending\n    ON integration_operations(status, next_retry_at)\n    WHERE status IN ('PENDING', 'FAILED');\n-- Recovery index: stale IN_PROGRESS operations with expired leases\nCREATE INDEX IF NOT EXISTS idx_integration_ops_recovery\n    ON integration_operations(status, lease_expires_at)\n    WHERE status = 'IN_PROGRESS';\n-- Idempotency lookup\nCREATE INDEX IF NOT EXISTS idx_integration_ops_idempotency\n    ON integration_operations(idempotency_key)\n    WHERE idempotency_key IS NOT NULL;\n\n-- Updated_at trigger\nCREATE OR REPLACE FUNCTION set_integration_op_updated_at()\nRETURNS TRIGGER AS $$\nBEGIN\n    NEW.updated_at = NOW();\n    RETURN NEW;\nEND;\n$$ LANGUAGE plpgsql;\n\nDROP TRIGGER IF EXISTS trg_integration_ops_updated_at ON integration_operations;\nCREATE TRIGGER trg_integration_ops_updated_at\nBEFORE UPDATE ON integration_operations\nFOR EACH ROW EXECUTE FUNCTION set_integration_op_updated_at();\n\n-- ──────────────────────────────────────────────────────────────────────────────\n-- 17. Outbox Trigger: Queue Calendar Integration Operations (finding #1)\n-- ──────────────────────────────────────────────────────────────────────────────\n-- This trigger is the SOLE mechanism that queues Calendar operations.\n-- It fires AFTER business workflows update PostgreSQL.\n-- Business workflows (WhatsApp, Dashboard) must NEVER call Google Calendar directly.\n--\n-- GCAL_CREATE semantics (finding #16, #17 — idempotency):\n--   Queued whenever appointment transitions to CONFIRMED (from any prior state).\n--   idempotency_key = '<appointment_id>:GCAL_CREATE'\n--   The Calendar Worker MUST:\n--     1. Search GCal for an event with this idempotency key before creating.\n--     2. If found: use existing event_id (mark SUCCESS, no new event created).\n--     3. If not found: create new event, store key in extendedProperties.\n--   This ensures exactly one Calendar event per appointment across retries.\n--\n-- GCAL_UPDATE semantics (finding #18):\n--   Queued when time changes on a CONFIRMED/RESCHEDULED appointment that has\n--   a calendar_event_id. Idempotent: repeated execution updates to correct time.\n--\n-- GCAL_DELETE semantics (finding #19):\n--   Queued when appointment is CANCELLED and had a calendar_event_id.\n--   Calendar Worker treats HTTP 404 as success (event already deleted = desired state).\n--\n-- NOTE: This trigger does NOT fire for the Calendar Worker's own update to\n-- calendar_event_id column — only status and time changes matter here.\nCREATE OR REPLACE FUNCTION queue_calendar_integration_ops()\nRETURNS TRIGGER AS $$\nDECLARE\n    v_idempotency_key VARCHAR(255);\nBEGIN\n    IF TG_OP = 'INSERT' THEN\n        -- New appointment inserted as CONFIRMED (e.g. dashboard manual create):\n        -- Queue GCAL_CREATE immediately.\n        IF NEW.status = 'CONFIRMED' THEN\n            v_idempotency_key := NEW.appointment_id::TEXT || ':GCAL_CREATE';\n            INSERT INTO integration_operations\n                (appointment_id, operation_type, status, idempotency_key, payload, created_at, updated_at)\n            VALUES\n                (NEW.appointment_id, 'GCAL_CREATE', 'PENDING', v_idempotency_key, to_jsonb(NEW), NOW(), NOW());\n        END IF;\n\n    ELSIF TG_OP = 'UPDATE' THEN\n\n        -- ── CONFIRMED transition (PENDING → CONFIRMED, or any → CONFIRMED) ──\n        -- This is the primary path: patient confirms a hold → PENDING → CONFIRMED.\n        -- The outbox trigger fires here; the business workflow does NOT touch Calendar.\n        IF OLD.status != 'CONFIRMED' AND NEW.status = 'CONFIRMED' THEN\n            v_idempotency_key := NEW.appointment_id::TEXT || ':GCAL_CREATE';\n            -- Only queue GCAL_CREATE if no calendar event exists yet.\n            -- If calendar_event_id is already set (e.g. manual create → CONFIRMED),\n            -- a previous GCAL_CREATE succeeded. No duplicate create needed.\n            IF NEW.calendar_event_id IS NULL OR NEW.calendar_event_id = '' THEN\n                INSERT INTO integration_operations\n                    (appointment_id, operation_type, status, idempotency_key, payload, created_at, updated_at)\n                VALUES\n                    (NEW.appointment_id, 'GCAL_CREATE', 'PENDING', v_idempotency_key, to_jsonb(NEW), NOW(), NOW());\n            END IF;\n\n        -- ── CANCELLED transition ──\n        -- Queue GCAL_DELETE only if there is a known Calendar event to delete.\n        ELSIF OLD.status != 'CANCELLED' AND NEW.status = 'CANCELLED'\n              AND OLD.calendar_event_id IS NOT NULL AND OLD.calendar_event_id != '' THEN\n            INSERT INTO integration_operations\n                (appointment_id, operation_type, status, payload, created_at, updated_at)\n            VALUES\n                (NEW.appointment_id, 'GCAL_DELETE', 'PENDING', to_jsonb(NEW), NOW(), NOW());\n\n        -- ── TIME CHANGED on active appointment ──\n        -- Queue GCAL_UPDATE if times changed and a Calendar event exists.\n        ELSIF (OLD.start_time IS DISTINCT FROM NEW.start_time OR OLD.end_time IS DISTINCT FROM NEW.end_time)\n              AND NEW.status IN ('CONFIRMED', 'RESCHEDULED')\n              AND NEW.calendar_event_id IS NOT NULL AND NEW.calendar_event_id != '' THEN\n            INSERT INTO integration_operations\n                (appointment_id, operation_type, status, payload, created_at, updated_at)\n            VALUES\n                (NEW.appointment_id, 'GCAL_UPDATE', 'PENDING', to_jsonb(NEW), NOW(), NOW());\n\n        END IF;\n    END IF;\n\n    RETURN NEW;\nEND;\n$$ LANGUAGE plpgsql;\n\nDROP TRIGGER IF EXISTS trg_queue_calendar_ops ON appointments;\nCREATE TRIGGER trg_queue_calendar_ops\nAFTER INSERT OR UPDATE ON appointments\nFOR EACH ROW EXECUTE FUNCTION queue_calendar_integration_ops();\n\n-- ──────────────────────────────────────────────────────────────────────────────\n-- 18. Claim Integration Operation (finding #15 — safe lease semantics)\n-- ──────────────────────────────────────────────────────────────────────────────\n-- Workers call this function to atomically claim operations using\n-- SELECT ... FOR UPDATE SKIP LOCKED to prevent concurrent claim races.\n--\n-- Returns the claimed operation row (or nothing if nothing available).\n-- The caller (Calendar Worker) should use this result to process the operation.\n--\n-- Supersession logic:\n--   If a newer GCAL_DELETE exists for the same appointment, older PENDING/FAILED\n--   operations are marked SUPERSEDED. If a newer GCAL_UPDATE exists, older\n--   PENDING/FAILED GCAL_UPDATEs for the same appointment are SUPERSEDED.\n--   GCAL_CREATE is never superseded by UPDATE (CREATE must succeed first).\n--\n-- Lease duration: 10 minutes (configurable via p_lease_minutes parameter).\nCREATE OR REPLACE FUNCTION claim_integration_operations(\n    p_batch_size   INT     DEFAULT 10,\n    p_lease_minutes INT    DEFAULT 10\n) RETURNS SETOF integration_operations AS $$\nDECLARE\n    v_op_ids INT[];\nBEGIN\n    -- Step 1: Supersede stale operations\n    WITH superseded AS (\n        UPDATE integration_operations io\n        SET status = 'SUPERSEDED', updated_at = NOW()\n        FROM integration_operations newer\n        WHERE io.appointment_id = newer.appointment_id\n          AND io.operation_id   < newer.operation_id\n          AND io.status IN ('PENDING', 'FAILED')\n          AND newer.status IN ('PENDING', 'IN_PROGRESS', 'FAILED')\n          AND (\n              newer.operation_type = 'GCAL_DELETE'\n              OR (newer.operation_type = io.operation_type AND newer.operation_type = 'GCAL_UPDATE')\n          )\n        RETURNING io.operation_id\n    )\n    SELECT array_agg(operation_id) INTO v_op_ids FROM superseded;\n\n    -- Step 2: Mark already-satisfied operations as SUCCESS\n    -- (e.g. GCAL_CREATE PENDING but appointment already has calendar_event_id)\n    WITH already_done AS (\n        UPDATE integration_operations io\n        SET status = 'SUCCESS', updated_at = NOW()\n        FROM appointments a\n        WHERE io.appointment_id = a.appointment_id\n          AND io.status = 'PENDING'\n          AND (\n              (io.operation_type = 'GCAL_CREATE' AND a.calendar_event_id IS NOT NULL AND a.calendar_event_id != '')\n              OR (io.operation_type = 'GCAL_DELETE' AND (a.calendar_event_id IS NULL OR a.calendar_event_id = ''))\n          )\n        RETURNING io.operation_id\n    )\n    SELECT array_agg(operation_id) || COALESCE(v_op_ids, '{}') INTO v_op_ids FROM already_done;\n\n    -- Step 3: Claim claimable operations with FOR UPDATE SKIP LOCKED\n    RETURN QUERY\n    WITH claimable AS (\n        SELECT io.operation_id\n        FROM integration_operations io\n        WHERE (\n            io.status = 'PENDING'\n            OR (io.status = 'FAILED'       AND io.next_retry_at <= NOW()   AND io.attempt_count < io.max_attempts)\n            OR (io.status = 'IN_PROGRESS'  AND io.lease_expires_at < NOW() AND io.attempt_count < io.max_attempts)\n        )\n        AND (v_op_ids IS NULL OR io.operation_id != ALL(v_op_ids))\n        ORDER BY\n            CASE io.status WHEN 'IN_PROGRESS' THEN 0 WHEN 'PENDING' THEN 1 ELSE 2 END,\n            io.created_at\n        LIMIT p_batch_size\n        FOR UPDATE SKIP LOCKED\n    )\n    UPDATE integration_operations io\n    SET\n        status          = 'IN_PROGRESS',\n        last_attempt_at = NOW(),\n        lease_expires_at = NOW() + (p_lease_minutes || ' minutes')::INTERVAL,\n        attempt_count   = CASE WHEN io.status = 'IN_PROGRESS'\n                               THEN io.attempt_count     -- recovery: don't double-count\n                               ELSE io.attempt_count + 1\n                          END,\n        updated_at      = NOW()\n    FROM claimable c\n    WHERE io.operation_id = c.operation_id\n    RETURNING io.*;\n\nEND;\n$$ LANGUAGE plpgsql;\n\nCOMMENT ON FUNCTION claim_integration_operations IS\n  'Atomically claims pending/recoverable integration operations using FOR UPDATE SKIP LOCKED. Sets lease_expires_at for crash recovery. Call from Calendar Worker only.';\n\n-- ──────────────────────────────────────────────────────────────────────────────\n-- 19. Maintenance Functions (finding #109, #110)\n-- ──────────────────────────────────────────────────────────────────────────────\n-- PENDING appointment expiration is now a standalone maintenance function.\n-- It must NOT be called inside customer-facing request processing.\n-- A dedicated scheduled job (n8n schedule or pg_cron) calls this independently.\nCREATE OR REPLACE FUNCTION expire_stale_pending_appointments()\nRETURNS INT AS $$\nDECLARE\n    v_count INT;\nBEGIN\n    -- Set actor for audit trail\n    PERFORM set_config('app.current_actor', 'system:maintenance', true);\n\n    UPDATE appointments\n    SET status = 'EXPIRED', updated_at = NOW()\n    WHERE status = 'PENDING'\n      AND expires_at <= NOW();\n\n    GET DIAGNOSTICS v_count = ROW_COUNT;\n    RETURN v_count;\nEND;\n$$ LANGUAGE plpgsql;\n\nCOMMENT ON FUNCTION expire_stale_pending_appointments IS\n  'Expires stale PENDING appointments. Must be called from a scheduled maintenance job, NOT from customer request paths. Returns count of appointments expired.';\n\n-- Processed message cleanup (finding #110)\n-- Moved out of customer context query. Call from maintenance scheduler.\nCREATE OR REPLACE FUNCTION cleanup_old_processed_messages(\n    p_retention_days INT DEFAULT 7\n) RETURNS INT AS $$\nDECLARE\n    v_count INT;\nBEGIN\n    DELETE FROM processed_messages\n    WHERE processed_at < NOW() - (p_retention_days || ' days')::INTERVAL;\n\n    GET DIAGNOSTICS v_count = ROW_COUNT;\n    RETURN v_count;\nEND;\n$$ LANGUAGE plpgsql;\n\nCOMMENT ON FUNCTION cleanup_old_processed_messages IS\n  'Deletes processed_messages older than p_retention_days (default 7). Call from scheduled maintenance job, NOT customer request paths.';\n\n-- ──────────────────────────────────────────────────────────────────────────────\n-- 20. Reconciliation View (finding #20)\n-- ──────────────────────────────────────────────────────────────────────────────\n-- Detects DB↔Calendar discrepancies for operator review.\n-- MISSING_CALENDAR_EVENT: appointment is active but no Calendar event queued/created.\n--   Repair: insert GCAL_CREATE integration_operation manually.\n-- CANCELLED_WITH_ACTIVE_CALENDAR_ID: appointment cancelled but calendar_event_id still set.\n--   Repair: insert GCAL_DELETE integration_operation manually.\n-- STALE_PENDING_HOLD: expired pending appointment not yet cleaned up.\n--   Repair: call expire_stale_pending_appointments().\n-- CALENDAR_EVENT_PENDING: healthy but Calendar operation not yet processed (expected).\nCREATE OR REPLACE VIEW vw_appointment_reconciliation AS\nSELECT\n    a.appointment_id,\n    a.customer_name,\n    a.phone,\n    a.doctor_id,\n    a.status,\n    a.start_time,\n    a.end_time,\n    a.calendar_event_id,\n    a.appointment_source,\n    d.calendar_id,\n    d.doctor_name,\n    -- Pending integration operations for this appointment\n    (SELECT string_agg(io.operation_type || ':' || io.status, ', ' ORDER BY io.operation_id)\n     FROM integration_operations io\n     WHERE io.appointment_id = a.appointment_id\n       AND io.status IN ('PENDING', 'IN_PROGRESS', 'FAILED')\n    ) AS pending_operations,\n    CASE\n        WHEN a.status IN ('CONFIRMED', 'RESCHEDULED', 'ARRIVED', 'COMPLETED')\n             AND (a.calendar_event_id IS NULL OR a.calendar_event_id = '')\n             AND NOT EXISTS (\n                 SELECT 1 FROM integration_operations io\n                 WHERE io.appointment_id = a.appointment_id\n                   AND io.operation_type = 'GCAL_CREATE'\n                   AND io.status IN ('PENDING', 'IN_PROGRESS', 'FAILED')\n             )\n        THEN 'MISSING_CALENDAR_EVENT'\n        WHEN a.status = 'CANCELLED'\n             AND a.calendar_event_id IS NOT NULL AND a.calendar_event_id != ''\n             AND NOT EXISTS (\n                 SELECT 1 FROM integration_operations io\n                 WHERE io.appointment_id = a.appointment_id\n                   AND io.operation_type = 'GCAL_DELETE'\n                   AND io.status IN ('PENDING', 'IN_PROGRESS')\n             )\n        THEN 'CANCELLED_WITH_ACTIVE_CALENDAR_ID'\n        WHEN a.status = 'PENDING' AND a.expires_at <= NOW()\n        THEN 'STALE_PENDING_HOLD'\n        WHEN a.status IN ('CONFIRMED', 'RESCHEDULED', 'ARRIVED', 'COMPLETED')\n             AND (a.calendar_event_id IS NULL OR a.calendar_event_id = '')\n             AND EXISTS (\n                 SELECT 1 FROM integration_operations io\n                 WHERE io.appointment_id = a.appointment_id\n                   AND io.operation_type = 'GCAL_CREATE'\n                   AND io.status IN ('PENDING', 'IN_PROGRESS', 'FAILED')\n             )\n        THEN 'CALENDAR_EVENT_PENDING'\n        ELSE 'HEALTHY'\n    END AS sync_status,\n    a.updated_at\nFROM appointments a\nJOIN doctors d ON a.doctor_id = d.doctor_id;\n\nCOMMENT ON VIEW vw_appointment_reconciliation IS\n  'Shows discrepancies between PostgreSQL appointment state and Google Calendar sync status. Use pending_operations column to see what Calendar Worker will do next.';\n\n-- ──────────────────────────────────────────────────────────────────────────────\n-- 21. Reconciliation Repair Functions (finding #20)\n-- ──────────────────────────────────────────────────────────────────────────────\n-- These functions queue repair operations into integration_operations.\n-- They are deterministic, idempotent, and logged.\n-- They do NOT directly call Google Calendar.\nCREATE OR REPLACE FUNCTION reconcile_queue_missing_calendar_create(\n    p_appointment_id INT\n) RETURNS TEXT AS $$\nDECLARE\n    v_appt   appointments%ROWTYPE;\n    v_key    VARCHAR(255);\n    v_exists BOOLEAN;\nBEGIN\n    SELECT * INTO v_appt FROM appointments WHERE appointment_id = p_appointment_id;\n    IF NOT FOUND THEN\n        RETURN 'ERROR: Appointment ' || p_appointment_id || ' not found.';\n    END IF;\n\n    IF v_appt.calendar_event_id IS NOT NULL AND v_appt.calendar_event_id != '' THEN\n        RETURN 'SKIPPED: Appointment already has calendar_event_id = ' || v_appt.calendar_event_id;\n    END IF;\n\n    IF v_appt.status NOT IN ('CONFIRMED', 'RESCHEDULED', 'ARRIVED', 'COMPLETED') THEN\n        RETURN 'SKIPPED: Appointment status ' || v_appt.status || ' does not require Calendar event.';\n    END IF;\n\n    v_key := p_appointment_id::TEXT || ':GCAL_CREATE';\n\n    -- Check if already queued\n    SELECT EXISTS (\n        SELECT 1 FROM integration_operations\n        WHERE appointment_id = p_appointment_id\n          AND operation_type = 'GCAL_CREATE'\n          AND status IN ('PENDING', 'IN_PROGRESS', 'FAILED')\n    ) INTO v_exists;\n\n    IF v_exists THEN\n        RETURN 'SKIPPED: GCAL_CREATE already queued for appointment ' || p_appointment_id;\n    END IF;\n\n    INSERT INTO integration_operations\n        (appointment_id, operation_type, status, idempotency_key, payload, created_at, updated_at)\n    VALUES\n        (p_appointment_id, 'GCAL_CREATE', 'PENDING', v_key, to_jsonb(v_appt), NOW(), NOW());\n\n    RETURN 'QUEUED: GCAL_CREATE for appointment ' || p_appointment_id;\nEND;\n$$ LANGUAGE plpgsql;\n\nCREATE OR REPLACE FUNCTION reconcile_queue_stale_calendar_delete(\n    p_appointment_id INT\n) RETURNS TEXT AS $$\nDECLARE\n    v_appt   appointments%ROWTYPE;\n    v_exists BOOLEAN;\nBEGIN\n    SELECT * INTO v_appt FROM appointments WHERE appointment_id = p_appointment_id;\n    IF NOT FOUND THEN\n        RETURN 'ERROR: Appointment ' || p_appointment_id || ' not found.';\n    END IF;\n\n    IF v_appt.status != 'CANCELLED' THEN\n        RETURN 'SKIPPED: Appointment status is ' || v_appt.status || ', not CANCELLED.';\n    END IF;\n\n    IF v_appt.calendar_event_id IS NULL OR v_appt.calendar_event_id = '' THEN\n        RETURN 'SKIPPED: No calendar_event_id to delete.';\n    END IF;\n\n    SELECT EXISTS (\n        SELECT 1 FROM integration_operations\n        WHERE appointment_id = p_appointment_id\n          AND operation_type = 'GCAL_DELETE'\n          AND status IN ('PENDING', 'IN_PROGRESS')\n    ) INTO v_exists;\n\n    IF v_exists THEN\n        RETURN 'SKIPPED: GCAL_DELETE already queued for appointment ' || p_appointment_id;\n    END IF;\n\n    INSERT INTO integration_operations\n        (appointment_id, operation_type, status, payload, created_at, updated_at)\n    VALUES\n        (p_appointment_id, 'GCAL_DELETE', 'PENDING', to_jsonb(v_appt), NOW(), NOW());\n\n    RETURN 'QUEUED: GCAL_DELETE for appointment ' || p_appointment_id;\nEND;\n$$ LANGUAGE plpgsql;\n\n-- ──────────────────────────────────────────────────────────────────────────────\n-- 22. Operational Monitoring Views\n-- ──────────────────────────────────────────────────────────────────────────────\nCREATE OR REPLACE VIEW v_permanently_failed_operations AS\nSELECT\n    io.operation_id,\n    io.appointment_id,\n    io.operation_type,\n    io.status,\n    io.attempt_count,\n    io.last_attempt_at,\n    io.error_details,\n    io.idempotency_key,\n    io.created_at,\n    a.customer_name,\n    a.phone,\n    a.status AS appt_status,\n    a.calendar_event_id,\n    d.doctor_name\nFROM integration_operations io\nLEFT JOIN appointments a ON io.appointment_id = a.appointment_id\nLEFT JOIN doctors d ON a.doctor_id = d.doctor_id\nWHERE io.status IN ('PERMANENTLY_FAILED', 'SUPERSEDED')\nORDER BY io.last_attempt_at DESC;\n\nCREATE OR REPLACE VIEW v_stale_in_progress_operations AS\nSELECT\n    io.operation_id,\n    io.appointment_id,\n    io.operation_type,\n    io.status,\n    io.attempt_count,\n    io.last_attempt_at,\n    io.lease_expires_at,\n    io.created_at,\n    a.customer_name,\n    a.status AS appt_status,\n    CASE WHEN io.lease_expires_at < NOW() THEN TRUE ELSE FALSE END AS lease_expired\nFROM integration_operations io\nLEFT JOIN appointments a ON io.appointment_id = a.appointment_id\nWHERE io.status = 'IN_PROGRESS'\n  AND io.last_attempt_at < NOW() - INTERVAL '10 minutes'\nORDER BY io.last_attempt_at;\n\n-- ──────────────────────────────────────────────────────────────────────────────\n-- 23. Concurrency Test Function (finding test scenarios 1–8)\n-- ──────────────────────────────────────────────────────────────────────────────\n-- Test scenario 1: concurrent bookings for same doctor/time\n-- This function documents the expected PostgreSQL behavior.\n-- Run in separate sessions to verify exclusion constraint works.\nCREATE OR REPLACE FUNCTION test_concurrent_booking_scenario()\nRETURNS TABLE(scenario TEXT, result TEXT) AS $$\nBEGIN\n    -- Scenario 1: Verify exclusion constraint protects concurrent slots\n    RETURN QUERY SELECT\n        'EXCLUSION_CONSTRAINT_PRESENT'::TEXT,\n        CASE WHEN EXISTS (\n            SELECT 1 FROM pg_constraint WHERE conname = 'no_overlapping_active_appointments'\n        ) THEN 'PASS: no_overlapping_active_appointments constraint exists'\n        ELSE 'FAIL: exclusion constraint missing'\n        END::TEXT;\n\n    -- Scenario 2: Verify btree_gist is enabled\n    RETURN QUERY SELECT\n        'BTREE_GIST_EXTENSION'::TEXT,\n        CASE WHEN EXISTS (\n            SELECT 1 FROM pg_extension WHERE extname = 'btree_gist'\n        ) THEN 'PASS: btree_gist extension installed'\n        ELSE 'FAIL: btree_gist not installed'\n        END::TEXT;\n\n    -- Scenario 3: Verify integration_operations FK is SET NULL not CASCADE\n    RETURN QUERY SELECT\n        'INTEGRATION_OPS_FK_BEHAVIOR'::TEXT,\n        CASE WHEN EXISTS (\n            SELECT 1 FROM pg_constraint c\n            JOIN pg_class rel ON rel.oid = c.conrelid\n            WHERE c.conname = 'integration_operations_appointment_id_fkey'\n              AND rel.relname = 'integration_operations'\n              AND c.confdeltype = 'n'  -- 'n' = SET NULL\n        ) THEN 'PASS: integration_operations FK is ON DELETE SET NULL'\n        ELSE 'FAIL or NOT YET MIGRATED: check FK confdeltype'\n        END::TEXT;\n\n    -- Scenario 4: Verify partial unique index on calendar_event_id\n    RETURN QUERY SELECT\n        'CALENDAR_EVENT_ID_UNIQUENESS'::TEXT,\n        CASE WHEN EXISTS (\n            SELECT 1 FROM pg_indexes\n            WHERE tablename = 'appointments'\n              AND indexname = 'uidx_appointments_cal_event_id'\n        ) THEN 'PASS: partial unique index on calendar_event_id exists'\n        ELSE 'FAIL: uidx_appointments_cal_event_id missing'\n        END::TEXT;\n\n    -- Scenario 5: Verify state transition trigger\n    RETURN QUERY SELECT\n        'STATE_TRANSITION_TRIGGER'::TEXT,\n        CASE WHEN EXISTS (\n            SELECT 1 FROM pg_trigger\n            WHERE tgname = 'trg_enforce_state_transition'\n        ) THEN 'PASS: state transition trigger installed'\n        ELSE 'FAIL: trg_enforce_state_transition missing'\n        END::TEXT;\n\n    -- Scenario 6: Verify appointment_source column\n    RETURN QUERY SELECT\n        'APPOINTMENT_SOURCE_COLUMN'::TEXT,\n        CASE WHEN EXISTS (\n            SELECT 1 FROM information_schema.columns\n            WHERE table_name = 'appointments' AND column_name = 'appointment_source'\n        ) THEN 'PASS: appointment_source column exists'\n        ELSE 'FAIL: appointment_source column missing'\n        END::TEXT;\n\n    -- Scenario 7: Verify idempotency_key column on integration_operations\n    RETURN QUERY SELECT\n        'IDEMPOTENCY_KEY_COLUMN'::TEXT,\n        CASE WHEN EXISTS (\n            SELECT 1 FROM information_schema.columns\n            WHERE table_name = 'integration_operations' AND column_name = 'idempotency_key'\n        ) THEN 'PASS: idempotency_key column exists'\n        ELSE 'FAIL: idempotency_key column missing'\n        END::TEXT;\n\n    -- Scenario 8: Verify outbox trigger exists\n    RETURN QUERY SELECT\n        'OUTBOX_TRIGGER'::TEXT,\n        CASE WHEN EXISTS (\n            SELECT 1 FROM pg_trigger WHERE tgname = 'trg_queue_calendar_ops'\n        ) THEN 'PASS: trg_queue_calendar_ops trigger installed'\n        ELSE 'FAIL: outbox trigger missing'\n        END::TEXT;\n\nEND;\n$$ LANGUAGE plpgsql;\n\nCOMMENT ON FUNCTION test_concurrent_booking_scenario IS\n  'Structural test suite. Returns PASS/FAIL for each architectural requirement. Run after schema migration to verify.';\n\n-- ──────────────────────────────────────────────────────────────────────────────\n-- 24. Schema version marker\n-- ──────────────────────────────────────────────────────────────────────────────\nCOMMENT ON SCHEMA public IS\n  'Appointment Booking System — Prompt 1 Architecture. PostgreSQL = booking authority. integration_operations = Calendar outbox. Calendar Worker = only Calendar mutator.';\n"
       },
       "credentials": {
         "postgres": {
@@ -81,7 +81,7 @@
       ],
       "parameters": {
         "operation": "executeQuery",
-        "query": "\n    WITH cleanup_exp AS (\n      UPDATE appointments \n      SET status = 'EXPIRED', updated_at = NOW() \n      WHERE status = 'PENDING' AND expires_at <= NOW()\n    ),\n    cleanup_msg AS (\n      DELETE FROM processed_messages \n      WHERE processed_at < NOW() - INTERVAL '7 days'\n    ),\n    doc_list AS (\n      SELECT json_agg(d.*) AS active_doctors\n      FROM doctors d\n      WHERE d.is_active = TRUE\n    ),\n    cust_appts AS (\n      SELECT json_agg(a.* ORDER BY a.start_time DESC) AS recent_appointments\n      FROM appointments a\n      WHERE a.phone = $1 AND a.status IN ('PENDING', 'CONFIRMED', 'RESCHEDULED', 'ARRIVED')\n    ),\n    unavail_list AS (\n      SELECT json_agg(u.*) AS active_unavailability\n      FROM doctor_unavailability u\n      WHERE u.end_time > NOW()\n    ),\n    rate_limit AS (\n      SELECT COUNT(*) AS recent_msg_count\n      FROM processed_messages\n      WHERE sender = $1 AND processed_at >= NOW() - INTERVAL '1 minute'\n    )\n    SELECT \n      COALESCE((SELECT active_doctors FROM doc_list), '[]'::json) AS active_doctors,\n      COALESCE((SELECT recent_appointments FROM cust_appts), '[]'::json) AS recent_appointments,\n      COALESCE((SELECT active_unavailability FROM unavail_list), '[]'::json) AS active_unavailability,\n      COALESCE((SELECT recent_msg_count FROM rate_limit), 0) AS recent_msg_count;\n",
+        "query": "\n    WITH doc_list AS (\n      SELECT json_agg(d.*) AS active_doctors\n      FROM doctors d\n      WHERE d.is_active = TRUE\n    ),\n    cust_appts AS (\n      SELECT json_agg(a.* ORDER BY a.start_time DESC) AS recent_appointments\n      FROM appointments a\n      WHERE a.phone = $1 AND a.status IN ('PENDING', 'CONFIRMED', 'RESCHEDULED', 'ARRIVED')\n    ),\n    unavail_list AS (\n      SELECT json_agg(u.*) AS active_unavailability\n      FROM doctor_unavailability u\n      WHERE u.end_time > NOW()\n    ),\n    rate_limit AS (\n      SELECT COUNT(*) AS recent_msg_count\n      FROM processed_messages\n      WHERE sender = $1 AND processed_at >= NOW() - INTERVAL '1 minute'\n    )\n    SELECT\n      COALESCE((SELECT active_doctors FROM doc_list), '[]'::json) AS active_doctors,\n      COALESCE((SELECT recent_appointments FROM cust_appts), '[]'::json) AS recent_appointments,\n      COALESCE((SELECT active_unavailability FROM unavail_list), '[]'::json) AS active_unavailability,\n      COALESCE((SELECT recent_msg_count FROM rate_limit), 0) AS recent_msg_count;\n",
         "queryParameters": "={{ [$json.phone] }}"
       },
       "credentials": {
@@ -619,7 +619,7 @@
       ],
       "parameters": {
         "operation": "executeQuery",
-        "query": "\n    WITH cleanup AS (\n      UPDATE appointments \n      SET status = 'EXPIRED', updated_at = NOW() \n      WHERE status = 'PENDING' AND expires_at <= NOW()\n    )\n    INSERT INTO appointments (customer_name, phone, doctor_id, service, start_time, end_time, status, expires_at, created_at, updated_at)\n    VALUES ($1, $2, $3, $4, $5, $6, 'PENDING', NOW() + INTERVAL '15 minutes', NOW(), NOW())\n    RETURNING appointment_id, customer_name, phone, doctor_id, service, start_time, end_time, status, expires_at;\n",
+        "query": "\n    INSERT INTO appointments (customer_name, phone, doctor_id, service, start_time, end_time, status, appointment_source, expires_at, created_at, updated_at)\n    VALUES ($1, $2, $3, $4, $5, $6, 'PENDING', 'WHATSAPP', NOW() + INTERVAL '15 minutes', NOW(), NOW())\n    ON CONFLICT ON CONSTRAINT no_overlapping_active_appointments DO NOTHING\n    RETURNING appointment_id, customer_name, phone, doctor_id, service, start_time, end_time, status, expires_at;\n",
         "queryParameters": "={{ [$json.customer_name, $json.phone, $json.doctor.doctor_id, $json.service, $json.start_time_iso, $json.end_time_iso] }}"
       },
       "credentials": {
@@ -781,7 +781,7 @@
     },
     {
       "id": "55fb71d4-8bc4-4639-9dcd-ab752097d23d",
-      "name": "GCal_Final_Availability_Check",
+      "name": "GCal_Check_External_Busy_Advisory",
       "type": "n8n-nodes-base.googleCalendar",
       "typeVersion": 1.2,
       "position": [
@@ -820,7 +820,7 @@
       ],
       "parameters": {
         "language": "javascript",
-        "jsCode": "\nfunction getUtcFromLocal(dateStr, timeStr, timeZone) {\n  const [yyyy, mm, dd] = dateStr.split('-').map(Number);\n  const [hh, min] = timeStr.split(':').map(Number);\n  const testUtc = new Date(Date.UTC(yyyy, mm - 1, dd, hh, min, 0));\n  \n  const dtf = new Intl.DateTimeFormat('en-US', {\n    timeZone,\n    year: 'numeric', month: '2-digit', day: '2-digit',\n    hour: '2-digit', minute: '2-digit', second: '2-digit',\n    hour12: false\n  });\n  \n  const parts = dtf.formatToParts(testUtc);\n  const p = {};\n  for (const part of parts) {\n    p[part.type] = part.value;\n  }\n  let partHour = parseInt(p.hour, 10);\n  if (partHour === 24) partHour = 0;\n  \n  const formattedAsUtc = Date.UTC(\n    parseInt(p.year, 10),\n    parseInt(p.month, 10) - 1,\n    parseInt(p.day, 10),\n    partHour,\n    parseInt(p.minute, 10),\n    parseInt(p.second, 10)\n  );\n  \n  const offset = formattedAsUtc - testUtc.getTime();\n  return new Date(testUtc.getTime() - offset);\n}\n\nfunction getWeekdayFromDate(dateObj, timeZone) {\n  const dayStr = new Intl.DateTimeFormat('en-US', { timeZone, weekday: 'short' }).format(dateObj);\n  const map = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };\n  return map[dayStr];\n}\n\nfunction formatInTimezone(dateObj, timeZone, options) {\n  return new Intl.DateTimeFormat('en-US', { timeZone, ...options }).format(dateObj);\n}\n\nfunction isValidDate(dateStr) {\n  if (!dateStr || typeof dateStr !== 'string') return false;\n  const match = dateStr.match(/^(\\d{4})-(\\d{2})-(\\d{2})$/);\n  if (!match) return false;\n  const [_, yStr, mStr, dStr] = match;\n  const y = Number(yStr), m = Number(mStr), d = Number(dStr);\n  if (m < 1 || m > 12 || d < 1 || d > 31) return false;\n  const testDate = new Date(Date.UTC(y, m - 1, d));\n  return testDate.getUTCFullYear() === y && testDate.getUTCMonth() === (m - 1) && testDate.getUTCDate() === d;\n}\n\nfunction isValidTime(timeStr) {\n  if (!timeStr || typeof timeStr !== 'string') return false;\n  return /^([01]\\d|2[0-3]):([0-5]\\d)$/.test(timeStr);\n}\n\nconst prev = $('Validate_Pending_For_Confirm').first().json;\nconst allInputs = $input.all();\n\n// Explicit Google Calendar failure detection\nconst gcalError = allInputs.some(i => i.json?.error || i.error);\nif (gcalError) {\n  return [{\n    json: {\n      ...prev,\n      is_final_slot_free: false,\n      calendar_check_failed: true,\n      error_msg: \"We are temporarily unable to verify calendar availability. Your booking hold is still saved. Please try confirming again in a moment by replying YES.\"\n    }\n  }];\n}\n\nconst gcalItems = allInputs.map(i => i.json).filter(j => j && (j.id || j.start));\nconst reqStart = new Date(prev.start_time_iso);\nconst reqEnd = new Date(prev.end_time_iso);\nconst now = new Date();\n\nlet isFree = true;\nlet reason = \"\";\n\nif (!prev.active_pending || prev.active_pending.status !== 'PENDING') {\n  isFree = false;\n  reason = \"Appointment is no longer in PENDING state.\";\n} else if (prev.active_pending.expires_at && new Date(prev.active_pending.expires_at) <= now) {\n  isFree = false;\n  reason = \"Appointment hold has expired.\";\n}\n\nconst doc = (prev.active_doctors || []).find(d => d.doctor_id === prev.doctor_id) || prev.doctor;\nif (!doc) {\n  isFree = false;\n  reason = \"Doctor not found or inactive.\";\n}\n\nif (isFree && doc) {\n  const tz = doc.timezone || 'Asia/Kolkata';\n  const weekdayNum = getWeekdayFromDate(reqStart, tz);\n  const workingDays = doc.working_days || [1, 2, 3, 4, 5, 6];\n  if (!workingDays.includes(weekdayNum)) {\n    isFree = false;\n    reason = \"Requested date is not a working day for this doctor.\";\n  }\n}\n\nif (isFree) {\n  const unavailList = prev.active_unavailability || [];\n  for (const u of unavailList) {\n    if (u.doctor_id === prev.doctor_id) {\n      const uStart = new Date(u.start_time);\n      const uEnd = new Date(u.end_time);\n      if (reqStart < uEnd && reqEnd > uStart) {\n        isFree = false;\n        reason = `Doctor is unavailable: ${u.reason || 'On Leave'}`;\n        break;\n      }\n    }\n  }\n}\n\nif (isFree) {\n  const bufferMin = doc?.buffer_minutes || 0;\n  for (const ev of gcalItems) {\n    const evStartStr = ev.start?.dateTime || ev.start?.date;\n    const evEndStr = ev.end?.dateTime || ev.end?.date;\n    if (!evStartStr || !evEndStr) continue;\n    const evStart = new Date(evStartStr);\n    const evEnd = new Date(evEndStr);\n    const evStartBuffered = new Date(evStart.getTime() - bufferMin * 60000);\n    const evEndBuffered = new Date(evEnd.getTime() + bufferMin * 60000);\n    if (reqStart < evEndBuffered && reqEnd > evStartBuffered) {\n      isFree = false;\n      reason = \"Slot is already booked on the doctor's calendar.\";\n      break;\n    }\n  }\n}\n\nreturn [{\n  json: {\n    ...prev,\n    is_final_slot_free: isFree,\n    calendar_check_failed: false,\n    conflict_reason: reason\n  }\n}];\n",
+        "jsCode": "\n// NOTE (Architecture, finding #1, #2):\n// This check queries Google Calendar for EXTERNAL busy events (e.g. doctor's\n// personal blocks, non-system appointments). It is ADVISORY ONLY.\n// The authoritative booking conflict check is the PostgreSQL exclusion constraint\n// (no_overlapping_active_appointments). The actual INSERT/UPDATE will fail with\n// a constraint violation if two concurrent requests try to book the same slot.\n// Do NOT use GCal as the booking lock. Use it only to show external conflicts.\n\nfunction getUtcFromLocal(dateStr, timeStr, timeZone) {\n  const [yyyy, mm, dd] = dateStr.split('-').map(Number);\n  const [hh, min] = timeStr.split(':').map(Number);\n  const testUtc = new Date(Date.UTC(yyyy, mm - 1, dd, hh, min, 0));\n  \n  const dtf = new Intl.DateTimeFormat('en-US', {\n    timeZone,\n    year: 'numeric', month: '2-digit', day: '2-digit',\n    hour: '2-digit', minute: '2-digit', second: '2-digit',\n    hour12: false\n  });\n  \n  const parts = dtf.formatToParts(testUtc);\n  const p = {};\n  for (const part of parts) {\n    p[part.type] = part.value;\n  }\n  let partHour = parseInt(p.hour, 10);\n  if (partHour === 24) partHour = 0;\n  \n  const formattedAsUtc = Date.UTC(\n    parseInt(p.year, 10),\n    parseInt(p.month, 10) - 1,\n    parseInt(p.day, 10),\n    partHour,\n    parseInt(p.minute, 10),\n    parseInt(p.second, 10)\n  );\n  \n  const offset = formattedAsUtc - testUtc.getTime();\n  return new Date(testUtc.getTime() - offset);\n}\n\nfunction getWeekdayFromDate(dateObj, timeZone) {\n  const dayStr = new Intl.DateTimeFormat('en-US', { timeZone, weekday: 'short' }).format(dateObj);\n  const map = { Sun: 0, Mon: 1, Tue: 2, Wed: 3, Thu: 4, Fri: 5, Sat: 6 };\n  return map[dayStr];\n}\n\nfunction formatInTimezone(dateObj, timeZone, options) {\n  return new Intl.DateTimeFormat('en-US', { timeZone, ...options }).format(dateObj);\n}\n\nfunction isValidDate(dateStr) {\n  if (!dateStr || typeof dateStr !== 'string') return false;\n  const match = dateStr.match(/^(\\d{4})-(\\d{2})-(\\d{2})$/);\n  if (!match) return false;\n  const [_, yStr, mStr, dStr] = match;\n  const y = Number(yStr), m = Number(mStr), d = Number(dStr);\n  if (m < 1 || m > 12 || d < 1 || d > 31) return false;\n  const testDate = new Date(Date.UTC(y, m - 1, d));\n  return testDate.getUTCFullYear() === y && testDate.getUTCMonth() === (m - 1) && testDate.getUTCDate() === d;\n}\n\nfunction isValidTime(timeStr) {\n  if (!timeStr || typeof timeStr !== 'string') return false;\n  return /^([01]\\d|2[0-3]):([0-5]\\d)$/.test(timeStr);\n}\n\nconst prev = $('Validate_Pending_For_Confirm').first().json;\nconst allInputs = $input.all();\n\n// Explicit Google Calendar failure detection\nconst gcalError = allInputs.some(i => i.json?.error || i.error);\nif (gcalError) {\n  return [{\n    json: {\n      ...prev,\n      is_final_slot_free: false,\n      calendar_check_failed: true,\n      error_msg: \"We are temporarily unable to verify calendar availability. Your booking hold is still saved. Please try confirming again in a moment by replying YES.\"\n    }\n  }];\n}\n\nconst gcalItems = allInputs.map(i => i.json).filter(j => j && (j.id || j.start));\nconst reqStart = new Date(prev.start_time_iso);\nconst reqEnd = new Date(prev.end_time_iso);\nconst now = new Date();\n\nlet isFree = true;\nlet reason = \"\";\n\nif (!prev.active_pending || prev.active_pending.status !== 'PENDING') {\n  isFree = false;\n  reason = \"Appointment is no longer in PENDING state.\";\n} else if (prev.active_pending.expires_at && new Date(prev.active_pending.expires_at) <= now) {\n  isFree = false;\n  reason = \"Appointment hold has expired.\";\n}\n\nconst doc = (prev.active_doctors || []).find(d => d.doctor_id === prev.doctor_id) || prev.doctor;\nif (!doc) {\n  isFree = false;\n  reason = \"Doctor not found or inactive.\";\n}\n\nif (isFree && doc) {\n  const tz = doc.timezone || 'Asia/Kolkata';\n  const weekdayNum = getWeekdayFromDate(reqStart, tz);\n  const workingDays = doc.working_days || [1, 2, 3, 4, 5, 6];\n  if (!workingDays.includes(weekdayNum)) {\n    isFree = false;\n    reason = \"Requested date is not a working day for this doctor.\";\n  }\n}\n\nif (isFree) {\n  const unavailList = prev.active_unavailability || [];\n  for (const u of unavailList) {\n    if (u.doctor_id === prev.doctor_id) {\n      const uStart = new Date(u.start_time);\n      const uEnd = new Date(u.end_time);\n      if (reqStart < uEnd && reqEnd > uStart) {\n        isFree = false;\n        reason = `Doctor is unavailable: ${u.reason || 'On Leave'}`;\n        break;\n      }\n    }\n  }\n}\n\nif (isFree) {\n  const bufferMin = doc?.buffer_minutes || 0;\n  for (const ev of gcalItems) {\n    const evStartStr = ev.start?.dateTime || ev.start?.date;\n    const evEndStr = ev.end?.dateTime || ev.end?.date;\n    if (!evStartStr || !evEndStr) continue;\n    const evStart = new Date(evStartStr);\n    const evEnd = new Date(evEndStr);\n    const evStartBuffered = new Date(evStart.getTime() - bufferMin * 60000);\n    const evEndBuffered = new Date(evEnd.getTime() + bufferMin * 60000);\n    if (reqStart < evEndBuffered && reqEnd > evStartBuffered) {\n      isFree = false;\n      reason = \"Doctor's external calendar shows a conflicting event. If this is an appointment booked through this system, the PostgreSQL exclusion constraint is the final authority.\";\n      break;\n    }\n  }\n}\n\nreturn [{\n  json: {\n    ...prev,\n    is_final_slot_free: isFree,\n    calendar_check_failed: false,\n    conflict_reason: reason\n  }\n}];\n",
         "mode": "runOnceForAllItems"
       }
     },
@@ -922,35 +922,6 @@
       "parameters": {}
     },
     {
-      "id": "7c31763d-746a-4245-8a71-04bef5184cbc",
-      "name": "GCal_Create_Confirmed_Event",
-      "type": "n8n-nodes-base.googleCalendar",
-      "typeVersion": 1.2,
-      "position": [
-        2840,
-        840
-      ],
-      "parameters": {
-        "operation": "create",
-        "calendar": {
-          "__rl": true,
-          "value": "={{ $json.calendar_id }}",
-          "mode": "id"
-        },
-        "start": "={{ $json.start_time_iso }}",
-        "end": "={{ $json.end_time_iso }}",
-        "summary": "={{ 'Appointment: ' + $json.customer_name + ' (' + $json.doctor_id + ')' }}",
-        "description": "={{ 'Patient Phone: ' + $json.phone + '\\nService: ' + $json.service + '\\nDoctor: ' + $json.doctor_id + '\\nStatus: CONFIRMED\\nAppt ID: ' + $json.appointment_id }}"
-      },
-      "credentials": {
-        "googleCalendarOAuth2": {
-          "id": "google_calendar_credentials_id",
-          "name": "Google Calendar Account"
-        }
-      },
-      "continueOnFail": true
-    },
-    {
       "id": "b27cb08a-0771-4851-af2a-10dccac5ebc1",
       "name": "Postgres_Update_To_Confirmed",
       "type": "n8n-nodes-base.postgres",
@@ -961,8 +932,8 @@
       ],
       "parameters": {
         "operation": "executeQuery",
-        "query": "\n    UPDATE appointments\n    SET status = 'CONFIRMED',\n        calendar_event_id = $1,\n        updated_at = NOW(),\n        reminder_3d_sent = FALSE,\n        reminder_1d_sent = FALSE,\n        reminder_4h_sent = FALSE,\n        reminder_1h_sent = FALSE,\n        reminder_3d_claimed_at = NULL,\n        reminder_1d_claimed_at = NULL,\n        reminder_4h_claimed_at = NULL,\n        reminder_1h_claimed_at = NULL\n    WHERE appointment_id = $2\n      AND status = 'PENDING'\n      AND (expires_at IS NULL OR expires_at > NOW())\n    RETURNING appointment_id, customer_name, phone, doctor_id, service, start_time, end_time, status, calendar_event_id;\n    ",
-        "queryParameters": "={{ [$('GCal_Create_Confirmed_Event').item.json.id, $('Verify_Final_Availability').item.json.appointment_id] }}"
+        "query": "\n    -- Set system actor for audit trail (finding #58)\n    SELECT set_config('app.current_actor', 'system:whatsapp_agent', true);\n\n    UPDATE appointments\n    SET status = 'CONFIRMED',\n        updated_at = NOW(),\n        reminder_3d_sent = FALSE,\n        reminder_1d_sent = FALSE,\n        reminder_4h_sent = FALSE,\n        reminder_1h_sent = FALSE,\n        reminder_3d_claimed_at = NULL,\n        reminder_1d_claimed_at = NULL,\n        reminder_4h_claimed_at = NULL,\n        reminder_1h_claimed_at = NULL\n    WHERE appointment_id = $1\n      AND status = 'PENDING'\n      AND (expires_at IS NULL OR expires_at > NOW())\n    RETURNING appointment_id, customer_name, phone, doctor_id, service, start_time, end_time, status, calendar_event_id;\n",
+        "queryParameters": "={{ [$json.appointment_id] }}"
       },
       "credentials": {
         "postgres": {
@@ -1242,37 +1213,6 @@
       "parameters": {}
     },
     {
-      "id": "cde32691-13a7-4d67-b190-92a29a35bb0f",
-      "name": "GCal_Update_Rescheduled_Event",
-      "type": "n8n-nodes-base.googleCalendar",
-      "typeVersion": 1.2,
-      "position": [
-        2840,
-        1180
-      ],
-      "parameters": {
-        "operation": "update",
-        "calendar": {
-          "__rl": true,
-          "value": "={{ $json.calendar_id }}",
-          "mode": "id"
-        },
-        "eventId": "={{ $json.calendar_event_id }}",
-        "start": "={{ $json.new_start_iso }}",
-        "end": "={{ $json.new_end_iso }}",
-        "updateFields": {
-          "summary": "={{ 'Appointment (RESCHEDULED): ' + $json.customer_name + ' (' + $json.doctor_id + ')' }}",
-          "description": "={{ 'Patient Phone: ' + $json.phone + '\\nService: ' + $json.service + '\\nStatus: RESCHEDULED\\nAppt ID: ' + $json.appointment_id }}"
-        }
-      },
-      "credentials": {
-        "googleCalendarOAuth2": {
-          "id": "google_calendar_credentials_id",
-          "name": "Google Calendar Account"
-        }
-      }
-    },
-    {
       "id": "c8f43c0a-8d7f-444d-bf7e-a78906e4fef1",
       "name": "Postgres_Update_Rescheduled",
       "type": "n8n-nodes-base.postgres",
@@ -1283,7 +1223,7 @@
       ],
       "parameters": {
         "operation": "executeQuery",
-        "query": "\n    UPDATE appointments\n    SET start_time = $1,\n        end_time = $2,\n        status = 'CONFIRMED',\n        updated_at = NOW(),\n        reminder_3d_sent = FALSE,\n        reminder_1d_sent = FALSE,\n        reminder_4h_sent = FALSE,\n        reminder_1h_sent = FALSE,\n        reminder_3d_claimed_at = NULL,\n        reminder_1d_claimed_at = NULL,\n        reminder_4h_claimed_at = NULL,\n        reminder_1h_claimed_at = NULL\n    WHERE appointment_id = $3\n      AND phone = $4\n      AND status IN ('CONFIRMED', 'RESCHEDULED')\n    RETURNING *;\n    ",
+        "query": "\n    -- Set system actor for audit trail (finding #58)\n    SELECT set_config('app.current_actor', 'system:whatsapp_agent', true);\n\n    UPDATE appointments\n    SET start_time = $1,\n        end_time = $2,\n        status = 'CONFIRMED',\n        updated_at = NOW(),\n        reminder_3d_sent = FALSE,\n        reminder_1d_sent = FALSE,\n        reminder_4h_sent = FALSE,\n        reminder_1h_sent = FALSE,\n        reminder_3d_claimed_at = NULL,\n        reminder_1d_claimed_at = NULL,\n        reminder_4h_claimed_at = NULL,\n        reminder_1h_claimed_at = NULL\n    WHERE appointment_id = $3\n      AND phone = $4\n      AND status IN ('CONFIRMED', 'RESCHEDULED')\n    RETURNING *;\n",
         "queryParameters": "={{ [$('Validate_Reschedule_Request').item.json.new_start_iso, $('Validate_Reschedule_Request').item.json.new_end_iso, $('Validate_Reschedule_Request').item.json.appointment_id, $('Parse_WhatsApp_Inbound').first().json.phone] }}"
       },
       "credentials": {
@@ -1430,34 +1370,6 @@
       "parameters": {}
     },
     {
-      "id": "5cfb96c6-e6bc-4d48-a517-e54c673aae6d",
-      "name": "GCal_Delete_Cancelled_Event",
-      "type": "n8n-nodes-base.googleCalendar",
-      "typeVersion": 1.2,
-      "position": [
-        2150,
-        1440
-      ],
-      "parameters": {
-        "operation": "delete",
-        "calendar": {
-          "__rl": true,
-          "value": "={{ $json.calendar_id }}",
-          "mode": "id"
-        },
-        "eventId": "={{ $json.calendar_event_id }}"
-      },
-      "credentials": {
-        "googleCalendarOAuth2": {
-          "id": "google_calendar_credentials_id",
-          "name": "Google Calendar Account"
-        }
-      },
-      "continueOnFail": true,
-      "notesInFlow": true,
-      "notes": "continueOnFail=true to capture GCal errors. If_Cancel_GCal_Success gates DB update."
-    },
-    {
       "id": "df8e7b4a-f6ac-4096-ac3e-e957a975b01a",
       "name": "Postgres_Update_Cancelled",
       "type": "n8n-nodes-base.postgres",
@@ -1468,7 +1380,7 @@
       ],
       "parameters": {
         "operation": "executeQuery",
-        "query": "\nUPDATE appointments\nSET status = 'CANCELLED',\n    calendar_event_id = NULL,\n    updated_at = NOW(),\n    reminder_3d_sent = TRUE,\n    reminder_1d_sent = TRUE,\n    reminder_4h_sent = TRUE,\n    reminder_1h_sent = TRUE\nWHERE appointment_id = $1\n  AND phone = $2\n  AND status IN ('PENDING', 'CONFIRMED', 'RESCHEDULED')\nRETURNING *;\n",
+        "query": "\n    -- Set system actor for audit trail (finding #58)\n    SELECT set_config('app.current_actor', 'system:whatsapp_agent', true);\n\n    UPDATE appointments\n    SET status = 'CANCELLED',\n        updated_at = NOW(),\n        reminder_3d_sent = TRUE,\n        reminder_1d_sent = TRUE,\n        reminder_4h_sent = TRUE,\n        reminder_1h_sent = TRUE\n    WHERE appointment_id = $1\n      AND phone = $2\n      AND status IN ('PENDING', 'CONFIRMED', 'RESCHEDULED')\n    RETURNING *;\n",
         "queryParameters": "={{ [$('Validate_Cancel_Request').item.json.appointment_id, $('Parse_WhatsApp_Inbound').first().json.phone] }}"
       },
       "credentials": {
@@ -1615,40 +1527,6 @@
       ]
     },
     {
-      "parameters": {
-        "method": "POST",
-        "url": "https://graph.facebook.com/v20.0/{{ $env.WHATSAPP_PHONE_NUMBER_ID || 'FROM_PHONE_NUMBER_ID' }}/messages",
-        "authentication": "genericCredentialType",
-        "genericAuthType": "httpHeaderAuth",
-        "sendHeaders": true,
-        "headerParameters": {
-          "parameters": [
-            {
-              "name": "Content-Type",
-              "value": "application/json"
-            }
-          ]
-        },
-        "sendBody": true,
-        "specifyBody": "json",
-        "jsonBody": "={{\n{\n  \"messaging_product\": \"whatsapp\",\n  \"recipient_type\": \"individual\",\n  \"to\": $('Parse_WhatsApp_Inbound').first().json.phone,\n  \"type\": \"text\",\n  \"text\": {\n    \"preview_url\": false,\n    \"body\": $json.error_msg || \"⚠️ We are temporarily unable to verify calendar availability. Your booking hold is still saved. Please try confirming again in a moment by replying YES.\"\n  }\n}\n}}"
-      },
-      "id": "w1-send-gcal-err",
-      "name": "Send_WhatsApp_GCal_Error",
-      "type": "n8n-nodes-base.httpRequest",
-      "typeVersion": 4.2,
-      "position": [
-        3800,
-        1000
-      ],
-      "credentials": {
-        "httpHeaderAuth": {
-          "id": "whatsapp_cloud_api_credentials",
-          "name": "WhatsApp Cloud API"
-        }
-      }
-    },
-    {
       "parameters": {},
       "id": "w1-respond-gcal-err",
       "name": "Respond_GCal_Error",
@@ -1733,32 +1611,6 @@
         1350,
         750
       ]
-    },
-    {
-      "parameters": {
-        "operation": "delete",
-        "calendar": {
-          "__rl": true,
-          "value": "={{ $('Verify_Final_Availability').item.json.calendar_id }}",
-          "mode": "id"
-        },
-        "eventId": "={{ $('GCal_Create_Confirmed_Event').item.json.id }}"
-      },
-      "continueOnFail": true,
-      "id": "w1-gcal-rollback-confirmed",
-      "name": "GCal_Rollback_Confirmed_Event",
-      "type": "n8n-nodes-base.googleCalendar",
-      "typeVersion": 1.2,
-      "position": [
-        4200,
-        750
-      ],
-      "credentials": {
-        "googleCalendarOAuth2": {
-          "id": "google_calendar_credentials_id",
-          "name": "Google Calendar account"
-        }
-      }
     },
     {
       "parameters": {
@@ -1929,67 +1781,6 @@
           "conditions": [
             {
               "leftValue": "={{ Boolean($json.appointment_id && $json.status === 'CONFIRMED') }}",
-              "rightValue": true,
-              "operator": {
-                "type": "boolean",
-                "operation": "equals"
-              }
-            }
-          ],
-          "combinator": "and"
-        }
-      }
-    },
-    {
-      "id": "w1-gcal-rollback-rescheduled-event",
-      "name": "GCal_Rollback_Rescheduled_Event",
-      "type": "n8n-nodes-base.googleCalendar",
-      "typeVersion": 1.2,
-      "position": [
-        3500,
-        1300
-      ],
-      "parameters": {
-        "operation": "update",
-        "calendar": {
-          "__rl": true,
-          "value": "={{ $('Validate_Reschedule_Request').item.json.calendar_id }}",
-          "mode": "id"
-        },
-        "eventId": "={{ $('Validate_Reschedule_Request').item.json.calendar_event_id }}",
-        "start": "={{ $('Validate_Reschedule_Request').item.json.old_start_iso }}",
-        "end": "={{ $('Validate_Reschedule_Request').item.json.old_end_iso }}",
-        "updateFields": {
-          "summary": "={{ 'Appointment: ' + $('Validate_Reschedule_Request').item.json.customer_name + ' (' + $('Validate_Reschedule_Request').item.json.doctor_id + ')' }}"
-        }
-      },
-      "credentials": {
-        "googleCalendarOAuth2": {
-          "id": "google_calendar_credentials_id",
-          "name": "Google Calendar Account"
-        }
-      },
-      "continueOnFail": true
-    },
-    {
-      "id": "w1-if-gcal-create-success",
-      "name": "If_GCal_Create_Success",
-      "type": "n8n-nodes-base.if",
-      "typeVersion": 2,
-      "position": [
-        3720,
-        700
-      ],
-      "parameters": {
-        "conditions": {
-          "options": {
-            "caseSensitive": true,
-            "leftValue": "",
-            "typeValidation": "strict"
-          },
-          "conditions": [
-            {
-              "leftValue": "={{ Boolean($json.id && typeof $json.id === 'string' && !$json.error) }}",
               "rightValue": true,
               "operator": {
                 "type": "boolean",
@@ -2174,47 +1965,6 @@
       },
       "notesInFlow": true,
       "notes": "Meta GET Webhook Verification endpoint (/webhook/whatsapp-webhook)"
-    },
-    {
-      "id": "w1-if-cancel-gcal-success",
-      "name": "If_Cancel_GCal_Success",
-      "type": "n8n-nodes-base.if",
-      "typeVersion": 2,
-      "position": [
-        2310,
-        1440
-      ],
-      "parameters": {
-        "conditions": {
-          "options": {
-            "caseSensitive": true,
-            "leftValue": "",
-            "typeValidation": "strict"
-          },
-          "conditions": [
-            {
-              "leftValue": "={{ Boolean(!$json.error) }}",
-              "rightValue": true,
-              "operator": {
-                "type": "boolean",
-                "operation": "equals"
-              }
-            }
-          ],
-          "combinator": "and"
-        }
-      }
-    },
-    {
-      "id": "w1-respond-cancel-gcal-fail",
-      "name": "Respond_Cancel_GCal_Failed",
-      "type": "n8n-nodes-base.noOp",
-      "typeVersion": 1,
-      "position": [
-        2540,
-        1560
-      ],
-      "parameters": {}
     }
   ],
   "connections": {
@@ -2527,7 +2277,7 @@
       "main": [
         [
           {
-            "node": "GCal_Final_Availability_Check",
+            "node": "GCal_Check_External_Busy_Advisory",
             "type": "main",
             "index": 0
           }
@@ -2552,17 +2302,6 @@
         ]
       ]
     },
-    "GCal_Final_Availability_Check": {
-      "main": [
-        [
-          {
-            "node": "Verify_Final_Availability",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
     "Verify_Final_Availability": {
       "main": [
         [
@@ -2578,7 +2317,7 @@
       "main": [
         [
           {
-            "node": "GCal_Create_Confirmed_Event",
+            "node": "Postgres_Update_To_Confirmed",
             "type": "main",
             "index": 0
           }
@@ -2608,17 +2347,6 @@
         [
           {
             "node": "Respond_Interim_Conflict",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "GCal_Create_Confirmed_Event": {
-      "main": [
-        [
-          {
-            "node": "If_GCal_Create_Success",
             "type": "main",
             "index": 0
           }
@@ -2724,7 +2452,7 @@
       "main": [
         [
           {
-            "node": "GCal_Update_Rescheduled_Event",
+            "node": "Postgres_Update_Rescheduled",
             "type": "main",
             "index": 0
           }
@@ -2743,17 +2471,6 @@
         [
           {
             "node": "Respond_Reschedule_Busy",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "GCal_Update_Rescheduled_Event": {
-      "main": [
-        [
-          {
-            "node": "Postgres_Update_Rescheduled",
             "type": "main",
             "index": 0
           }
@@ -2797,7 +2514,7 @@
       "main": [
         [
           {
-            "node": "GCal_Delete_Cancelled_Event",
+            "node": "Postgres_Update_Cancelled",
             "type": "main",
             "index": 0
           }
@@ -2816,17 +2533,6 @@
         [
           {
             "node": "Respond_No_Cancel_Target",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "GCal_Delete_Cancelled_Event": {
-      "main": [
-        [
-          {
-            "node": "If_Cancel_GCal_Success",
             "type": "main",
             "index": 0
           }
@@ -2879,27 +2585,10 @@
     },
     "If_GCal_Check_Failed": {
       "main": [
-        [
-          {
-            "node": "Send_WhatsApp_GCal_Error",
-            "type": "main",
-            "index": 0
-          }
-        ],
+        [],
         [
           {
             "node": "Postgres_Mark_Interim_Conflict",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Send_WhatsApp_GCal_Error": {
-      "main": [
-        [
-          {
-            "node": "Respond_GCal_Error",
             "type": "main",
             "index": 0
           }
@@ -2946,17 +2635,6 @@
         ],
         [
           {
-            "node": "GCal_Rollback_Confirmed_Event",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "GCal_Rollback_Confirmed_Event": {
-      "main": [
-        [
-          {
             "node": "Send_WhatsApp_Confirmation_Failed",
             "type": "main",
             "index": 0
@@ -2988,13 +2666,7 @@
     },
     "If_Reschedule_GCal_Failed": {
       "main": [
-        [
-          {
-            "node": "Send_WhatsApp_GCal_Error",
-            "type": "main",
-            "index": 0
-          }
-        ],
+        [],
         [
           {
             "node": "Send_WhatsApp_Reschedule_Busy",
@@ -3013,42 +2685,7 @@
             "index": 0
           }
         ],
-        [
-          {
-            "node": "GCal_Rollback_Rescheduled_Event",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "GCal_Rollback_Rescheduled_Event": {
-      "main": [
-        [
-          {
-            "node": "Send_WhatsApp_Interim_Conflict",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "If_GCal_Create_Success": {
-      "main": [
-        [
-          {
-            "node": "Postgres_Update_To_Confirmed",
-            "type": "main",
-            "index": 0
-          }
-        ],
-        [
-          {
-            "node": "Send_WhatsApp_GCal_Error",
-            "type": "main",
-            "index": 0
-          }
-        ]
+        []
       ]
     },
     "Route_Inbound_Webhook": {
@@ -3116,18 +2753,11 @@
         ]
       ]
     },
-    "If_Cancel_GCal_Success": {
+    "GCal_Check_External_Busy_Advisory": {
       "main": [
         [
           {
-            "node": "Postgres_Update_Cancelled",
-            "type": "main",
-            "index": 0
-          }
-        ],
-        [
-          {
-            "node": "Respond_Cancel_GCal_Failed",
+            "node": "Verify_Final_Availability",
             "type": "main",
             "index": 0
           }
@@ -3139,7 +2769,7 @@
   "settings": {
     "executionOrder": "v1"
   },
-  "versionId": "7534052e-91b1-4a58-bf62-ca9bbea4839f",
+  "versionId": "01-whatsapp-agent-v2-prompt1",
   "meta": {
     "templateCredsSetupCompleted": false,
     "instanceId": "01_WhatsApp_AI_Appointment_Agent"
