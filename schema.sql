@@ -29,7 +29,19 @@ CREATE TABLE patients (
   created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
   -- Normalized E.164-style form, e.g. +919876543210
-  CONSTRAINT chk_patients_phone_format CHECK (whatsapp_phone ~ '^\+[1-9][0-9]{6,14}$')
+  CONSTRAINT chk_patients_phone_format CHECK (whatsapp_phone ~ '^\+[1-9][0-9]{6,14}$'),
+  -- Rejects NULL (already covered by NOT NULL), empty strings, whitespace-only
+  -- values, and unreasonably long values, while deliberately using no
+  -- ASCII-only or character-set restriction so legitimate Indian/international
+  -- names with non-ASCII characters remain valid. full_name = btrim(full_name)
+  -- requires the stored value to already be trimmed - callers (register_patient)
+  -- are responsible for trimming before insert, so this constraint rejects any
+  -- write path that forgets to.
+  CONSTRAINT chk_patients_full_name_valid CHECK (
+    length(btrim(full_name)) > 0
+    AND length(btrim(full_name)) <= 200
+    AND full_name = btrim(full_name)
+  )
 );
 
 CREATE INDEX idx_patients_whatsapp_phone ON patients (whatsapp_phone);
@@ -207,11 +219,23 @@ CREATE TABLE appointments (
   updated_at                TIMESTAMPTZ NOT NULL DEFAULT now(),
   cancelled_at              TIMESTAMPTZ NULL,
 
+  -- Monotonic per-appointment mutation counter, incremented by exactly 1 in
+  -- the same UPDATE statement that reschedules an appointment (Workflow 01's
+  -- reschedule_appointment tool). This gives Workflow 01 a deterministic,
+  -- database-generated (never random) value to build a distinct
+  -- integration_outbox idempotency key per successful reschedule - keying
+  -- solely on (appointment_id, new_start_time) is insufficient because the
+  -- same appointment can legitimately be moved back to a previously-used
+  -- time (e.g. 10:00 -> 11:00 -> 10:00 -> 11:00), and each such move must
+  -- still produce its own outbox event for Workflow 04 to process.
+  revision                  INTEGER NOT NULL DEFAULT 0,
+
   CONSTRAINT chk_appointments_status CHECK (
     status IN ('SCHEDULED', 'ARRIVED', 'COMPLETED', 'NO_SHOW', 'CANCELLED')
   ),
   CONSTRAINT chk_appointments_time_order CHECK (ends_at > starts_at),
   CONSTRAINT chk_appointments_buffer_non_negative CHECK (buffer_minutes >= 0),
+  CONSTRAINT chk_appointments_revision_non_negative CHECK (revision >= 0),
 
   -- Blocking range = [starts_at, ends_at + buffer_minutes). Used only for
   -- overlap protection, never for cadence. TIMESTAMPTZ arithmetic is not
@@ -275,6 +299,64 @@ CREATE TRIGGER trg_appointments_leave_check
 BEFORE INSERT OR UPDATE OF starts_at, ends_at, service_id, doctor_id ON appointments
 FOR EACH ROW EXECUTE FUNCTION enforce_appointment_not_during_leave();
 
+-- DATABASE-LEVEL SCHEDULE ENFORCEMENT (also closes the midnight-crossing
+-- gap): doctor_schedules rows are always same-day (chk_doctor_schedules_time_order
+-- requires end_time > start_time, so overnight/split-midnight shifts are not
+-- representable), so a valid appointment's full blocking period (service
+-- duration + buffer) must start and end within the SAME Asia/Kolkata local
+-- calendar date as its start, anchored to one active schedule row for that
+-- date. Both bounds are compared as full local timestamps
+-- (date_trunc('day', local_start) + sch.start_time/end_time) rather than by
+-- truncating to ::time - a ::time-only comparison silently wraps a
+-- past-midnight instant back into an early-morning-looking value (e.g.
+-- 00:30) and can incorrectly compare as "before closing time", which is
+-- exactly the bug this trigger closes. Because a same-day schedule's
+-- end_time can be at most 23:59:59.999999 on v_day_start, any blocking_end
+-- that has actually crossed into the next calendar date is automatically
+-- greater than v_day_start + sch.end_time and is rejected - no separate
+-- "did this cross midnight" check is needed. Runs after
+-- trg_appointments_blocking_range (needs NEW.blocking_range) and
+-- 'schedule' > 'blocking' alphabetically, so same-timing trigger firing
+-- order is correct.
+CREATE OR REPLACE FUNCTION enforce_appointment_within_schedule()
+RETURNS TRIGGER AS $$
+DECLARE
+  v_local_start     TIMESTAMP;
+  v_local_block_end TIMESTAMP;
+  v_day_start       TIMESTAMP;
+  v_day_of_week     INTEGER;
+BEGIN
+  IF NEW.status = 'CANCELLED' THEN
+    RETURN NEW;
+  END IF;
+
+  v_local_start     := NEW.starts_at AT TIME ZONE 'Asia/Kolkata';
+  v_local_block_end := upper(NEW.blocking_range) AT TIME ZONE 'Asia/Kolkata';
+  v_day_start       := date_trunc('day', v_local_start);
+  v_day_of_week     := EXTRACT(DOW FROM v_local_start)::int;
+
+  IF NOT EXISTS (
+    SELECT 1
+      FROM doctor_schedules sch
+     WHERE sch.doctor_id = NEW.doctor_id
+       AND sch.active = TRUE
+       AND sch.day_of_week = v_day_of_week
+       AND v_local_start     >= v_day_start + sch.start_time
+       AND v_local_block_end <= v_day_start + sch.end_time
+  ) THEN
+    RAISE EXCEPTION
+      'Appointment for doctor % does not fit within a single active same-day schedule window (Asia/Kolkata); overnight/midnight-crossing appointments are not supported',
+      NEW.doctor_id;
+  END IF;
+
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_appointments_schedule_check
+BEFORE INSERT OR UPDATE OF starts_at, ends_at, service_id, doctor_id ON appointments
+FOR EACH ROW EXECUTE FUNCTION enforce_appointment_within_schedule();
+
 -- Enforce the ONLY valid status transitions from the project brief:
 --   SCHEDULED -> ARRIVED | CANCELLED | NO_SHOW
 --   ARRIVED   -> COMPLETED
@@ -299,6 +381,42 @@ $$ LANGUAGE plpgsql;
 CREATE TRIGGER trg_appointments_status_transition
 BEFORE UPDATE OF status ON appointments
 FOR EACH ROW EXECUTE FUNCTION enforce_appointment_status_transition();
+
+-- REVISION INTEGRITY (defense-in-depth for optimistic concurrency):
+-- appointments.revision is the counter reschedule_appointment uses for
+-- optimistic-concurrency conflict detection (see reschedule_appointment in
+-- Workflow 01). This trigger guarantees, at the database level, that no
+-- update path - however it is written in the future - can decrease the
+-- counter or jump it by more than one, regardless of what any application
+-- layer does or forgets to do:
+--   * revision must never decrease.
+--   * revision may only advance by exactly one per UPDATE (a normal
+--     versioned mutation), never be reset or bumped arbitrarily.
+-- INSERTs are unaffected (initial revision 0, or any non-negative starting
+-- value per chk_appointments_revision_non_negative, remains valid); this
+-- trigger only fires when an UPDATE actually touches the revision column.
+CREATE OR REPLACE FUNCTION enforce_appointment_revision_integrity()
+RETURNS TRIGGER AS $$
+BEGIN
+  IF NEW.revision < OLD.revision THEN
+    RAISE EXCEPTION
+      'appointments.revision cannot decrease (id=%, old=%, new=%)',
+      OLD.id, OLD.revision, NEW.revision;
+  END IF;
+
+  IF NEW.revision > OLD.revision + 1 THEN
+    RAISE EXCEPTION
+      'appointments.revision must advance by exactly 1 per update (id=%, old=%, new=%)',
+      OLD.id, OLD.revision, NEW.revision;
+  END IF;
+
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER trg_appointments_revision_integrity
+BEFORE UPDATE OF revision ON appointments
+FOR EACH ROW EXECUTE FUNCTION enforce_appointment_revision_integrity();
 
 -- ============================================================================
 -- 8. INTEGRATION_OUTBOX (Workflow 04 crash-safe Calendar sync)
@@ -391,3 +509,60 @@ CREATE TABLE audit_log (
 
 CREATE INDEX idx_audit_log_entity ON audit_log (entity_type, entity_id, created_at);
 CREATE INDEX idx_audit_log_action_time ON audit_log (action, created_at);
+
+-- ============================================================================
+-- 11. WHATSAPP_MESSAGE_DEDUP (Workflow 01 crash-safe, concurrency-safe
+--     idempotency gate - a WhatsApp webhook retry of the same message must
+--     never reach the AI Agent, or send a reply, twice)
+-- ============================================================================
+CREATE TABLE whatsapp_message_dedup (
+  -- The WhatsApp Business Cloud API's own per-message id. This is the
+  -- idempotency key: PRIMARY KEY gives it a unique index, so two concurrent
+  -- deliveries of the same message can both attempt the claim upsert below
+  -- and Postgres guarantees only one of them ever gets a row back via
+  -- RETURNING - the other gets zero rows, which is how Workflow 01 stops a
+  -- duplicate before it reaches the Appointment Agent or sends a second reply.
+  wa_message_id     TEXT PRIMARY KEY,
+  normalized_phone  TEXT NOT NULL,
+  -- PROCESSING = claimed and not yet known to have completed successfully.
+  -- COMPLETED  = the corresponding reply was actually produced/sent; this
+  --              message must never be processed again.
+  -- A row is only ever moved PROCESSING -> COMPLETED by Workflow 01's
+  -- "Mark ... Processed" step, which runs only on the success path (after
+  -- the Appointment Agent/reply flow finished without error). If processing
+  -- fails after the claim but before that step, the row is left PROCESSING
+  -- so the same message can be safely retried once claimed_at goes stale -
+  -- see the claim upsert pattern used by Workflow 01's dedup nodes:
+  --   INSERT INTO whatsapp_message_dedup (wa_message_id, normalized_phone, status, claimed_at)
+  --   VALUES ($1, $2, 'PROCESSING', now())
+  --   ON CONFLICT (wa_message_id) DO UPDATE
+  --     SET claimed_at = now(), status = 'PROCESSING'
+  --   WHERE whatsapp_message_dedup.status = 'PROCESSING'
+  --     AND whatsapp_message_dedup.claimed_at < now() - interval '2 minutes'
+  --   RETURNING wa_message_id;
+  -- This single atomic statement covers every required case:
+  --   * brand-new message                -> INSERT succeeds, 1 row returned, proceed.
+  --   * already COMPLETED                -> WHERE is false, 0 rows, treated as duplicate, dropped.
+  --   * PROCESSING and still fresh       -> WHERE is false, 0 rows, dropped (protects
+  --                                          against two concurrent webhook deliveries
+  --                                          both proceeding at once).
+  --   * PROCESSING and stale (crashed/   -> WHERE is true, row is reclaimed
+  --     failed previous attempt)            (claimed_at bumped), 1 row returned, retried.
+  status            TEXT NOT NULL DEFAULT 'PROCESSING',
+  received_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+  claimed_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
+  completed_at      TIMESTAMPTZ NULL,
+
+  CONSTRAINT chk_whatsapp_message_dedup_status CHECK (status IN ('PROCESSING', 'COMPLETED'))
+);
+
+-- Supports a periodic external cleanup job (not part of Workflow 01) purging
+-- rows older than some retention window, e.g.:
+-- DELETE FROM whatsapp_message_dedup WHERE received_at < now() - interval '30 days';
+CREATE INDEX idx_whatsapp_message_dedup_received_at ON whatsapp_message_dedup (received_at);
+
+-- Lets an operator eyeball currently in-flight/stuck claims; the claim
+-- upsert above is self-healing (no separate reaper job is required), this
+-- index just makes those rows cheap to inspect.
+CREATE INDEX idx_whatsapp_message_dedup_processing ON whatsapp_message_dedup (claimed_at)
+  WHERE status = 'PROCESSING';
