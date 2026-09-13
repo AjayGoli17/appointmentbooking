@@ -19,10 +19,9 @@
       "credentials": {
         "whatsAppTriggerApi": {
           "id": "PLACEHOLDER_WHATSAPP_TRIGGER_CRED",
-          "name": "WhatsApp OAuth (placeholder)"
+          "name": "WhatsApp OAuth"
         }
-      },
-      "notes": "Verifies the webhook (hub.challenge) automatically and emits one item per WhatsApp Business Cloud API event. Configure the Verify Token and Access Token in the credential, not here."
+      }
     },
     {
       "parameters": {
@@ -55,12 +54,11 @@
         140,
         0
       ],
-      "id": "is_inbound_text_message?",
-      "notes": "WhatsApp sends non-message webhook events too (delivery/read statuses, non-text message types). Only true 'text' messages continue into the agent; everything else is silently dropped on the false branch."
+      "id": "is_inbound_text_message"
     },
     {
       "parameters": {
-        "jsCode": "// Extract and normalize the fields the rest of the workflow needs.\n// patients.whatsapp_phone has CHECK (whatsapp_phone ~ '^\\+[1-9][0-9]{6,14}$'),\n// i.e. E.164 with a leading '+' and no other punctuation. WhatsApp's\n// \"from\" field arrives as digits only (e.g. \"919876543210\"), so we add\n// the '+' and strip anything that is not a digit before it.\nconst msg = $json.messages[0];\nconst rawFrom = String(msg.from || '').trim();\nconst digitsOnly = rawFrom.replace(/[^0-9]/g, '');\nconst normalizedPhone = '+' + digitsOnly;\n\nconst phonePattern = /^\\+[1-9][0-9]{6,14}$/;\nif (!phonePattern.test(normalizedPhone)) {\n  throw new Error('Could not normalize WhatsApp sender number into the expected +<countrycode><number> format required by the database.');\n}\n\nreturn [{\n  json: {\n    normalized_phone: normalizedPhone,\n    wa_message_id: msg.id,\n    message_text: msg.text?.body || '',\n    wa_timestamp: msg.timestamp,\n    phone_number_id: $json.metadata?.phone_number_id || '',\n  }\n}];"
+        "jsCode": "const msg = $json.messages?.[0];\n\nif (!msg?.id) {\n  throw new Error('Missing WhatsApp message ID.');\n}\n\nif (!msg?.from) {\n  throw new Error('Missing WhatsApp sender number.');\n}\n\nconst phoneNumberId = String($json.metadata?.phone_number_id || '').trim();\nif (!phoneNumberId) {\n  throw new Error('Missing WhatsApp phone number ID.');\n}\n\nconst digitsOnly = String(msg.from).replace(/[^0-9]/g, '');\nconst normalizedPhone = '+' + digitsOnly;\nconst phonePattern = /^\\+[1-9][0-9]{6,14}$/;\n\nif (!phonePattern.test(normalizedPhone)) {\n  throw new Error('Invalid WhatsApp sender number.');\n}\n\nconst messageText = String(msg.text?.body || '').trim();\nif (!messageText) {\n  throw new Error('Inbound text message has an empty body.');\n}\n\nreturn [{\n  json: {\n    normalized_phone: normalizedPhone,\n    wa_message_id: String(msg.id),\n    message_text: messageText,\n    wa_timestamp: msg.timestamp || null,\n    phone_number_id: phoneNumberId,\n    received_at: new Date().toISOString()\n  }\n}];"
       },
       "name": "Normalize Message",
       "type": "n8n-nodes-base.code",
@@ -69,27 +67,48 @@
         380,
         0
       ],
-      "id": "normalize_message",
-      "notes": "Deterministic, non-AI normalization of the phone number into the exact format the patients table CHECK constraint requires. The AI Agent never guesses or reformats this value."
+      "id": "normalize_message"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO whatsapp_message_dedup (\n  wa_message_id,\n  normalized_phone,\n  phone_number_id,\n  status,\n  claimed_at\n)\nVALUES ($1, $2, $3, 'PROCESSING', now())\nON CONFLICT (wa_message_id) DO UPDATE\nSET claimed_at = now(),\n    status = 'PROCESSING',\n    phone_number_id = EXCLUDED.phone_number_id\nWHERE whatsapp_message_dedup.status = 'PROCESSING'\n  AND whatsapp_message_dedup.claimed_at < now() - interval '10 minutes'\nRETURNING wa_message_id;",
+        "options": {
+          "queryReplacement": "={{ $('Normalize Message').item.json.wa_message_id }}, {{ $('Normalize Message').item.json.normalized_phone }}, {{ $('Normalize Message').item.json.phone_number_id }}"
+        }
+      },
+      "name": "Claim Message",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        560,
+        0
+      ],
+      "id": "claim_message",
+      "credentials": {
+        "postgres": {
+          "id": "PLACEHOLDER_POSTGRES_CRED",
+          "name": "Appointments Postgres"
+        }
+      }
     },
     {
       "parameters": {
         "promptType": "define",
         "text": "={{ $('Normalize Message').item.json.message_text }}",
         "options": {
-          "systemMessage": "You are a healthcare appointment receptionist speaking with a patient over WhatsApp.\n\nCurrent date/time context is provided to you as {{ $now.setZone('Asia/Kolkata').toFormat('cccc, dd LLLL yyyy HH:mm') }} (Asia/Kolkata). Always resolve relative dates (\"today\", \"tomorrow\", \"Friday\") against this value and the Asia/Kolkata timezone.\n\nThe patient's WhatsApp number for this conversation is: {{ $('Normalize Message').item.json.normalized_phone }}\nAlways use this exact value whenever a tool needs the patient's phone number. Never ask the patient to repeat their phone number and never alter its format.\n\nHARD RULES:\n- PostgreSQL is the single source of truth. Never state that a doctor exists, that a service exists, or that a time slot is available unless a tool call just confirmed it.\n- Never invent doctors, specializations, services, appointment IDs, confirmation numbers, dates, or times.\n- Never tell the patient a booking, reschedule, or cancellation succeeded unless the corresponding tool call returned a successful result with a real appointment_id.\n- If a tool returns no rows, an error, or an ambiguous result, treat the action as NOT completed. Explain the problem in plain, friendly language and ask what they'd like to do next. Never mention SQL, tables, columns, constraints, error codes, or internal system details.\n- If required information is missing (doctor, service/specialization, date, time, or patient name for a first-time patient), ask for exactly what is missing instead of guessing.\n- Use check_doctor to resolve a doctor/specialization/service mention into a real doctor_id and confirm which services that doctor provides before booking. Each doctor's services are returned as a list of {service_id, name} pairs - match the patient's requested service against 'name', then always use that exact 'service_id' UUID (never a name or a guess) for check_availability and book_appointment.\n- If check_doctor returns more than one matching doctor (e.g. several doctors share a specialization or a partial name matches more than one), never pick one yourself. List the matching doctors (name and specialization) and ask the patient to choose before doing anything else. Only proceed once the patient has picked, and then use that exact returned doctor_id - never invent or guess a doctor_id. If check_doctor returns exactly one clear match, you may continue without asking.\n- Always call check_availability with a specific doctor_id, service_id, and starts_at before promising or booking a slot. The slot is available only if the tool's 'available' field is true; if it is false, tell the patient using the tool's 'reason' field in plain, friendly language instead of guessing why.\n- This check_availability requirement applies equally to rescheduling: for EVERY reschedule request, after identifying the existing appointment via a fresh get_patient and resolving the new doctor/service/time the patient wants, you must call check_availability for that new doctor_id, service_id, and starts_at BEFORE calling reschedule_appointment. Only proceed to reschedule_appointment if check_availability returns available = true. Never call reschedule_appointment just to see if the database will accept an unavailable slot - check_availability comes first, then read back the new details and get the patient's explicit confirmation, and only then call reschedule_appointment. reschedule_appointment requires an expected_revision argument: this MUST be the exact 'revision' value for that appointment from the get_patient call you just made in this same turn - never a revision number you remember from earlier in the conversation, and never a guess. If reschedule_appointment returns success = false with reason = 'revision_conflict', it means the appointment was changed by someone or something else since your last look - do not retry with the same expected_revision; instead call get_patient again, tell the patient plainly that the appointment's details may have just changed, read back the current state, and get fresh confirmation before trying again. For any other failure reason, explain the problem in plain, friendly language without technical detail and ask what they'd like to do next.\n- Use get_patient to identify the patient by their WhatsApp number before booking. get_patient is READ-ONLY and never creates or updates a patient. If it returns no patient, ask for their full name, then call register_patient with that name to create the record, then call get_patient again to confirm and proceed to book_appointment.\n- get_patient may also return the patient's 'upcoming_appointments' (their SCHEDULED appointments from now onward), each including a 'revision' field that you must carry forward as expected_revision if you reschedule that appointment. For EVERY cancellation or reschedule request, you must call get_patient again with this conversation's WhatsApp number to fetch a FRESH copy of upcoming_appointments from the database, even if you already looked this up earlier in the same conversation, even if the patient already told you which appointment they mean, and even if you remember an appointment_id, doctor, service, date or time from earlier turns. Conversation memory alone is never sufficient authorization to change or cancel an appointment - only the appointment_id from this fresh get_patient call may be used. Identify the requested appointment only from this fresh result, never from an appointment_id you merely remember. If more than one upcoming appointment could match what the patient described, ask them to clarify which one they mean before calling reschedule_appointment or cancel_appointment. If the fresh result no longer contains a matching appointment (e.g. it was already cancelled, completed, or changed through another channel since you last checked), tell the patient plainly instead of proceeding. Finding a matching appointment is not itself authorization to change it - always read back the doctor, service, date and time from this fresh result and get explicit confirmation first, as already required.\n- Always read back the doctor, service, date and time and get the patient's explicit yes/confirmation before calling book_appointment, reschedule_appointment, or cancel_appointment.\n- Only call reschedule_appointment or cancel_appointment for an appointment_id you already confirmed belongs to this patient (via a prior get_patient / conversation context) and that is currently SCHEDULED. If the tool reports the appointment can't be changed, tell the patient plainly (e.g. it may already be cancelled, completed, or not found) without technical detail.\n- Never modify or mention Google Calendar; calendar sync is handled by a separate internal process and is not something you do or discuss.\n- Keep replies short, warm, and clear, in plain WhatsApp-friendly text (no markdown tables). Confirm key details (doctor name, service, date, time) back to the patient in every booking/reschedule/cancellation confirmation."
+          "systemMessage": "You are a healthcare appointment receptionist speaking over WhatsApp.\n\nCurrent date/time: {{ $now.setZone('Asia/Kolkata').toFormat('cccc, dd LLLL yyyy HH:mm') }} Asia/Kolkata.\n\nPatient WhatsApp number: {{ $('Normalize Message').item.json.normalized_phone }}\n\nIncoming WhatsApp message ID: {{ $('Normalize Message').item.json.wa_message_id }}\n\nHARD RULES:\n\n1. PostgreSQL is the source of truth. Never invent doctors, services, IDs, availability, appointments, dates or times.\n\n2. Never allow the patient to supply or override their phone number. Tools derive the phone from Normalize Message.\n\n3. Never expose SQL, database errors, UUIDs, internal operation IDs, Google Calendar, credentials or implementation details.\n\n4. Before booking, call get_patient and check_doctor/check_availability as required.\n\n5. If there is no patient, ask for their full name before booking.\n\n6. If check_doctor returns multiple doctors, ask the patient to choose. Never guess.\n\n7. If the requested service matches multiple services, ask the patient to choose. Never guess.\n\n8. Always use the exact doctor_id and service_id returned by the database.\n\n9. Always call check_availability immediately before promising a slot or attempting a booking/reschedule.\n\n10. Before booking, read back doctor, service, date and time and obtain explicit confirmation.\n\n11. Before every cancellation or reschedule, call get_patient again using the fixed conversation phone number. Never use an appointment ID remembered only from conversation memory.\n\n12. For rescheduling, use the exact revision returned by that fresh get_patient call as expected_revision.\n\n13. Before cancellation, also use the exact revision returned by the fresh get_patient call as expected_revision.\n\n14. If a mutation returns success=false, do not claim success.\n\n15. If a reschedule or cancellation returns revision_conflict, call get_patient again, explain that the appointment changed, read the current appointment details, obtain fresh confirmation and only then retry with the new revision.\n\n16. Mutation tools are idempotent using the current WhatsApp message ID. If a tool reports that the operation was already completed, treat the returned appointment/result as the result of this message. Never attempt a second mutation for the same message.\n\n17. If booking/rescheduling/cancellation succeeds, confirm the resulting appointment details.\n\n18. If a tool returns no usable result, say you could not complete the request and ask what the patient would like to do next.\n\n19. Do not discuss Google Calendar.\n\n20. Keep WhatsApp replies concise and friendly.\n\nMEMORY IS NOT AUTHORITATIVE. Database tool results always override conversation memory."
         }
       },
       "name": "Appointment Agent",
       "type": "@n8n/n8n-nodes-langchain.agent",
       "typeVersion": 1.7,
       "position": [
-        640,
+        760,
         0
       ],
       "id": "appointment_agent",
-      "onError": "continueErrorOutput",
-      "notes": "Restricted to the 6 controlled Postgres tools below - no generic/unrestricted SQL tool is attached, and no Google Calendar node/tool is attached."
+      "onError": "continueErrorOutput"
     },
     {
       "parameters": {
@@ -102,17 +121,16 @@
       "type": "@n8n/n8n-nodes-langchain.lmChatGoogleGemini",
       "typeVersion": 1,
       "position": [
-        520,
-        220
+        600,
+        260
       ],
       "id": "gemini_chat_model",
       "credentials": {
         "googlePalmApi": {
           "id": "PLACEHOLDER_GEMINI_CRED",
-          "name": "Google Gemini (PaLM) API (placeholder)"
+          "name": "Google Gemini API"
         }
-      },
-      "notes": "Swap modelName for whichever Gemini model string is enabled/supported in your n8n instance's Google Gemini credential/region."
+      }
     },
     {
       "parameters": {
@@ -120,68 +138,65 @@
         "sessionKey": "={{ $('Normalize Message').item.json.normalized_phone }}",
         "contextWindowLength": 12
       },
-      "name": "Session Memory (per phone)",
+      "name": "Session Memory",
       "type": "@n8n/n8n-nodes-langchain.memoryBufferWindow",
       "typeVersion": 1.3,
       "position": [
-        660,
-        220
+        760,
+        260
       ],
-      "id": "session_memory_(per_phone)",
-      "notes": "sessionKey is the patient's normalized phone number, so each patient's conversation history is fully isolated. Only conversational turns are stored - no separate sensitive fields are written to memory."
+      "id": "session_memory"
     },
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "SELECT\n  d.id AS doctor_id,\n  d.full_name,\n  d.specialization,\n  d.active,\n  COALESCE(jsonb_agg(DISTINCT jsonb_build_object('service_id', s.id, 'name', s.name)) FILTER (WHERE s.id IS NOT NULL), '[]'::jsonb) AS services\nFROM doctors d\nLEFT JOIN doctor_services ds ON ds.doctor_id = d.id AND ds.active = TRUE\nLEFT JOIN services s ON s.id = ds.service_id AND s.active = TRUE\nWHERE d.active = TRUE\n  AND (\n    NULLIF($1, '') IS NULL\n    OR d.full_name ILIKE '%' || $1 || '%'\n  )\n  AND (\n    NULLIF($2, '') IS NULL\n    OR d.specialization ILIKE '%' || $2 || '%'\n  )\n  AND (\n    NULLIF($3, '') IS NULL\n    OR s.name ILIKE '%' || $3 || '%'\n  )\nGROUP BY d.id, d.full_name, d.specialization, d.active\nORDER BY d.full_name;",
+        "query": "SELECT\n  d.id AS doctor_id,\n  d.full_name,\n  d.specialization,\n  jsonb_agg(\n    DISTINCT jsonb_build_object(\n      'service_id', s.id,\n      'name', s.name\n    )\n  ) FILTER (WHERE s.id IS NOT NULL) AS services\nFROM doctors d\nLEFT JOIN doctor_services ds\n  ON ds.doctor_id = d.id\n AND ds.active = TRUE\nLEFT JOIN services s\n  ON s.id = ds.service_id\n AND s.active = TRUE\nWHERE d.active = TRUE\n  AND (\n    NULLIF(btrim($1), '') IS NULL\n    OR d.full_name ILIKE '%' || $1 || '%'\n  )\n  AND (\n    NULLIF(btrim($2), '') IS NULL\n    OR d.specialization ILIKE '%' || $2 || '%'\n  )\n  AND (\n    NULLIF(btrim($3), '') IS NULL\n    OR s.name ILIKE '%' || $3 || '%'\n  )\nGROUP BY d.id, d.full_name, d.specialization\nORDER BY d.full_name;",
         "options": {
-          "queryReplacement": "={{ $fromAI('doctor_name', 'Doctor full name (or partial name) to search for. Empty string if the patient did not name a doctor.', 'string') }}, {{ $fromAI('specialization', 'Medical specialization the patient asked for, e.g. cardiologist, general physician. Empty string if not mentioned.', 'string') }}, {{ $fromAI('service_name', 'Service/procedure name the patient asked for, e.g. Consultation, ECG. Empty string if not mentioned.', 'string') }}"
+          "queryReplacement": "={{ $fromAI('doctor_name', 'Doctor name or empty string.', 'string') }}, {{ $fromAI('specialization', 'Specialization or empty string.', 'string') }}, {{ $fromAI('service_name', 'Service name or empty string.', 'string') }}"
         }
       },
       "name": "check_doctor",
       "type": "n8n-nodes-base.postgresTool",
       "typeVersion": 2.5,
       "position": [
-        980,
-        -260
+        1100,
+        -280
       ],
       "id": "check_doctor",
       "credentials": {
         "postgres": {
           "id": "PLACEHOLDER_POSTGRES_CRED",
-          "name": "Appointments Postgres (placeholder)"
+          "name": "Appointments Postgres"
         }
-      },
-      "notes": "Looks up active doctors by name / specialization / service. Read-only. AI-supplied values are bound as query parameters ($1/$2/$3) via the node's Query Parameters option, never concatenated into the SQL string. Each doctor's 'services' field is a JSON array of {service_id, name} objects - match the patient's chosen service against 'name', then use that exact matching 'service_id' UUID for check_availability and book_appointment. Never invent a doctor_id or a service_id. 'services' is always a JSON array, never null, even when a doctor currently has zero active services (COALESCE to '[]'::jsonb) - jsonb_agg(...) FILTER (...) over zero matching rows would otherwise be SQL NULL."
+      }
     },
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "WITH params AS (\n  SELECT\n    $1::uuid AS doctor_id,\n    $2::uuid AS service_id,\n    $3::timestamptz AS starts_at\n),\nsvc AS (\n  SELECT s.id, s.active AS service_active, s.duration_minutes, s.buffer_minutes\n  FROM services s\n  JOIN params p ON s.id = p.service_id\n),\ncalc AS (\n  SELECT\n    p.doctor_id,\n    p.service_id,\n    p.starts_at,\n    p.starts_at + (COALESCE(svc.duration_minutes, 0) * interval '1 minute') AS ends_at,\n    p.starts_at + (\n      (COALESCE(svc.duration_minutes, 0) + COALESCE(svc.buffer_minutes, 0)) * interval '1 minute'\n    ) AS blocking_end,\n    svc.service_active\n  FROM params p\n  LEFT JOIN svc ON TRUE\n),\nchecks AS (\n  SELECT\n    c.starts_at,\n    c.ends_at,\n    (d.id IS NOT NULL) AS doctor_exists,\n    COALESCE(d.active, FALSE) AS doctor_active,\n    COALESCE(c.service_active, FALSE) AS service_active,\n    EXISTS (\n      SELECT 1 FROM doctor_services ds\n      WHERE ds.doctor_id = c.doctor_id AND ds.service_id = c.service_id AND ds.active = TRUE\n    ) AS doctor_provides_service,\n    (c.starts_at >= now()) AS starts_in_future,\n    EXISTS (\n      SELECT 1 FROM doctor_schedules sch\n      WHERE sch.doctor_id = c.doctor_id\n        AND sch.active = TRUE\n        AND sch.day_of_week = EXTRACT(DOW FROM (c.starts_at AT TIME ZONE 'Asia/Kolkata'))::int\n        AND (c.starts_at AT TIME ZONE 'Asia/Kolkata')\n              >= date_trunc('day', c.starts_at AT TIME ZONE 'Asia/Kolkata') + sch.start_time\n        AND (c.blocking_end AT TIME ZONE 'Asia/Kolkata')\n              <= date_trunc('day', c.starts_at AT TIME ZONE 'Asia/Kolkata') + sch.end_time\n    ) AS within_schedule,\n    NOT EXISTS (\n      SELECT 1 FROM doctor_leave dl\n      WHERE dl.doctor_id = c.doctor_id\n        AND tstzrange(dl.starts_at, dl.ends_at, '[)') && tstzrange(c.starts_at, c.blocking_end, '[)')\n    ) AS not_on_leave,\n    NOT EXISTS (\n      SELECT 1 FROM appointments a\n      WHERE a.doctor_id = c.doctor_id\n        AND a.status <> 'CANCELLED'\n        AND a.blocking_range && tstzrange(c.starts_at, c.blocking_end, '[)')\n    ) AS no_conflict\n  FROM calc c\n  LEFT JOIN doctors d ON d.id = c.doctor_id\n)\nSELECT\n  starts_at,\n  ends_at,\n  (doctor_exists AND doctor_active AND service_active AND doctor_provides_service\n     AND starts_in_future AND within_schedule AND not_on_leave AND no_conflict) AS available,\n  CASE\n    WHEN NOT doctor_exists THEN 'The requested doctor could not be found.'\n    WHEN NOT doctor_active THEN 'The requested doctor is not currently active.'\n    WHEN NOT service_active THEN 'The requested service is not currently active.'\n    WHEN NOT doctor_provides_service THEN 'The doctor does not provide the requested service.'\n    WHEN NOT starts_in_future THEN 'The requested appointment time has already passed.'\n    WHEN NOT within_schedule THEN 'The requested time is outside the doctor''s working schedule.'\n    WHEN NOT not_on_leave THEN 'The doctor is on leave during this time.'\n    WHEN NOT no_conflict THEN 'The requested time conflicts with another appointment.'\n    ELSE 'The requested time is available.'\n  END AS reason\nFROM checks;",
+        "query": "WITH p AS (\n  SELECT\n    $1::uuid AS doctor_id,\n    $2::uuid AS service_id,\n    $3::timestamptz AS starts_at\n),\nsvc AS (\n  SELECT s.id, s.duration_minutes, s.buffer_minutes, s.active\n  FROM services s\n  JOIN p ON p.service_id = s.id\n),\ncalc AS (\n  SELECT\n    p.*,\n    p.starts_at + (svc.duration_minutes * interval '1 minute') AS ends_at,\n    p.starts_at + ((svc.duration_minutes + svc.buffer_minutes) * interval '1 minute') AS blocking_end,\n    svc.active AS service_active\n  FROM p\n  JOIN svc ON TRUE\n),\nresult AS (\n  SELECT\n    c.*,\n    EXISTS (\n      SELECT 1 FROM doctors d\n      WHERE d.id = c.doctor_id AND d.active = TRUE\n    ) AS doctor_active,\n    EXISTS (\n      SELECT 1 FROM doctor_services ds\n      WHERE ds.doctor_id = c.doctor_id\n        AND ds.service_id = c.service_id\n        AND ds.active = TRUE\n    ) AS doctor_provides_service,\n    c.starts_at > now() AS starts_in_future,\n    EXISTS (\n      SELECT 1\n      FROM doctor_schedules sch\n      WHERE sch.doctor_id = c.doctor_id\n        AND sch.active = TRUE\n        AND sch.day_of_week = EXTRACT(DOW FROM (c.starts_at AT TIME ZONE 'Asia/Kolkata'))::int\n        AND (c.starts_at AT TIME ZONE 'Asia/Kolkata') >=\n            date_trunc('day', c.starts_at AT TIME ZONE 'Asia/Kolkata') + sch.start_time\n        AND (c.blocking_end AT TIME ZONE 'Asia/Kolkata') <=\n            date_trunc('day', c.starts_at AT TIME ZONE 'Asia/Kolkata') + sch.end_time\n    ) AS within_schedule,\n    NOT EXISTS (\n      SELECT 1 FROM doctor_leave dl\n      WHERE dl.doctor_id = c.doctor_id\n        AND tstzrange(dl.starts_at, dl.ends_at, '[)') &&\n            tstzrange(c.starts_at, c.blocking_end, '[)')\n    ) AS not_on_leave,\n    NOT EXISTS (\n      SELECT 1 FROM appointments a\n      WHERE a.doctor_id = c.doctor_id\n        AND a.status = 'SCHEDULED'\n        AND a.blocking_range && tstzrange(c.starts_at, c.blocking_end, '[)')\n    ) AS no_conflict\n  FROM calc c\n)\nSELECT\n  starts_at,\n  ends_at,\n  (\n    doctor_active\n    AND service_active\n    AND doctor_provides_service\n    AND starts_in_future\n    AND within_schedule\n    AND not_on_leave\n    AND no_conflict\n  ) AS available,\n  CASE\n    WHEN NOT doctor_active THEN 'The requested doctor is not currently active.'\n    WHEN NOT service_active THEN 'The requested service is not currently active.'\n    WHEN NOT doctor_provides_service THEN 'The doctor does not provide this service.'\n    WHEN NOT starts_in_future THEN 'That appointment time has already passed.'\n    WHEN NOT within_schedule THEN 'That time is outside the doctor''s working hours.'\n    WHEN NOT not_on_leave THEN 'The doctor is unavailable during that time.'\n    WHEN NOT no_conflict THEN 'That time is already booked.'\n    ELSE 'The requested time is available.'\n  END AS reason\nFROM result;",
         "options": {
-          "queryReplacement": "={{ $fromAI('doctor_id', 'Doctor UUID returned earlier by check_doctor.', 'string') }}, {{ $fromAI('service_id', 'Service UUID returned earlier by check_doctor / known service.', 'string') }}, {{ $fromAI('starts_at', 'Requested appointment start as an ISO 8601 timestamp with the +05:30 Asia/Kolkata offset, e.g. 2026-09-15T17:00:00+05:30', 'string') }}"
+          "queryReplacement": "={{ $fromAI('doctor_id', 'Exact doctor UUID returned by check_doctor.', 'string') }}, {{ $fromAI('service_id', 'Exact service UUID returned by check_doctor.', 'string') }}, {{ $fromAI('starts_at', 'ISO timestamp including +05:30 offset.', 'string') }}"
         }
       },
       "name": "check_availability",
       "type": "n8n-nodes-base.postgresTool",
       "typeVersion": 2.5,
       "position": [
-        980,
-        -90
+        1100,
+        -100
       ],
       "id": "check_availability",
       "credentials": {
         "postgres": {
           "id": "PLACEHOLDER_POSTGRES_CRED",
-          "name": "Appointments Postgres (placeholder)"
+          "name": "Appointments Postgres"
         }
-      },
-      "notes": "Read-only diagnostic check against doctors, services, doctor_services, doctor_schedules, doctor_leave and appointments (using the real blocking_range). AI-supplied doctor_id/service_id/starts_at are bound as query parameters ($1/$2/$3), never concatenated into the SQL string. Returns exactly one row with 'available' (boolean) and 'reason' (plain text) - use these two fields directly rather than inferring availability from other fields. Both the doctor-schedule boundary check and the doctor-leave overlap check use the FULL blocking period (starts_at through blocking_end = starts_at + service duration + service buffer), not just the appointment's own end time, so a buffer that would push past closing time or into a leave period correctly makes available = false. The schedule boundary check compares starts_at and blocking_end as full local timestamps anchored to starts_at's own Asia/Kolkata calendar date (date_trunc('day', local starts_at) + sch.start_time / end_time), not by truncating to ::time - a ::time-only comparison would silently wrap a past-midnight instant back into an early value (e.g. 00:30) and could wrongly look like it is still before closing time. Since doctor_schedules rows are always same-day (end_time > start_time), any blocking_end that has actually crossed into the next calendar date is therefore correctly excluded and available = false with the schedule reason. A starts_at that is not strictly in the future (compared against the database's own now()) also makes available = false with reason 'The requested appointment time has already passed.' - this is a database-level check independent of the AI's own date interpretation."
+      }
     },
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "WITH input AS (\n  SELECT $1::text AS phone\n),\npatient_row AS (\n  -- Pure retrieval: get_patient never creates or updates a patient row.\n  -- Registration is handled exclusively by the separate register_patient\n  -- tool, so this tool cannot silently mutate patient data.\n  SELECT p.id AS patient_id, p.full_name\n  FROM patients p, input\n  WHERE p.whatsapp_phone = input.phone\n),\nupcoming AS (\n  SELECT\n    a.patient_id,\n    jsonb_agg(\n      jsonb_build_object(\n        'appointment_id', a.id,\n        'doctor_id', a.doctor_id,\n        'doctor_name', d.full_name,\n        'service_id', a.service_id,\n        'service_name', s.name,\n        'starts_at', a.starts_at,\n        'ends_at', a.ends_at,\n        'status', a.status,\n        'revision', a.revision\n      )\n      ORDER BY a.starts_at\n    ) AS appointments\n  FROM appointments a\n  JOIN doctors d ON d.id = a.doctor_id\n  JOIN services s ON s.id = a.service_id\n  WHERE a.patient_id IN (SELECT patient_id FROM patient_row)\n    AND a.status = 'SCHEDULED'\n    AND a.starts_at >= now()\n  GROUP BY a.patient_id\n)\nSELECT\n  pr.patient_id,\n  pr.full_name,\n  COALESCE(u.appointments, '[]'::jsonb) AS upcoming_appointments\nFROM patient_row pr\nLEFT JOIN upcoming u ON u.patient_id = pr.patient_id;",
+        "query": "WITH patient_row AS (\n  SELECT id, full_name\n  FROM patients\n  WHERE whatsapp_phone = $1\n),\nupcoming AS (\n  SELECT\n    a.patient_id,\n    jsonb_agg(\n      jsonb_build_object(\n        'appointment_id', a.id,\n        'doctor_id', a.doctor_id,\n        'doctor_name', d.full_name,\n        'service_id', a.service_id,\n        'service_name', s.name,\n        'starts_at', a.starts_at,\n        'ends_at', a.ends_at,\n        'revision', a.revision,\n        'status', a.status\n      ) ORDER BY a.starts_at\n    ) AS appointments\n  FROM appointments a\n  JOIN doctors d ON d.id = a.doctor_id\n  JOIN services s ON s.id = a.service_id\n  JOIN patient_row p ON p.id = a.patient_id\n  WHERE a.status = 'SCHEDULED'\n    AND a.starts_at >= now()\n  GROUP BY a.patient_id\n)\nSELECT\n  p.id AS patient_id,\n  p.full_name,\n  COALESCE(u.appointments, '[]'::jsonb) AS upcoming_appointments\nFROM patient_row p\nLEFT JOIN upcoming u ON u.patient_id = p.id;",
         "options": {
           "queryReplacement": "={{ $('Normalize Message').item.json.normalized_phone }}"
         }
@@ -190,129 +205,113 @@
       "type": "n8n-nodes-base.postgresTool",
       "typeVersion": 2.5,
       "position": [
-        980,
+        1100,
         80
       ],
       "id": "get_patient",
       "credentials": {
         "postgres": {
           "id": "PLACEHOLDER_POSTGRES_CRED",
-          "name": "Appointments Postgres (placeholder)"
+          "name": "Appointments Postgres"
         }
-      },
-      "notes": "READ-ONLY lookup of the patient by their WhatsApp number - never creates or updates a patient row (that mutation is handled exclusively by the separate register_patient tool). The phone ($1) is bound directly from this conversation's Normalize Message output, never from the AI - the agent cannot supply or alter it and no other value is accepted. If the phone is not yet registered, zero rows are returned; the AI should then ask for the patient's name and call register_patient (not get_patient) to create the record, then call get_patient again. The projected output is limited to patient_id, full_name, and upcoming_appointments only - date_of_birth, email and whatsapp_phone are never exposed to the AI, since they are not required for any appointment operation. 'upcoming_appointments' is a JSON array of {appointment_id, doctor_id, doctor_name, service_id, service_name, starts_at, ends_at, status, revision} for that patient's SCHEDULED appointments starting now or later (empty array if none) - scoped strictly to this phone number's patient_id, never another patient's appointments. The 'revision' field is the exact value that must be passed back as expected_revision to reschedule_appointment; because reschedule_appointment now requires optimistic-concurrency matching on this value, the AI MUST call get_patient again immediately before every reschedule to get a fresh revision rather than reusing one remembered from earlier in the conversation. Never call get_patient with a different phone number than this conversation's."
+      }
     },
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "WITH input AS (\n  SELECT\n    $1::text AS phone,\n    -- Trimmed server-side regardless of what the AI sends, so surrounding\n    -- whitespace never reaches the patients table. chk_patients_full_name_valid\n    -- is the authoritative backstop (rejects NULL/empty/whitespace-only/too-long),\n    -- this WHERE guard just avoids attempting (and erroring on) an obviously\n    -- empty write.\n    NULLIF(btrim($2::text), '') AS full_name\n),\ninserted AS (\n  -- Atomic, concurrency-safe upsert: INSERT ... ON CONFLICT (whatsapp_phone).\n  -- DO UPDATE with a no-op assignment (full_name = patients.full_name) rather\n  -- than DO NOTHING, specifically so RETURNING also fires - and returns the\n  -- CURRENT committed row - when this call loses a concurrent registration\n  -- race, instead of surfacing a unique-constraint error or returning\n  -- nothing. (xmax = 0) is TRUE only for a row this statement itself just\n  -- inserted, and FALSE when the conflict branch fired (someone else's row\n  -- already existed), which is how newly_registered is derived without a\n  -- second query. This is the ONLY tool that ever creates or updates a\n  -- patients row - get_patient is pure retrieval.\n  INSERT INTO patients (whatsapp_phone, full_name)\n  SELECT input.phone, input.full_name\n  FROM input\n  WHERE input.full_name IS NOT NULL\n  ON CONFLICT (whatsapp_phone) DO UPDATE\n    SET full_name = patients.full_name\n  RETURNING id, full_name, (xmax = 0) AS newly_registered\n)\nSELECT id AS patient_id, full_name, newly_registered FROM inserted;",
+        "query": "WITH input AS (\n  SELECT\n    $1::text AS operation_id,\n    $2::text AS phone,\n    $3::uuid AS doctor_id,\n    $4::uuid AS service_id,\n    $5::timestamptz AS starts_at,\n    NULLIF(btrim($6::text), '') AS notes,\n    NULLIF(btrim($7::text), '') AS full_name\n),\nexisting_operation AS (\n  SELECT result\n  FROM appointment_operations\n  WHERE operation_id = (SELECT operation_id FROM input)\n),\nnew_operation AS (\n  INSERT INTO appointment_operations (\n    operation_id,\n    operation_type,\n    normalized_phone,\n    status,\n    result\n  )\n  SELECT operation_id, 'BOOK', phone, 'COMPLETED', '{}'::jsonb\n  FROM input\n  WHERE NOT EXISTS (SELECT 1 FROM existing_operation)\n  RETURNING operation_id\n),\npatient_upsert AS (\n  INSERT INTO patients (whatsapp_phone, full_name)\n  SELECT phone, full_name\n  FROM input\n  WHERE full_name IS NOT NULL\n    AND EXISTS (SELECT 1 FROM new_operation)\n  ON CONFLICT (whatsapp_phone) DO NOTHING\n  RETURNING id\n),\npatient AS (\n  SELECT p.id\n  FROM patients p, input\n  WHERE p.whatsapp_phone = input.phone\n),\nsvc AS (\n  SELECT s.id, s.duration_minutes, s.buffer_minutes\n  FROM services s, input\n  WHERE s.id = input.service_id\n    AND s.active = TRUE\n),\nvalid AS (\n  SELECT\n    input.*,\n    patient.id AS patient_id,\n    svc.duration_minutes,\n    svc.buffer_minutes\n  FROM input\n  JOIN patient ON TRUE\n  JOIN svc ON TRUE\n  WHERE EXISTS (SELECT 1 FROM new_operation)\n    AND EXISTS (\n      SELECT 1 FROM doctors d\n      WHERE d.id = input.doctor_id AND d.active = TRUE\n    )\n    AND EXISTS (\n      SELECT 1 FROM doctor_services ds\n      WHERE ds.doctor_id = input.doctor_id\n        AND ds.service_id = input.service_id\n        AND ds.active = TRUE\n    )\n    AND input.starts_at > now()\n    AND EXISTS (\n      SELECT 1\n      FROM doctor_schedules sch\n      WHERE sch.doctor_id = input.doctor_id\n        AND sch.active = TRUE\n        AND sch.day_of_week = EXTRACT(DOW FROM (input.starts_at AT TIME ZONE 'Asia/Kolkata'))::int\n        AND (input.starts_at AT TIME ZONE 'Asia/Kolkata') >=\n            date_trunc('day', input.starts_at AT TIME ZONE 'Asia/Kolkata') + sch.start_time\n        AND ((input.starts_at + ((svc.duration_minutes + svc.buffer_minutes) * interval '1 minute')) AT TIME ZONE 'Asia/Kolkata') <=\n            date_trunc('day', input.starts_at AT TIME ZONE 'Asia/Kolkata') + sch.end_time\n    )\n),\ncreated AS (\n  INSERT INTO appointments (\n    patient_id,\n    doctor_id,\n    service_id,\n    starts_at,\n    ends_at,\n    status,\n    notes\n  )\n  SELECT\n    patient_id,\n    doctor_id,\n    service_id,\n    starts_at,\n    starts_at + (duration_minutes * interval '1 minute'),\n    'SCHEDULED',\n    notes\n  FROM valid\n  RETURNING id, patient_id, doctor_id, service_id, starts_at, ends_at, status, revision\n),\noperation_update AS (\n  UPDATE appointment_operations op\n  SET appointment_id = created.id,\n      result = jsonb_build_object(\n        'success', true,\n        'appointment_id', created.id,\n        'starts_at', created.starts_at,\n        'ends_at', created.ends_at,\n        'status', created.status,\n        'revision', created.revision\n      )\n  FROM created\n  WHERE op.operation_id = (SELECT operation_id FROM input)\n  RETURNING op.result\n),\noutbox AS (\n  INSERT INTO integration_outbox (\n    aggregate_type,\n    aggregate_id,\n    operation,\n    payload,\n    idempotency_key\n  )\n  SELECT\n    'APPOINTMENT',\n    id,\n    'CREATE',\n    jsonb_build_object(\n      'appointment_id', id,\n      'patient_id', patient_id,\n      'doctor_id', doctor_id,\n      'service_id', service_id,\n      'starts_at', starts_at,\n      'ends_at', ends_at,\n      'revision', revision\n    ),\n    'CREATE:' || id::text\n  FROM created\n  ON CONFLICT (idempotency_key) DO NOTHING\n),\naudit AS (\n  INSERT INTO audit_log (\n    actor_type,\n    action,\n    entity_type,\n    entity_id,\n    metadata\n  )\n  SELECT\n    'AI_AGENT',\n    'BOOK_APPOINTMENT',\n    'APPOINTMENT',\n    id,\n    jsonb_build_object(\n      'channel', 'whatsapp',\n      'operation_id', (SELECT operation_id FROM input)\n    )\n  FROM created\n)\nSELECT result\nFROM existing_operation\nUNION ALL\nSELECT result FROM operation_update;",
         "options": {
-          "queryReplacement": "={{ $('Normalize Message').item.json.normalized_phone }}, {{ $fromAI('full_name', \"Patient's full name, exactly as given, only call this when get_patient found no existing patient and the patient has just told you their name.\", 'string') }}"
-        }
-      },
-      "name": "register_patient",
-      "type": "n8n-nodes-base.postgresTool",
-      "typeVersion": 2.5,
-      "position": [
-        980,
-        160
-      ],
-      "id": "register_patient",
-      "credentials": {
-        "postgres": {
-          "id": "PLACEHOLDER_POSTGRES_CRED",
-          "name": "Appointments Postgres (placeholder)"
-        }
-      },
-      "notes": "The ONLY tool that creates or updates a patients row - get_patient is strictly read-only and never touches this table. Only call this after get_patient returned zero rows for this phone number AND the patient has just supplied their name. The phone ($1) is bound from Normalize Message, never from the AI. full_name ($2) is AI-supplied, bound as a query parameter (never concatenated into SQL), and is trimmed server-side (btrim) before use regardless of what the AI sends. patients.chk_patients_full_name_valid additionally rejects NULL, empty, whitespace-only, or unreasonably long (>200 char) names at the database level - legitimate Indian/international names and non-ASCII characters are never restricted. Concurrency: two simultaneous first-time registrations for the same phone number cannot race a plain 'check-then-insert' - INSERT ... ON CONFLICT (whatsapp_phone) DO UPDATE (no-op) always returns exactly one row for whichever request actually created the patient row, and the losing request's own INSERT transparently turns into the UPDATE branch and returns that same already-committed row via RETURNING. Exactly one patient row is ever created per phone number. After a successful call, call get_patient again to proceed with booking using the returned patient context."
-    },
-    {
-      "parameters": {
-        "operation": "executeQuery",
-        "query": "WITH input AS (\n  SELECT\n    $1::text AS phone,\n    $2::uuid AS doctor_id,\n    $3::uuid AS service_id,\n    $4::timestamptz AS starts_at,\n    NULLIF($5, '') AS notes\n),\npatient AS (\n  SELECT p.id AS patient_id FROM patients p, input WHERE p.whatsapp_phone = input.phone\n),\ndoc AS (\n  SELECT d.id FROM doctors d, input WHERE d.id = input.doctor_id AND d.active = TRUE\n),\nsvc AS (\n  SELECT s.id, s.duration_minutes, s.buffer_minutes\n  FROM services s, input\n  WHERE s.id = input.service_id AND s.active = TRUE\n),\ndoc_svc AS (\n  SELECT 1\n  FROM doctor_services ds, input\n  WHERE ds.doctor_id = input.doctor_id\n    AND ds.service_id = input.service_id\n    AND ds.active = TRUE\n),\ncalc AS (\n  SELECT\n    input.starts_at AS starts_at,\n    input.starts_at + (COALESCE((SELECT duration_minutes FROM svc), 0) * interval '1 minute') AS ends_at,\n    input.starts_at + (\n      (COALESCE((SELECT duration_minutes FROM svc), 0) + COALESCE((SELECT buffer_minutes FROM svc), 0))\n      * interval '1 minute'\n    ) AS blocking_end\n  FROM input\n),\nschedule_ok AS (\n  SELECT 1\n  FROM doctor_schedules sch, input, calc\n  WHERE sch.doctor_id = input.doctor_id\n    AND sch.active = TRUE\n    AND sch.day_of_week = EXTRACT(DOW FROM (calc.starts_at AT TIME ZONE 'Asia/Kolkata'))::int\n    AND (calc.starts_at AT TIME ZONE 'Asia/Kolkata')\n          >= date_trunc('day', calc.starts_at AT TIME ZONE 'Asia/Kolkata') + sch.start_time\n    AND (calc.blocking_end AT TIME ZONE 'Asia/Kolkata')\n          <= date_trunc('day', calc.starts_at AT TIME ZONE 'Asia/Kolkata') + sch.end_time\n),\nnew_appt AS (\n  INSERT INTO appointments (patient_id, doctor_id, service_id, starts_at, ends_at, status, notes)\n  SELECT\n    patient.patient_id,\n    input.doctor_id,\n    svc.id,\n    calc.starts_at,\n    calc.ends_at,\n    'SCHEDULED',\n    input.notes\n  FROM input\n  JOIN patient ON TRUE\n  JOIN doc ON TRUE\n  JOIN svc ON TRUE\n  JOIN calc ON TRUE\n  WHERE input.starts_at >= now()\n    AND EXISTS (SELECT 1 FROM patient)\n    AND EXISTS (SELECT 1 FROM doc)\n    AND EXISTS (SELECT 1 FROM svc)\n    AND EXISTS (SELECT 1 FROM doc_svc)\n    AND EXISTS (SELECT 1 FROM schedule_ok)\n  RETURNING id, patient_id, doctor_id, service_id, starts_at, ends_at, status\n),\noutbox AS (\n  INSERT INTO integration_outbox (aggregate_type, aggregate_id, operation, payload, idempotency_key)\n  SELECT\n    'APPOINTMENT', new_appt.id, 'CREATE',\n    jsonb_build_object(\n      'appointment_id', new_appt.id, 'patient_id', new_appt.patient_id,\n      'doctor_id', new_appt.doctor_id, 'service_id', new_appt.service_id,\n      'starts_at', new_appt.starts_at, 'ends_at', new_appt.ends_at\n    ),\n    'CREATE:' || new_appt.id::text\n  FROM new_appt\n  RETURNING id\n),\naudit AS (\n  INSERT INTO audit_log (actor_type, action, entity_type, entity_id, metadata)\n  SELECT\n    'AI_AGENT', 'BOOK_APPOINTMENT', 'APPOINTMENT', new_appt.id,\n    jsonb_build_object('starts_at', new_appt.starts_at, 'ends_at', new_appt.ends_at, 'channel', 'whatsapp')\n  FROM new_appt\n  RETURNING id\n)\nSELECT new_appt.id AS appointment_id, new_appt.starts_at, new_appt.ends_at, new_appt.status\nFROM new_appt;",
-        "options": {
-          "queryReplacement": "={{ $('Normalize Message').item.json.normalized_phone }}, {{ $fromAI('doctor_id', 'Doctor UUID already confirmed via check_doctor/check_availability.', 'string') }}, {{ $fromAI('service_id', 'Service UUID already confirmed via check_doctor/check_availability.', 'string') }}, {{ $fromAI('starts_at', 'Confirmed appointment start as an ISO 8601 timestamp with the +05:30 Asia/Kolkata offset.', 'string') }}, {{ $fromAI('notes', 'Optional short note about the visit reason. Empty string if none.', 'string') }}"
+          "queryReplacement": "={{ $('Normalize Message').item.json.wa_message_id }}, {{ $('Normalize Message').item.json.normalized_phone }}, {{ $fromAI('doctor_id', 'Exact doctor UUID.', 'string') }}, {{ $fromAI('service_id', 'Exact service UUID.', 'string') }}, {{ $fromAI('starts_at', 'Confirmed ISO timestamp.', 'string') }}, {{ $fromAI('notes', 'Optional visit note.', 'string') }}, {{ $fromAI('full_name', 'Patient full name only for a new patient.', 'string') }}"
         }
       },
       "name": "book_appointment",
       "type": "n8n-nodes-base.postgresTool",
       "typeVersion": 2.5,
       "position": [
-        980,
-        250
+        1100,
+        260
       ],
       "id": "book_appointment",
       "credentials": {
         "postgres": {
           "id": "PLACEHOLDER_POSTGRES_CRED",
-          "name": "Appointments Postgres (placeholder)"
+          "name": "Appointments Postgres"
         }
-      },
-      "notes": "Single atomic statement: inserts the appointment, the integration_outbox CREATE row, and the audit_log row together (all-or-nothing). The patient phone ($1) is bound from Normalize Message, never from the AI; doctor_id/service_id/starts_at/notes ($2-$5) are AI-supplied and bound as query parameters, never concatenated into the SQL string. Write-time gates independently re-verify, via explicit EXISTS checks in the INSERT's WHERE clause (not just COALESCE fallbacks): patient exists for this phone, doctor is active, service exists and is active, the doctor actually offers that service (doctor_services), the requested starts_at is strictly in the future (compared against the database's own now(), not the AI's date interpretation), and the full blocking period (service duration + buffer) fits inside a single active Asia/Kolkata doctor_schedules row for that same local calendar date - it does not rely solely on check_availability. As in check_availability, this comparison anchors both bounds to starts_at's own local calendar date (date_trunc('day', local starts_at) + sch.start_time / end_time) rather than truncating to ::time, so a requested time whose service duration + buffer pushes past local midnight is correctly rejected instead of silently wrapping into an early-morning-looking value. The database's own trg_appointments_schedule_check trigger is the final authority on this rule regardless of what this workflow-level gate computes. The explicit EXISTS (SELECT 1 FROM patient/doc/svc) checks make each precondition an unambiguous, self-documenting invariant of the INSERT rather than relying only on the incidental effect of the 'JOIN ... ON TRUE' clauses (an inner join against an empty CTE already yields zero rows today, but that is easy to silently break with a future edit, e.g. if a join were ever changed to a LEFT JOIN). In particular EXISTS (SELECT 1 FROM svc) makes explicit that a missing/inactive service_id must produce zero inserted rows, not an appointment whose ends_at was computed from the COALESCE(duration_minutes, 0) fallback used only for the calc CTE's arithmetic. If any gate fails, or the patient/doctor/service doesn't exist, zero rows are returned and nothing is inserted. The database's own trg_appointments_blocking_range trigger and chk_services_duration_positive/exc_appointments_no_doctor_overlap constraints remain the final, authoritative protection for duration matching, leave enforcement and doctor double-booking - this workflow-level EXISTS check is defense-in-depth, not a replacement for them. Only call this after check_availability confirmed the slot and get_patient confirmed the patient. Never touches Google Calendar."
+      }
     },
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "WITH input AS (\n  SELECT\n    $1::text AS phone,\n    $2::uuid AS appointment_id,\n    $3::timestamptz AS new_starts_at,\n    $4::integer AS expected_revision\n),\ntarget AS (\n  -- Deliberately NOT filtered to status = 'SCHEDULED' here (unlike the\n  -- previous version) so we can tell \"not found / not this patient's\" apart\n  -- from \"found but not reschedulable\" and from \"found but stale revision\"\n  -- in the diagnostic reason below.\n  SELECT a.id, a.doctor_id, a.service_id, a.status, a.revision,\n         s.duration_minutes, s.buffer_minutes\n  FROM appointments a\n  JOIN services s ON s.id = a.service_id\n  JOIN patients p ON p.id = a.patient_id\n  JOIN input ON a.id = input.appointment_id\n  WHERE p.whatsapp_phone = input.phone\n),\ndoc AS (\n  SELECT d.id FROM doctors d, target WHERE d.id = target.doctor_id AND d.active = TRUE\n),\nsvc AS (\n  SELECT s.id FROM services s, target WHERE s.id = target.service_id AND s.active = TRUE\n),\ndoc_svc AS (\n  SELECT 1 FROM doctor_services ds, target\n  WHERE ds.doctor_id = target.doctor_id AND ds.service_id = target.service_id AND ds.active = TRUE\n),\ncalc AS (\n  SELECT\n    input.new_starts_at AS starts_at,\n    input.new_starts_at + (target.duration_minutes * interval '1 minute') AS ends_at,\n    input.new_starts_at + ((target.duration_minutes + target.buffer_minutes) * interval '1 minute') AS blocking_end\n  FROM input, target\n),\nschedule_ok AS (\n  SELECT 1\n  FROM doctor_schedules sch, target, calc\n  WHERE sch.doctor_id = target.doctor_id\n    AND sch.active = TRUE\n    AND sch.day_of_week = EXTRACT(DOW FROM (calc.starts_at AT TIME ZONE 'Asia/Kolkata'))::int\n    AND (calc.starts_at AT TIME ZONE 'Asia/Kolkata')\n          >= date_trunc('day', calc.starts_at AT TIME ZONE 'Asia/Kolkata') + sch.start_time\n    AND (calc.blocking_end AT TIME ZONE 'Asia/Kolkata')\n          <= date_trunc('day', calc.starts_at AT TIME ZONE 'Asia/Kolkata') + sch.end_time\n),\n-- OPTIMISTIC CONCURRENCY: the UPDATE below only ever succeeds when the\n-- appointment is still SCHEDULED *and* its current revision still equals\n-- expected_revision (the revision value the patient's fresh get_patient\n-- call most recently saw). Postgres re-checks this condition against the\n-- live row under the row lock the UPDATE takes, so a stale revision (the\n-- appointment was changed by someone/something else since the AI last\n-- looked) safely fails the WHERE clause and updates nothing rather than\n-- overwriting newer data - it can never \"win\" a race against a concurrent\n-- successful reschedule. Successful update increments revision by exactly\n-- 1, enforced additionally by trg_appointments_revision_integrity.\nupdated AS (\n  UPDATE appointments a\n  SET starts_at = calc.starts_at,\n      ends_at = calc.ends_at,\n      revision = a.revision + 1\n  FROM target, calc, input\n  WHERE a.id = target.id\n    AND target.status = 'SCHEDULED'\n    AND target.revision = input.expected_revision\n    AND calc.starts_at >= now()\n    AND EXISTS (SELECT 1 FROM doc)\n    AND EXISTS (SELECT 1 FROM svc)\n    AND EXISTS (SELECT 1 FROM doc_svc)\n    AND EXISTS (SELECT 1 FROM schedule_ok)\n  RETURNING a.id, a.doctor_id, a.starts_at, a.ends_at, a.status, a.revision\n),\noutbox AS (\n  INSERT INTO integration_outbox (aggregate_type, aggregate_id, operation, payload, idempotency_key)\n  SELECT\n    'APPOINTMENT', updated.id, 'UPDATE',\n    jsonb_build_object(\n      'appointment_id', updated.id, 'doctor_id', updated.doctor_id,\n      'starts_at', updated.starts_at, 'ends_at', updated.ends_at,\n      'revision', updated.revision\n    ),\n    'UPDATE:' || updated.id::text || ':' || updated.revision::text\n  FROM updated\n  ON CONFLICT (idempotency_key) DO NOTHING\n  RETURNING id\n),\naudit AS (\n  -- Only ever inserted for a row present in 'updated', i.e. only when the\n  -- mutation actually succeeded - so audit always corresponds 1:1 to a\n  -- real, successful revision-checked reschedule, never to a rejected\n  -- (stale-revision or otherwise failed) attempt.\n  INSERT INTO audit_log (actor_type, action, entity_type, entity_id, metadata)\n  SELECT\n    'AI_AGENT', 'RESCHEDULE_APPOINTMENT', 'APPOINTMENT', updated.id,\n    jsonb_build_object(\n      'new_starts_at', updated.starts_at, 'new_ends_at', updated.ends_at,\n      'revision', updated.revision, 'expected_revision', input.expected_revision,\n      'channel', 'whatsapp'\n    )\n  FROM updated, input\n  RETURNING id\n)\nSELECT\n  (SELECT id FROM updated) AS appointment_id,\n  (SELECT starts_at FROM updated) AS starts_at,\n  (SELECT ends_at FROM updated) AS ends_at,\n  (SELECT status FROM updated) AS status,\n  (SELECT revision FROM updated) AS revision,\n  EXISTS (SELECT 1 FROM updated) AS success,\n  -- Ordered so the AI gets a single, unambiguous, plain-language-mappable\n  -- reason whenever success = false, including a distinct 'revision_conflict'\n  -- the AI can recognize as \"someone/something already changed this\n  -- appointment - look it up again\" rather than a generic failure.\n  CASE\n    WHEN EXISTS (SELECT 1 FROM updated) THEN 'ok'\n    WHEN NOT EXISTS (SELECT 1 FROM target) THEN 'not_found'\n    WHEN (SELECT status FROM target) <> 'SCHEDULED' THEN 'not_schedulable'\n    WHEN (SELECT revision FROM target) <> (SELECT expected_revision FROM input) THEN 'revision_conflict'\n    WHEN NOT EXISTS (SELECT 1 FROM doc) THEN 'doctor_inactive'\n    WHEN NOT EXISTS (SELECT 1 FROM svc) THEN 'service_inactive'\n    WHEN NOT EXISTS (SELECT 1 FROM doc_svc) THEN 'doctor_service_mismatch'\n    WHEN (SELECT starts_at FROM calc) < now() THEN 'starts_at_in_past'\n    WHEN NOT EXISTS (SELECT 1 FROM schedule_ok) THEN 'outside_schedule_or_conflict'\n    ELSE 'unavailable'\n  END AS reason;",
+        "query": "WITH input AS (\n  SELECT\n    $1::text AS operation_id,\n    $2::text AS phone,\n    $3::uuid AS appointment_id,\n    $4::timestamptz AS new_starts_at,\n    $5::integer AS expected_revision\n),\nexisting_operation AS (\n  SELECT result\n  FROM appointment_operations\n  WHERE operation_id = (SELECT operation_id FROM input)\n),\ntarget AS (\n  SELECT\n    a.id,\n    a.doctor_id,\n    a.service_id,\n    a.status,\n    a.revision,\n    s.duration_minutes,\n    s.buffer_minutes\n  FROM appointments a\n  JOIN patients p ON p.id = a.patient_id\n  JOIN services s ON s.id = a.service_id\n  JOIN input ON input.appointment_id = a.id\n  WHERE p.whatsapp_phone = input.phone\n),\nnew_operation AS (\n  INSERT INTO appointment_operations (\n    operation_id,\n    operation_type,\n    normalized_phone,\n    appointment_id,\n    status,\n    result\n  )\n  SELECT\n    operation_id,\n    'RESCHEDULE',\n    phone,\n    appointment_id,\n    'COMPLETED',\n    '{}'::jsonb\n  FROM input\n  WHERE NOT EXISTS (SELECT 1 FROM existing_operation)\n  RETURNING operation_id\n),\nupdated AS (\n  UPDATE appointments a\n  SET starts_at = input.new_starts_at,\n      ends_at = input.new_starts_at + (target.duration_minutes * interval '1 minute'),\n      revision = a.revision + 1\n  FROM input\n  JOIN target ON target.id = input.appointment_id\n  WHERE EXISTS (SELECT 1 FROM new_operation)\n    AND a.id = target.id\n    AND a.status = 'SCHEDULED'\n    AND a.revision = input.expected_revision\n    AND input.new_starts_at > now()\n    AND EXISTS (\n      SELECT 1 FROM doctors d\n      WHERE d.id = target.doctor_id AND d.active = TRUE\n    )\n    AND EXISTS (\n      SELECT 1 FROM services s\n      WHERE s.id = target.service_id AND s.active = TRUE\n    )\n    AND EXISTS (\n      SELECT 1 FROM doctor_services ds\n      WHERE ds.doctor_id = target.doctor_id\n        AND ds.service_id = target.service_id\n        AND ds.active = TRUE\n    )\n    AND EXISTS (\n      SELECT 1\n      FROM doctor_schedules sch\n      WHERE sch.doctor_id = target.doctor_id\n        AND sch.active = TRUE\n        AND sch.day_of_week = EXTRACT(DOW FROM (input.new_starts_at AT TIME ZONE 'Asia/Kolkata'))::int\n        AND (input.new_starts_at AT TIME ZONE 'Asia/Kolkata') >=\n            date_trunc('day', input.new_starts_at AT TIME ZONE 'Asia/Kolkata') + sch.start_time\n        AND ((input.new_starts_at + ((target.duration_minutes + target.buffer_minutes) * interval '1 minute')) AT TIME ZONE 'Asia/Kolkata') <=\n            date_trunc('day', input.new_starts_at AT TIME ZONE 'Asia/Kolkata') + sch.end_time\n    )\n  RETURNING a.id, a.doctor_id, a.service_id, a.starts_at, a.ends_at, a.status, a.revision\n),\noperation_update AS (\n  UPDATE appointment_operations op\n  SET result = jsonb_build_object(\n    'success', true,\n    'appointment_id', updated.id,\n    'starts_at', updated.starts_at,\n    'ends_at', updated.ends_at,\n    'status', updated.status,\n    'revision', updated.revision\n  )\n  FROM updated\n  WHERE op.operation_id = (SELECT operation_id FROM input)\n  RETURNING op.result\n),\noutbox AS (\n  INSERT INTO integration_outbox (\n    aggregate_type,\n    aggregate_id,\n    operation,\n    payload,\n    idempotency_key\n  )\n  SELECT\n    'APPOINTMENT',\n    id,\n    'UPDATE',\n    jsonb_build_object(\n      'appointment_id', id,\n      'doctor_id', doctor_id,\n      'service_id', service_id,\n      'starts_at', starts_at,\n      'ends_at', ends_at,\n      'revision', revision\n    ),\n    'UPDATE:' || id::text || ':' || revision::text\n  FROM updated\n  ON CONFLICT (idempotency_key) DO NOTHING\n),\naudit AS (\n  INSERT INTO audit_log (\n    actor_type,\n    action,\n    entity_type,\n    entity_id,\n    metadata\n  )\n  SELECT\n    'AI_AGENT',\n    'RESCHEDULE_APPOINTMENT',\n    'APPOINTMENT',\n    id,\n    jsonb_build_object(\n      'channel', 'whatsapp',\n      'operation_id', (SELECT operation_id FROM input),\n      'revision', revision\n    )\n  FROM updated\n)\nSELECT result FROM existing_operation\nUNION ALL\nSELECT result FROM operation_update\nUNION ALL\nSELECT jsonb_build_object(\n  'success', false,\n  'appointment_id', input.appointment_id,\n  'reason', CASE\n    WHEN NOT EXISTS (SELECT 1 FROM target) THEN 'not_found'\n    WHEN (SELECT status FROM target) <> 'SCHEDULED' THEN 'not_schedulable'\n    WHEN (SELECT revision FROM target) <> input.expected_revision THEN 'revision_conflict'\n    ELSE 'unavailable'\n  END\n)\nFROM input\nWHERE EXISTS (SELECT 1 FROM new_operation)\n  AND NOT EXISTS (SELECT 1 FROM updated);",
         "options": {
-          "queryReplacement": "={{ $('Normalize Message').item.json.normalized_phone }}, {{ $fromAI('appointment_id', 'UUID of the appointment to move, already confirmed as belonging to this patient via a FRESH get_patient call.', 'string') }}, {{ $fromAI('new_starts_at', 'New confirmed start time as an ISO 8601 timestamp with the +05:30 Asia/Kolkata offset.', 'string') }}, {{ $fromAI('expected_revision', 'The exact revision number for this appointment as just returned by the FRESH get_patient call in this turn. Never reuse a revision value remembered from an earlier turn.', 'number') }}"
+          "queryReplacement": "={{ $('Normalize Message').item.json.wa_message_id }}, {{ $('Normalize Message').item.json.normalized_phone }}, {{ $fromAI('appointment_id', 'Appointment UUID from the fresh get_patient result.', 'string') }}, {{ $fromAI('new_starts_at', 'New confirmed ISO timestamp.', 'string') }}, {{ $fromAI('expected_revision', 'Exact revision from the fresh get_patient result.', 'number') }}"
         }
       },
       "name": "reschedule_appointment",
       "type": "n8n-nodes-base.postgresTool",
       "typeVersion": 2.5,
       "position": [
-        980,
-        420
+        1100,
+        440
       ],
       "id": "reschedule_appointment",
       "credentials": {
         "postgres": {
           "id": "PLACEHOLDER_POSTGRES_CRED",
-          "name": "Appointments Postgres (placeholder)"
+          "name": "Appointments Postgres"
         }
-      },
-      "notes": "Atomically moves an appointment's time using OPTIMISTIC CONCURRENCY on appointments.revision, and writes the integration_outbox UPDATE + audit_log rows together (all only on success). The patient phone ($1) is bound from Normalize Message, never from the AI; appointment_id/new_starts_at/expected_revision ($2-$4) are AI-supplied and bound as query parameters, never concatenated into the SQL string. The UPDATE's WHERE clause requires BOTH target.status = 'SCHEDULED' AND target.revision = expected_revision to hold against the live row at update time (Postgres re-checks this under the row lock the UPDATE takes), so a stale revision - the appointment was already changed since the AI's last get_patient call - safely updates zero rows instead of overwriting newer data; it can never race past a concurrent successful reschedule. On success, revision is incremented by exactly 1 in the same statement (trg_appointments_revision_integrity additionally guarantees this at the database level regardless of caller). Write-time gates re-verify the doctor is active, the service is active, the doctor still offers that service, the new new_starts_at is strictly in the future (compared against the database's own now()), and the new blocking period fits inside a single active Asia/Kolkata doctor_schedules row for that same local calendar date before the UPDATE runs, using the same midnight-safe, calendar-date-anchored comparison as check_availability and book_appointment. The database's own trg_appointments_schedule_check trigger remains the final authority on this rule. Returns exactly one row with 'success' (boolean) and, when success is false, 'reason' - one of not_found, not_schedulable, revision_conflict, doctor_inactive, service_inactive, doctor_service_mismatch, starts_at_in_past, outside_schedule_or_conflict, unavailable. 'revision_conflict' specifically means someone/something already changed this appointment since it was last looked up - the AI must call get_patient again to get the current state and revision, then re-confirm with the patient before retrying; it must never blindly resubmit the same expected_revision. The outbox idempotency key is 'UPDATE:<appointment_id>:<revision>' using the NEW post-increment revision, so every successful reschedule produces its own distinct outbox event even if it lands on a previously-used time. audit_log is only written for a row present in the successful UPDATE, so it always corresponds to a real, revision-checked mutation, never a rejected attempt. ON CONFLICT (idempotency_key) DO NOTHING remains as defense-in-depth. The database's own triggers still re-validate duration, leave and doctor double-booking on the new time; call check_availability first to give the patient a good answer without relying on a failed write. Never touches Google Calendar."
+      }
     },
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "WITH input AS (\n  SELECT\n    $1::text AS phone,\n    $2::uuid AS appointment_id,\n    NULLIF($3, '') AS reason\n),\ntarget AS (\n  SELECT a.id\n  FROM appointments a\n  JOIN patients p ON p.id = a.patient_id\n  JOIN input ON a.id = input.appointment_id\n  WHERE a.status = 'SCHEDULED'\n    AND p.whatsapp_phone = input.phone\n),\nupdated AS (\n  UPDATE appointments a\n  SET status = 'CANCELLED',\n      cancelled_at = now(),\n      notes = CASE\n        WHEN input.reason IS NOT NULL THEN COALESCE(a.notes || ' | ', '') || 'Cancelled: ' || input.reason\n        ELSE a.notes\n      END\n  FROM input, target\n  WHERE a.id = target.id\n  RETURNING a.id, a.doctor_id, a.starts_at\n),\noutbox AS (\n  INSERT INTO integration_outbox (aggregate_type, aggregate_id, operation, payload, idempotency_key)\n  SELECT\n    'APPOINTMENT', updated.id, 'DELETE',\n    jsonb_build_object('appointment_id', updated.id),\n    'DELETE:' || updated.id::text\n  FROM updated\n  ON CONFLICT (idempotency_key) DO NOTHING\n  RETURNING id\n),\naudit AS (\n  INSERT INTO audit_log (actor_type, action, entity_type, entity_id, metadata)\n  SELECT\n    'AI_AGENT', 'CANCEL_APPOINTMENT', 'APPOINTMENT', updated.id,\n    jsonb_build_object('channel', 'whatsapp')\n  FROM updated\n  RETURNING id\n)\nSELECT id AS appointment_id FROM updated;",
+        "query": "WITH input AS (\n  SELECT\n    $1::text AS operation_id,\n    $2::text AS phone,\n    $3::uuid AS appointment_id,\n    $4::integer AS expected_revision,\n    NULLIF(btrim($5::text), '') AS cancel_reason\n),\nexisting_operation AS (\n  SELECT result\n  FROM appointment_operations\n  WHERE operation_id = (SELECT operation_id FROM input)\n),\nnew_operation AS (\n  INSERT INTO appointment_operations (\n    operation_id,\n    operation_type,\n    normalized_phone,\n    appointment_id,\n    status,\n    result\n  )\n  SELECT\n    operation_id,\n    'CANCEL',\n    phone,\n    appointment_id,\n    'COMPLETED',\n    '{}'::jsonb\n  FROM input\n  WHERE NOT EXISTS (SELECT 1 FROM existing_operation)\n  RETURNING operation_id\n),\ntarget AS (\n  SELECT a.id, a.status, a.revision\n  FROM appointments a\n  JOIN patients p ON p.id = a.patient_id\n  JOIN input ON input.appointment_id = a.id\n  WHERE p.whatsapp_phone = input.phone\n),\nupdated AS (\n  UPDATE appointments a\n  SET status = 'CANCELLED',\n      cancelled_at = now(),\n      revision = a.revision + 1,\n      notes = CASE\n        WHEN input.cancel_reason IS NULL THEN a.notes\n        ELSE COALESCE(a.notes || ' | ', '') || 'Cancelled: ' || input.cancel_reason\n      END\n  FROM input\n  JOIN target ON target.id = input.appointment_id\n  WHERE EXISTS (SELECT 1 FROM new_operation)\n    AND a.id = target.id\n    AND a.status = 'SCHEDULED'\n    AND a.revision = input.expected_revision\n  RETURNING a.id, a.status, a.revision\n),\noperation_update AS (\n  UPDATE appointment_operations op\n  SET result = jsonb_build_object(\n    'success', true,\n    'appointment_id', updated.id,\n    'status', updated.status,\n    'revision', updated.revision\n  )\n  FROM updated\n  WHERE op.operation_id = (SELECT operation_id FROM input)\n  RETURNING op.result\n),\noutbox AS (\n  INSERT INTO integration_outbox (\n    aggregate_type,\n    aggregate_id,\n    operation,\n    payload,\n    idempotency_key\n  )\n  SELECT\n    'APPOINTMENT',\n    id,\n    'DELETE',\n    jsonb_build_object(\n      'appointment_id', id,\n      'revision', revision\n    ),\n    'DELETE:' || id::text || ':' || revision::text\n  FROM updated\n  ON CONFLICT (idempotency_key) DO NOTHING\n),\naudit AS (\n  INSERT INTO audit_log (\n    actor_type,\n    action,\n    entity_type,\n    entity_id,\n    metadata\n  )\n  SELECT\n    'AI_AGENT',\n    'CANCEL_APPOINTMENT',\n    'APPOINTMENT',\n    id,\n    jsonb_build_object(\n      'channel', 'whatsapp',\n      'operation_id', (SELECT operation_id FROM input),\n      'revision', revision\n    )\n  FROM updated\n)\nSELECT result FROM existing_operation\nUNION ALL\nSELECT result FROM operation_update\nUNION ALL\nSELECT jsonb_build_object(\n  'success', false,\n  'appointment_id', input.appointment_id,\n  'reason', CASE\n    WHEN NOT EXISTS (SELECT 1 FROM target) THEN 'not_found'\n    WHEN (SELECT status FROM target) <> 'SCHEDULED' THEN 'not_schedulable'\n    WHEN (SELECT revision FROM target) <> input.expected_revision THEN 'revision_conflict'\n    ELSE 'not_changed'\n  END\n)\nFROM input\nWHERE EXISTS (SELECT 1 FROM new_operation)\n  AND NOT EXISTS (SELECT 1 FROM updated);",
         "options": {
-          "queryReplacement": "={{ $('Normalize Message').item.json.normalized_phone }}, {{ $fromAI('appointment_id', 'UUID of the SCHEDULED appointment to cancel, already confirmed as belonging to this patient.', 'string') }}, {{ $fromAI('reason', 'Optional short cancellation reason given by the patient. Empty string if none given.', 'string') }}"
+          "queryReplacement": "={{ $('Normalize Message').item.json.wa_message_id }}, {{ $('Normalize Message').item.json.normalized_phone }}, {{ $fromAI('appointment_id', 'Appointment UUID from the fresh get_patient result.', 'string') }}, {{ $fromAI('expected_revision', 'Exact revision from the fresh get_patient result.', 'number') }}, {{ $fromAI('reason', 'Optional cancellation reason.', 'string') }}"
         }
       },
       "name": "cancel_appointment",
       "type": "n8n-nodes-base.postgresTool",
       "typeVersion": 2.5,
       "position": [
-        980,
-        590
+        1100,
+        620
       ],
       "id": "cancel_appointment",
       "credentials": {
         "postgres": {
           "id": "PLACEHOLDER_POSTGRES_CRED",
-          "name": "Appointments Postgres (placeholder)"
+          "name": "Appointments Postgres"
         }
-      },
-      "notes": "Sets status to CANCELLED and cancelled_at = now() (never deletes the row) and writes the integration_outbox DELETE + audit_log rows atomically. cancelled_at is only ever set inside this same UPDATE, which only runs for a row already matched by 'target' (status = SCHEDULED AND belongs to this conversation's phone number), so it is populated if and only if the cancellation actually happened - an appointment that is already cancelled/completed/no-show or doesn't belong to this patient matches zero rows and neither status nor cancelled_at is touched. The patient phone ($1) is bound from Normalize Message, never from the AI; appointment_id/reason ($2-$3) are AI-supplied and bound as query parameters, never concatenated into the SQL string. Only matches an appointment that is currently SCHEDULED and belongs to this conversation's phone number, consistent with the schema's allowed status transitions (SCHEDULED -> CANCELLED). The outbox DELETE idempotency key is deterministic (appointment ID only) and the INSERT is safe against a pre-existing identical key via ON CONFLICT DO NOTHING, so exactly one DELETE outbox row ever exists per appointment. Zero rows returned means the cancellation did not happen (already cancelled/completed/no-show, not found, or not this patient's) - report that plainly. Never touches Google Calendar."
+      }
     },
     {
       "parameters": {
         "assignments": {
           "assignments": [
             {
-              "id": "a1",
+              "id": "reply_to",
               "name": "to",
               "type": "string",
               "value": "={{ $('Normalize Message').item.json.normalized_phone }}"
             },
             {
-              "id": "a2",
+              "id": "reply_text",
               "name": "reply_text",
               "type": "string",
               "value": "={{ $json.output }}"
+            },
+            {
+              "id": "message_id",
+              "name": "message_id",
+              "type": "string",
+              "value": "={{ $('Normalize Message').item.json.wa_message_id }}"
+            },
+            {
+              "id": "phone_number_id",
+              "name": "phone_number_id",
+              "type": "string",
+              "value": "={{ $('Normalize Message').item.json.phone_number_id }}"
             }
           ]
         },
@@ -322,31 +321,54 @@
       "type": "n8n-nodes-base.set",
       "typeVersion": 3.4,
       "position": [
-        980,
-        -420
+        1020,
+        -400
       ],
       "id": "prepare_reply"
     },
     {
       "parameters": {
-        "resource": "message",
-        "operation": "send",
-        "phoneNumberId": "={{ $('Normalize Message').item.json.phone_number_id }}",
-        "recipientPhoneNumber": "={{ $json.to }}",
-        "textBody": "={{ $json.reply_text }}"
+        "operation": "executeQuery",
+        "query": "INSERT INTO whatsapp_outbox (\n  wa_message_id,\n  recipient_phone,\n  phone_number_id,\n  message_type,\n  body\n)\nVALUES ($1, $2, $3, 'text', $4)\nON CONFLICT (wa_message_id) DO NOTHING\nRETURNING id;",
+        "options": {
+          "queryReplacement": "={{ $json.message_id }}, {{ $json.to }}, {{ $json.phone_number_id }}, {{ $json.reply_text }}"
+        }
       },
-      "name": "Send WhatsApp Reply",
-      "type": "n8n-nodes-base.whatsApp",
-      "typeVersion": 1,
+      "name": "Queue WhatsApp Reply",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
       "position": [
-        1220,
-        -420
+        1240,
+        -400
       ],
-      "id": "send_whatsapp_reply",
+      "id": "queue_whatsapp_reply",
       "credentials": {
-        "whatsAppApi": {
-          "id": "PLACEHOLDER_WHATSAPP_API_CRED",
-          "name": "WhatsApp Business Cloud API (placeholder)"
+        "postgres": {
+          "id": "PLACEHOLDER_POSTGRES_CRED",
+          "name": "Appointments Postgres"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE whatsapp_message_dedup\nSET status = 'COMPLETED',\n    completed_at = now()\nWHERE wa_message_id = $1\n  AND status = 'PROCESSING'\nRETURNING wa_message_id;",
+        "options": {
+          "queryReplacement": "={{ $('Normalize Message').item.json.wa_message_id }}"
+        }
+      },
+      "name": "Mark Message Processed",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1460,
+        -400
+      ],
+      "id": "mark_message_processed",
+      "credentials": {
+        "postgres": {
+          "id": "PLACEHOLDER_POSTGRES_CRED",
+          "name": "Appointments Postgres"
         }
       }
     },
@@ -355,77 +377,87 @@
         "assignments": {
           "assignments": [
             {
-              "id": "e1",
+              "id": "error_to",
               "name": "to",
               "type": "string",
               "value": "={{ $('Normalize Message').item.json.normalized_phone }}"
             },
             {
-              "id": "e2",
+              "id": "error_text",
               "name": "reply_text",
               "type": "string",
-              "value": "Sorry, I ran into a problem just now and I'm not fully sure whether that last request went through. Could you please tell me \"show my appointments\" or repeat what you were trying to do? I'll check the current status before doing anything else."
+              "value": "Sorry, I couldn't safely complete that request just now. Please send your request again and I'll check the current appointment status before making any change."
+            },
+            {
+              "id": "error_message_id",
+              "name": "message_id",
+              "type": "string",
+              "value": "={{ $('Normalize Message').item.json.wa_message_id }}"
+            },
+            {
+              "id": "error_phone_number_id",
+              "name": "phone_number_id",
+              "type": "string",
+              "value": "={{ $('Normalize Message').item.json.phone_number_id }}"
             }
           ]
         },
         "options": {}
       },
-      "name": "Prepare Friendly Error Reply",
+      "name": "Prepare Error Reply",
       "type": "n8n-nodes-base.set",
       "typeVersion": 3.4,
       "position": [
-        980,
+        1020,
         -600
       ],
-      "id": "prepare_friendly_error_reply",
-      "notes": "Deliberately generic: never surfaces SQL errors, stack traces, credentials, or internal workflow details to the patient. Deliberately does NOT claim 'nothing was booked or changed' - the Appointment Agent's onError=continueErrorOutput catches failures anywhere in that single agent run, including a failure that happens AFTER a tool call (book_appointment/reschedule_appointment/cancel_appointment) has already committed a mutation (e.g. a later LLM step failing while composing the reply), so asserting nothing happened would sometimes be false. Instead this reply asks the patient to check current status, which prompts a fresh get_patient lookup on the next turn and reports only what the database actually shows - never a guess in either direction."
+      "id": "prepare_error_reply"
     },
     {
       "parameters": {
-        "resource": "message",
-        "operation": "send",
-        "phoneNumberId": "={{ $('Normalize Message').item.json.phone_number_id }}",
-        "recipientPhoneNumber": "={{ $json.to }}",
-        "textBody": "={{ $json.reply_text }}"
+        "operation": "executeQuery",
+        "query": "INSERT INTO whatsapp_outbox (\n  wa_message_id,\n  recipient_phone,\n  phone_number_id,\n  message_type,\n  body\n)\nVALUES ($1, $2, $3, 'text', $4)\nON CONFLICT (wa_message_id) DO NOTHING\nRETURNING id;",
+        "options": {
+          "queryReplacement": "={{ $json.message_id }}, {{ $json.to }}, {{ $json.phone_number_id }}, {{ $json.reply_text }}"
+        }
       },
-      "name": "Send WhatsApp Error Reply",
-      "type": "n8n-nodes-base.whatsApp",
-      "typeVersion": 1,
+      "name": "Queue Error Reply",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
       "position": [
-        1220,
+        1240,
         -600
       ],
-      "id": "send_whatsapp_error_reply",
+      "id": "queue_error_reply",
       "credentials": {
-        "whatsAppApi": {
-          "id": "PLACEHOLDER_WHATSAPP_API_CRED",
-          "name": "WhatsApp Business Cloud API (placeholder)"
+        "postgres": {
+          "id": "PLACEHOLDER_POSTGRES_CRED",
+          "name": "Appointments Postgres"
         }
       }
     },
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "INSERT INTO whatsapp_message_dedup (wa_message_id, normalized_phone, status, claimed_at)\nVALUES ($1, $2, 'PROCESSING', now())\nON CONFLICT (wa_message_id) DO UPDATE\n  SET claimed_at = now(),\n      status = 'PROCESSING'\nWHERE whatsapp_message_dedup.status = 'PROCESSING'\n  AND whatsapp_message_dedup.claimed_at < now() - interval '2 minutes'\nRETURNING wa_message_id;",
+        "query": "UPDATE whatsapp_message_dedup\nSET status = 'COMPLETED',\n    completed_at = now()\nWHERE wa_message_id = $1\n  AND status = 'PROCESSING'\nRETURNING wa_message_id;",
         "options": {
-          "queryReplacement": "={{ $json.wa_message_id }}, {{ $json.normalized_phone }}"
+          "queryReplacement": "={{ $('Normalize Message').item.json.wa_message_id }}"
         }
       },
-      "name": "Deduplicate Message",
+      "name": "Mark Error Message Processed",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
       "position": [
-        510,
-        -60
+        1460,
+        -600
       ],
-      "id": "deduplicate_message",
+      "id": "mark_error_message_processed",
       "credentials": {
         "postgres": {
           "id": "PLACEHOLDER_POSTGRES_CRED",
-          "name": "Appointments Postgres (placeholder)"
+          "name": "Appointments Postgres"
         }
-      },
-      "notes": "Idempotency/claim gate, placed BEFORE the Appointment Agent so a duplicate WhatsApp webhook delivery (retry) can never reach the AI a second time - and so a message whose processing previously FAILED can still be retried instead of being permanently consumed. INSERT ... ON CONFLICT (wa_message_id) DO UPDATE ... WHERE is a single atomic statement covering every case: (1) brand-new message - INSERT succeeds, 1 row returned, proceed; (2) already COMPLETED (a prior attempt actually finished successfully) - WHERE is false, 0 rows returned, treated as a duplicate and dropped, so no second reply is ever sent for a message that already succeeded; (3) still PROCESSING and recently claimed (a concurrent webhook delivery of the same message is already in flight right now) - WHERE is false, 0 rows returned, dropped, so two concurrent executions for the same message can never both proceed; (4) PROCESSING but stale (the previous attempt crashed or the AI step failed after this row was claimed, and enough time has passed) - WHERE is true, the row is reclaimed (claimed_at bumped), 1 row returned, and this execution retries the message. Because 0 returned rows means n8n does not execute any downstream node on this branch (Appointment Agent, Mark Message Processed, Prepare Reply, Send WhatsApp Reply never run), a message is only ever fully consumed once it reaches 'Mark Message Processed' on the success path - a failure anywhere before that (including inside the Appointment Agent) leaves the row PROCESSING and therefore retryable, it does not permanently swallow the message. Requires the whatsapp_message_dedup table (see accompanying SQL) with wa_message_id as its PRIMARY KEY and a status/claimed_at pair. This is a durable Postgres table, not in-memory, so it survives workflow/worker restarts."
+      }
     },
     {
       "parameters": {
@@ -438,7 +470,7 @@
           },
           "conditions": [
             {
-              "id": "n1",
+              "id": "nontext_message_exists",
               "leftValue": "={{ $json.messages?.[0] }}",
               "rightValue": "",
               "operator": {
@@ -459,122 +491,107 @@
         380,
         220
       ],
-      "id": "is_actual_inbound_message?",
-      "notes": "Reached only when 'Is Inbound Text Message?' was false, i.e. the message is not a text message. WhatsApp Cloud API sends both real non-text inbound messages (voice/image/document/etc, which DO have a messages[0] entry) and status webhook events (delivery/read receipts, which have no messages[0] entry at all). True = a real non-text inbound message exists -> tell the patient we only support text. False = a status/delivery/read event, not a patient message -> nothing is sent, matching the existing silent-drop behavior for these events."
+      "id": "is_actual_inbound_message"
     },
     {
       "parameters": {
-        "jsCode": "// Mirrors Normalize Message's phone normalization exactly, but does not\n// require msg.text (this branch handles voice/image/document/etc, which\n// have no text body). Used only to identify the sender/idempotency key so\n// we can deduplicate and send a single \"text only\" reply.\nconst msg = $json.messages[0];\nconst rawFrom = String(msg.from || '').trim();\nconst digitsOnly = rawFrom.replace(/[^0-9]/g, '');\nconst normalizedPhone = '+' + digitsOnly;\n\nconst phonePattern = /^\\+[1-9][0-9]{6,14}$/;\nif (!phonePattern.test(normalizedPhone)) {\n  throw new Error('Could not normalize WhatsApp sender number into the expected +<countrycode><number> format required by the database.');\n}\n\nreturn [{\n  json: {\n    normalized_phone: normalizedPhone,\n    wa_message_id: msg.id,\n    message_type: msg.type || 'unknown',\n    phone_number_id: $json.metadata?.phone_number_id || '',\n  }\n}];"
+        "jsCode": "const msg = $json.messages?.[0];\n\nif (!msg?.id) {\n  throw new Error('Missing WhatsApp message ID.');\n}\n\nif (!msg?.from) {\n  throw new Error('Missing WhatsApp sender number.');\n}\n\nconst phoneNumberId = String($json.metadata?.phone_number_id || '').trim();\nif (!phoneNumberId) {\n  throw new Error('Missing WhatsApp phone number ID.');\n}\n\nconst normalizedPhone = '+' + String(msg.from).replace(/[^0-9]/g, '');\n\nif (!/^\\+[1-9][0-9]{6,14}$/.test(normalizedPhone)) {\n  throw new Error('Invalid WhatsApp sender number.');\n}\n\nreturn [{\n  json: {\n    normalized_phone: normalizedPhone,\n    wa_message_id: String(msg.id),\n    message_type: String(msg.type || 'unknown'),\n    phone_number_id: phoneNumberId\n  }\n}];"
       },
       "name": "Normalize Non-Text Message",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
       "position": [
-        620,
+        600,
         220
       ],
-      "id": "normalize_non_text_message",
-      "notes": "Deterministic, non-AI extraction of sender/idempotency fields for a non-text inbound message. Does not touch message content since there is nothing the AI needs to see for this branch - it never reaches the Appointment Agent."
+      "id": "normalize_non_text_message"
     },
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "INSERT INTO whatsapp_message_dedup (wa_message_id, normalized_phone, status, claimed_at)\nVALUES ($1, $2, 'PROCESSING', now())\nON CONFLICT (wa_message_id) DO UPDATE\n  SET claimed_at = now(),\n      status = 'PROCESSING'\nWHERE whatsapp_message_dedup.status = 'PROCESSING'\n  AND whatsapp_message_dedup.claimed_at < now() - interval '2 minutes'\nRETURNING wa_message_id;",
+        "query": "INSERT INTO whatsapp_message_dedup (\n  wa_message_id,\n  normalized_phone,\n  phone_number_id,\n  status,\n  claimed_at\n)\nVALUES ($1, $2, $3, 'PROCESSING', now())\nON CONFLICT (wa_message_id) DO UPDATE\nSET claimed_at = now(),\n    status = 'PROCESSING',\n    phone_number_id = EXCLUDED.phone_number_id\nWHERE whatsapp_message_dedup.status = 'PROCESSING'\n  AND whatsapp_message_dedup.claimed_at < now() - interval '10 minutes'\nRETURNING wa_message_id;",
         "options": {
-          "queryReplacement": "={{ $json.wa_message_id }}, {{ $json.normalized_phone }}"
+          "queryReplacement": "={{ $('Normalize Non-Text Message').item.json.wa_message_id }}, {{ $('Normalize Non-Text Message').item.json.normalized_phone }}, {{ $('Normalize Non-Text Message').item.json.phone_number_id }}"
         }
       },
-      "name": "Deduplicate Non-Text Message",
+      "name": "Claim Non-Text Message",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
       "position": [
-        860,
+        820,
         220
       ],
-      "id": "deduplicate_non_text_message",
+      "id": "claim_non_text_message",
       "credentials": {
         "postgres": {
           "id": "PLACEHOLDER_POSTGRES_CRED",
-          "name": "Appointments Postgres (placeholder)"
+          "name": "Appointments Postgres"
         }
-      },
-      "notes": "Same whatsapp_message_dedup table and same atomic claim/reclaim pattern as the main Deduplicate Message node (see its notes for the full case-by-case breakdown), so a WhatsApp retry of the same non-text message cannot cause the patient to receive the 'please type text' reply twice, and a message whose reply send previously failed can still be retried instead of being permanently dropped. Zero returned rows means no downstream node on this branch runs. The row is only marked COMPLETED by 'Mark Non-Text Message Processed' after the reply actually sends."
+      }
     },
     {
       "parameters": {
         "assignments": {
           "assignments": [
             {
-              "id": "u1",
+              "id": "unsupported_to",
               "name": "to",
               "type": "string",
               "value": "={{ $('Normalize Non-Text Message').item.json.normalized_phone }}"
             },
             {
-              "id": "u2",
+              "id": "unsupported_text",
               "name": "reply_text",
               "type": "string",
-              "value": "Thanks for your message! Right now our appointment assistant can only read text messages. Could you please type your request instead (for example, the doctor or service, and the date and time you'd like)?"
+              "value": "Thanks for your message! I can currently process text messages only. Please type your appointment request."
+            },
+            {
+              "id": "unsupported_message_id",
+              "name": "message_id",
+              "type": "string",
+              "value": "={{ $('Normalize Non-Text Message').item.json.wa_message_id }}"
+            },
+            {
+              "id": "unsupported_phone_number_id",
+              "name": "phone_number_id",
+              "type": "string",
+              "value": "={{ $('Normalize Non-Text Message').item.json.phone_number_id }}"
             }
           ]
         },
         "options": {}
       },
-      "name": "Prepare Unsupported Message Reply",
+      "name": "Prepare Unsupported Reply",
       "type": "n8n-nodes-base.set",
       "typeVersion": 3.4,
       "position": [
-        1100,
+        1040,
         220
       ],
-      "id": "prepare_unsupported_message_reply"
-    },
-    {
-      "parameters": {
-        "resource": "message",
-        "operation": "send",
-        "phoneNumberId": "={{ $('Normalize Non-Text Message').item.json.phone_number_id }}",
-        "recipientPhoneNumber": "={{ $json.to }}",
-        "textBody": "={{ $json.reply_text }}"
-      },
-      "name": "Send Unsupported Message Reply",
-      "type": "n8n-nodes-base.whatsApp",
-      "typeVersion": 1,
-      "position": [
-        1340,
-        220
-      ],
-      "id": "send_unsupported_message_reply",
-      "credentials": {
-        "whatsAppApi": {
-          "id": "PLACEHOLDER_WHATSAPP_API_CRED",
-          "name": "WhatsApp Business Cloud API (placeholder)"
-        }
-      }
+      "id": "prepare_unsupported_reply"
     },
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "UPDATE whatsapp_message_dedup\nSET status = 'COMPLETED',\n    completed_at = now()\nWHERE wa_message_id = $1\n  AND status = 'PROCESSING'\nRETURNING wa_message_id;",
+        "query": "INSERT INTO whatsapp_outbox (\n  wa_message_id,\n  recipient_phone,\n  phone_number_id,\n  message_type,\n  body\n)\nVALUES ($1, $2, $3, 'text', $4)\nON CONFLICT (wa_message_id) DO NOTHING\nRETURNING id;",
         "options": {
-          "queryReplacement": "={{ $('Normalize Message').item.json.wa_message_id }}"
+          "queryReplacement": "={{ $json.message_id }}, {{ $json.to }}, {{ $json.phone_number_id }}, {{ $json.reply_text }}"
         }
       },
-      "name": "Mark Message Processed",
+      "name": "Queue Unsupported Reply",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
       "position": [
-        980,
-        -420
+        1260,
+        220
       ],
-      "id": "mark_message_processed",
+      "id": "queue_unsupported_reply",
       "credentials": {
         "postgres": {
           "id": "PLACEHOLDER_POSTGRES_CRED",
-          "name": "Appointments Postgres (placeholder)"
+          "name": "Appointments Postgres"
         }
-      },
-      "notes": "Runs ONLY on the Appointment Agent's success output (index 0), never on its error output. Flips this WhatsApp message's dedup row from PROCESSING to COMPLETED so it can never be reprocessed - this is the only place a message is marked as successfully handled. If the Appointment Agent itself failed (error output, index 1, goes straight to Prepare Friendly Error Reply instead), this node never runs, so the dedup row stays PROCESSING and the same message can be safely retried later once its claimed_at goes stale."
+      }
     },
     {
       "parameters": {
@@ -584,24 +601,74 @@
           "queryReplacement": "={{ $('Normalize Non-Text Message').item.json.wa_message_id }}"
         }
       },
-      "name": "Mark Non-Text Message Processed",
+      "name": "Mark Non-Text Processed",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
       "position": [
-        1580,
+        1480,
         220
       ],
-      "id": "mark_non_text_message_processed",
+      "id": "mark_non_text_processed",
       "credentials": {
         "postgres": {
           "id": "PLACEHOLDER_POSTGRES_CRED",
-          "name": "Appointments Postgres (placeholder)"
+          "name": "Appointments Postgres"
         }
-      },
-      "notes": "Runs only after 'Send Unsupported Message Reply' completes, so this non-text message's dedup row is only flipped to COMPLETED once the reply has actually been sent. If sending the reply fails, this node never runs, so the dedup row stays PROCESSING and the same message can be retried later once its claimed_at goes stale, instead of being permanently (and silently) marked handled with no reply ever sent."
+      }
     }
   ],
   "connections": {
+    "WhatsApp Trigger": {
+      "main": [
+        [
+          {
+            "node": "Is Inbound Text Message?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Inbound Text Message?": {
+      "main": [
+        [
+          {
+            "node": "Normalize Message",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Is Actual Inbound Message?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Message": {
+      "main": [
+        [
+          {
+            "node": "Claim Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claim Message": {
+      "main": [
+        [
+          {
+            "node": "Appointment Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
     "Gemini Chat Model": {
       "ai_languageModel": [
         [
@@ -613,7 +680,7 @@
         ]
       ]
     },
-    "Session Memory (per phone)": {
+    "Session Memory": {
       "ai_memory": [
         [
           {
@@ -694,14 +761,14 @@
       "main": [
         [
           {
-            "node": "Mark Message Processed",
+            "node": "Prepare Reply",
             "type": "main",
             "index": 0
           }
         ],
         [
           {
-            "node": "Prepare Friendly Error Reply",
+            "node": "Prepare Error Reply",
             "type": "main",
             "index": 0
           }
@@ -712,69 +779,40 @@
       "main": [
         [
           {
-            "node": "Send WhatsApp Reply",
+            "node": "Queue WhatsApp Reply",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Prepare Friendly Error Reply": {
+    "Queue WhatsApp Reply": {
       "main": [
         [
           {
-            "node": "Send WhatsApp Error Reply",
+            "node": "Mark Message Processed",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "WhatsApp Trigger": {
+    "Prepare Error Reply": {
       "main": [
         [
           {
-            "node": "Is Inbound Text Message?",
+            "node": "Queue Error Reply",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Is Inbound Text Message?": {
+    "Queue Error Reply": {
       "main": [
         [
           {
-            "node": "Normalize Message",
-            "type": "main",
-            "index": 0
-          }
-        ],
-        [
-          {
-            "node": "Is Actual Inbound Message?",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Normalize Message": {
-      "main": [
-        [
-          {
-            "node": "Deduplicate Message",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Deduplicate Message": {
-      "main": [
-        [
-          {
-            "node": "Appointment Agent",
+            "node": "Mark Error Message Processed",
             "type": "main",
             "index": 0
           }
@@ -797,63 +835,41 @@
       "main": [
         [
           {
-            "node": "Deduplicate Non-Text Message",
+            "node": "Claim Non-Text Message",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Deduplicate Non-Text Message": {
+    "Claim Non-Text Message": {
       "main": [
         [
           {
-            "node": "Prepare Unsupported Message Reply",
+            "node": "Prepare Unsupported Reply",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Prepare Unsupported Message Reply": {
+    "Prepare Unsupported Reply": {
       "main": [
         [
           {
-            "node": "Send Unsupported Message Reply",
+            "node": "Queue Unsupported Reply",
             "type": "main",
             "index": 0
           }
         ]
       ]
     },
-    "Mark Message Processed": {
+    "Queue Unsupported Reply": {
       "main": [
         [
           {
-            "node": "Prepare Reply",
+            "node": "Mark Non-Text Processed",
             "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Send Unsupported Message Reply": {
-      "main": [
-        [
-          {
-            "node": "Mark Non-Text Message Processed",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "register_patient": {
-      "ai_tool": [
-        [
-          {
-            "node": "Appointment Agent",
-            "type": "ai_tool",
             "index": 0
           }
         ]
@@ -867,7 +883,7 @@
     "callerPolicy": "workflowsFromSameOwner"
   },
   "pinData": {},
-  "versionId": "00000000-0000-0000-0000-000000000001",
+  "versionId": "00000000-0000-0000-0000-000000000002",
   "meta": {
     "templateCredsSetupCompleted": false
   }

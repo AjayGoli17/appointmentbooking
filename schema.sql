@@ -468,6 +468,11 @@ CREATE TABLE reminder_log (
   sent_at        TIMESTAMPTZ NULL,
   attempts       INTEGER NOT NULL DEFAULT 0,
   last_error     TEXT NULL,
+  -- Claim/lease timestamp for FOR UPDATE SKIP LOCKED claiming. A stale
+  -- locked_at (older than the retry backoff window) makes a PENDING row
+  -- claimable again after a worker crash. Mirrors integration_outbox.locked_at.
+  -- Not a status - PENDING covers both not-yet-due and currently-claimed rows.
+  locked_at      TIMESTAMPTZ NULL,
   created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
 

@@ -1,0 +1,770 @@
+{
+  "name": "02 - Appointment Reminder Engine - Production",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 1
+            }
+          ]
+        }
+      },
+      "id": "n1",
+      "name": "Every Minute",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE reminder_log rl\nSET status=CASE \n      WHEN rl.last_error LIKE 'RECONCILIATION_REQUIRED%' THEN rl.status \n      ELSE 'SKIPPED' \n    END,\n    last_error=CASE \n      WHEN rl.last_error LIKE 'RECONCILIATION_REQUIRED%' THEN rl.last_error \n      ELSE 'Appointment is no longer SCHEDULED' \n    END,\n    locked_at=NULL,\n    updated_at=now()\nFROM appointments a\nWHERE a.id=rl.appointment_id\n  AND rl.status='PENDING'\n  AND rl.locked_at IS NULL\n  AND a.status <> 'SCHEDULED'\nRETURNING rl.id AS reminder_id;"
+      },
+      "id": "n2",
+      "name": "Skip Obsolete Reminders",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        220,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_CREDENTIAL_ID",
+          "name": "PostgreSQL Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO reminder_log (\n  appointment_id, reminder_type, status, scheduled_for, attempts, last_error, locked_at\n)\nSELECT\n  a.id, rt.reminder_type,\n  CASE WHEN a.starts_at - rt.lead_interval > now() THEN 'PENDING' ELSE 'SKIPPED' END,\n  a.starts_at - rt.lead_interval,\n  0,\n  CASE WHEN a.starts_at - rt.lead_interval > now() THEN NULL\n       ELSE 'Reminder window was already missed when the reminder record was created' END,\n  NULL\nFROM appointments a\nCROSS JOIN (\n  VALUES\n    ('THREE_DAY'::text, INTERVAL '3 days'),\n    ('ONE_DAY'::text, INTERVAL '1 day'),\n    ('FOUR_HOUR'::text, INTERVAL '4 hours'),\n    ('ONE_HOUR'::text, INTERVAL '1 hour')\n) rt(reminder_type, lead_interval)\nWHERE a.status='SCHEDULED' AND a.starts_at > now()\nON CONFLICT (appointment_id, reminder_type)\nDO UPDATE SET\n  scheduled_for=EXCLUDED.scheduled_for,\n  status=CASE \n    WHEN reminder_log.last_error LIKE 'RECONCILIATION_REQUIRED%' THEN reminder_log.status\n    WHEN EXCLUDED.scheduled_for > now() THEN 'PENDING' \n    ELSE 'SKIPPED' \n  END,\n  attempts=CASE \n    WHEN reminder_log.last_error LIKE 'RECONCILIATION_REQUIRED%' THEN reminder_log.attempts\n    ELSE 0 \n  END,\n  last_error=CASE \n    WHEN reminder_log.last_error LIKE 'RECONCILIATION_REQUIRED%' THEN reminder_log.last_error\n    WHEN EXCLUDED.scheduled_for > now() THEN NULL\n    ELSE 'Reminder window was already missed after appointment reschedule'\n  END,\n  locked_at=CASE \n    WHEN reminder_log.last_error LIKE 'RECONCILIATION_REQUIRED%' THEN reminder_log.locked_at\n    ELSE NULL \n  END,\n  sent_at=CASE \n    WHEN reminder_log.last_error LIKE 'RECONCILIATION_REQUIRED%' THEN reminder_log.sent_at\n    ELSE NULL \n  END,\n  updated_at=now()\nWHERE reminder_log.status <> 'SENT'\n  AND reminder_log.locked_at IS NULL\n  AND reminder_log.scheduled_for IS DISTINCT FROM EXCLUDED.scheduled_for\nRETURNING id AS reminder_id;"
+      },
+      "id": "n3",
+      "name": "Sync Reminder Records",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        440,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_CREDENTIAL_ID",
+          "name": "PostgreSQL Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH candidates AS (\n  SELECT rl.id\n  FROM reminder_log rl\n  JOIN appointments a ON a.id=rl.appointment_id\n  WHERE rl.status='PENDING'\n    AND rl.scheduled_for <= now()\n    AND (rl.locked_at IS NULL OR rl.locked_at < now()-INTERVAL '30 minutes')\n    AND (rl.last_error IS NULL OR (rl.updated_at <= now()-INTERVAL '5 minutes' AND rl.last_error NOT LIKE 'RECONCILIATION_REQUIRED%'))\n    AND a.status='SCHEDULED'\n    AND a.starts_at > now()\n  ORDER BY rl.scheduled_for ASC, rl.id ASC\n  FOR UPDATE OF rl SKIP LOCKED\n  LIMIT 100\n)\nUPDATE reminder_log rl\nSET locked_at=now(), updated_at=now()\nFROM candidates c\nWHERE rl.id=c.id\nRETURNING rl.id AS reminder_id, rl.appointment_id, rl.reminder_type,\n          rl.scheduled_for, rl.locked_at AS claim_locked_at;"
+      },
+      "id": "n4",
+      "name": "Claim Due Reminders Atomically",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        660,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_CREDENTIAL_ID",
+          "name": "PostgreSQL Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT\n  rl.id AS reminder_id,\n  rl.appointment_id,\n  rl.reminder_type,\n  rl.scheduled_for,\n  rl.locked_at AS claim_locked_at,\n  a.status,\n  a.starts_at,\n  a.revision AS appointment_revision,\n  p.full_name AS patient_name,\n  p.whatsapp_phone,\n  d.full_name AS doctor_name,\n  d.timezone AS doctor_timezone,\n  s.name AS service_name\nFROM reminder_log rl\nJOIN appointments a ON a.id=rl.appointment_id\nJOIN patients p ON p.id=a.patient_id\nJOIN doctors d ON d.id=a.doctor_id\nJOIN services s ON s.id=a.service_id\nWHERE rl.id=$1::uuid\n  AND rl.locked_at=$2::timestamptz\n  AND rl.status='PENDING';",
+        "queryParameters": "={{ [$json.reminder_id, $json.claim_locked_at] }}"
+      },
+      "id": "n5",
+      "name": "Load Claimed Appointment",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        880,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_CREDENTIAL_ID",
+          "name": "PostgreSQL Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.status === 'SCHEDULED' && new Date($json.starts_at).getTime() > Date.now() && /^\\+[1-9][0-9]{6,14}$/.test($json.whatsapp_phone || '') }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "n6",
+      "name": "Still Eligible To Send?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1100,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH current_state AS (\n  SELECT rl.id, rl.status, rl.locked_at, a.status AS appointment_status,\n         a.starts_at, a.revision, p.whatsapp_phone\n  FROM reminder_log rl\n  JOIN appointments a ON a.id=rl.appointment_id\n  JOIN patients p ON p.id=a.patient_id\n  WHERE rl.id=$1::uuid\n),\nupdated AS (\n  UPDATE reminder_log rl\n  SET status=CASE\n        WHEN cs.appointment_status<>'SCHEDULED' THEN 'SKIPPED'\n        WHEN cs.starts_at <= now() THEN 'SKIPPED'\n        WHEN cs.whatsapp_phone IS NULL OR cs.whatsapp_phone !~ '^\\+[1-9][0-9]{6,14}$' THEN 'SKIPPED'\n        WHEN cs.revision<>$3::integer THEN 'PENDING'\n        ELSE 'SKIPPED'\n      END,\n      last_error=CASE\n        WHEN cs.appointment_status<>'SCHEDULED' THEN 'Appointment is no longer SCHEDULED'\n        WHEN cs.starts_at <= now() THEN 'Appointment is in the past'\n        WHEN cs.whatsapp_phone IS NULL OR cs.whatsapp_phone !~ '^\\+[1-9][0-9]{6,14}$' THEN 'Invalid WhatsApp phone number'\n        WHEN cs.revision<>$3::integer THEN 'Appointment changed during eligibility check; claim released'\n        ELSE 'Appointment is not eligible for reminder delivery'\n      END,\n      locked_at=NULL,\n      updated_at=now()\n  FROM current_state cs\n  WHERE rl.id=$1::uuid\n    AND rl.status='PENDING'\n    AND rl.locked_at=$2::timestamptz\n  RETURNING rl.id, rl.status\n)\nSELECT COALESCE((SELECT status FROM updated), 'CLAIM_LOST') AS result;",
+        "queryParameters": "={{ [$json.reminder_id, $json.claim_locked_at, $json.appointment_revision] }}"
+      },
+      "id": "n7",
+      "name": "Finalize Ineligible Claim",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        1320,
+        -120
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_CREDENTIAL_ID",
+          "name": "PostgreSQL Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH current_state AS (\n  SELECT rl.id AS reminder_id,\n         rl.status AS reminder_status,\n         rl.locked_at AS current_locked_at,\n         rl.scheduled_for,\n         rl.appointment_id,\n         rl.reminder_type,\n         rl.last_error,\n         a.status AS appointment_status,\n         a.starts_at,\n         a.revision AS appointment_revision,\n         p.full_name AS patient_name,\n         p.whatsapp_phone,\n         d.full_name AS doctor_name,\n         d.timezone AS doctor_timezone,\n         s.name AS service_name\n  FROM reminder_log rl\n  JOIN appointments a ON a.id=rl.appointment_id\n  JOIN patients p ON p.id=a.patient_id\n  JOIN doctors d ON d.id=a.doctor_id\n  JOIN services s ON s.id=a.service_id\n  WHERE rl.id=$1::uuid\n)\nSELECT \n  cs.*,\n  $2::timestamptz AS claim_locked_at,\n  CASE\n    WHEN cs.reminder_id IS NULL THEN 'CLAIM_LOST'\n    WHEN cs.current_locked_at IS DISTINCT FROM $2::timestamptz THEN 'CLAIM_LOST'\n    WHEN cs.last_error = 'IN_FLIGHT' THEN 'AMBIGUOUS'\n    WHEN cs.reminder_status <> 'PENDING' THEN 'INVALID'\n    WHEN cs.scheduled_for > now() THEN 'INVALID'\n    WHEN cs.appointment_status <> 'SCHEDULED' THEN 'INVALID'\n    WHEN cs.starts_at <= now() THEN 'INVALID'\n    WHEN cs.appointment_revision <> $3::integer THEN 'INVALID'\n    WHEN cs.whatsapp_phone IS NULL OR cs.whatsapp_phone !~ '^\\+[1-9][0-9]{6,14}$' THEN 'INVALID'\n    ELSE 'VALID'\n  END AS validation_result\nFROM (SELECT 1) dummy\nLEFT JOIN current_state cs ON TRUE;",
+        "queryParameters": "={{ [$json.reminder_id, $json.claim_locked_at, $json.appointment_revision] }}"
+      },
+      "id": "n8",
+      "name": "Final Concurrency Check",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        1320,
+        100
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_CREDENTIAL_ID",
+          "name": "PostgreSQL Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH current_appointment AS (\n  SELECT a.status AS appointment_status, p.whatsapp_phone, a.starts_at\n  FROM reminder_log rl\n  JOIN appointments a ON a.id=rl.appointment_id\n  JOIN patients p ON p.id=a.patient_id\n  WHERE rl.id=$1::uuid\n)\nUPDATE reminder_log\nSET status = CASE \n               WHEN (SELECT appointment_status FROM current_appointment) <> 'SCHEDULED' THEN 'SKIPPED' \n               WHEN (SELECT starts_at FROM current_appointment) <= now() THEN 'SKIPPED'\n               WHEN (SELECT whatsapp_phone FROM current_appointment) IS NULL OR (SELECT whatsapp_phone FROM current_appointment) !~ '^\\+[1-9][0-9]{6,14}$' THEN 'SKIPPED'\n               ELSE 'PENDING' \n             END,\n    attempts = 0,\n    last_error = CASE \n                   WHEN (SELECT appointment_status FROM current_appointment) <> 'SCHEDULED' THEN 'Appointment is no longer SCHEDULED; reminder skipped'\n                   WHEN (SELECT starts_at FROM current_appointment) <= now() THEN 'Appointment is in the past; reminder skipped'\n                   WHEN (SELECT whatsapp_phone FROM current_appointment) IS NULL OR (SELECT whatsapp_phone FROM current_appointment) !~ '^\\+[1-9][0-9]{6,14}$' THEN 'Invalid WhatsApp phone number; reminder skipped'\n                   ELSE 'RECONCILIATION_REQUIRED: Appointment changed before reminder delivery'\n                 END,\n    locked_at = NULL,\n    updated_at = now()\nWHERE id=$1::uuid AND status='PENDING' AND locked_at=$2::timestamptz\nRETURNING id AS reminder_id, status;",
+        "queryParameters": "={{ [$json.reminder_id, $json.claim_locked_at] }}"
+      },
+      "id": "n10",
+      "name": "Release Changed Appointment Claim",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        1980,
+        260
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_CREDENTIAL_ID",
+          "name": "PostgreSQL Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://graph.facebook.com/{{ $env.WHATSAPP_GRAPH_API_VERSION || 'v23.0' }}/{{ $env.WHATSAPP_PHONE_NUMBER_ID || 'PLACEHOLDER_WHATSAPP_PHONE_NUMBER_ID' }}/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ { messaging_product: 'whatsapp', to: $('Final Concurrency Check').item.json.whatsapp_phone, type: 'template', template: { name: $env.APPOINTMENT_REMINDER_TEMPLATE_NAME || 'PLACEHOLDER_APPOINTMENT_REMINDER_TEMPLATE_NAME', language: { code: $env.TEMPLATE_LANGUAGE_CODE || 'en_US' }, components: [{ type: 'body', parameters: [{ type:'text', text:$('Final Concurrency Check').item.json.patient_name }, { type:'text', text:$('Final Concurrency Check').item.json.doctor_name }, { type:'text', text:$('Final Concurrency Check').item.json.service_name }, { type:'text', text:new Intl.DateTimeFormat('en-IN',{timeZone:$('Final Concurrency Check').item.json.doctor_timezone || 'Asia/Kolkata',dateStyle:'medium'}).format(new Date($('Final Concurrency Check').item.json.starts_at)) }, { type:'text', text:new Intl.DateTimeFormat('en-IN',{timeZone:$('Final Concurrency Check').item.json.doctor_timezone || 'Asia/Kolkata',timeStyle:'short'}).format(new Date($('Final Concurrency Check').item.json.starts_at)) }] }] } } }}",
+        "options": {
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "n11",
+      "name": "Send WhatsApp Template",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 2,
+      "position": [
+        2090,
+        0
+      ],
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "WHATSAPP_CREDENTIAL_ID",
+          "name": "WhatsApp Cloud API Auth"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "language": "javascript",
+        "jsCode": "const out = [];\nfor (const item of $input.all()) {\n  const d = item.json || {};\n  const statusCandidates = [\n    d.statusCode, d.status, d.httpStatus,\n    d.error?.statusCode, d.error?.httpCode,\n    d.error?.response?.statusCode, d.error?.response?.status,\n    d.error?.cause?.statusCode\n  ];\n  const http_status = statusCandidates.find(v => Number.isFinite(Number(v))) != null\n    ? Number(statusCandidates.find(v => Number.isFinite(Number(v)))) : null;\n  const messageId = d.messages?.[0]?.id ?? d.message_id ?? d.id ?? null;\n  \n  const accepted = Array.isArray(d.messages) && d.messages.length > 0 && !d.error && (http_status === null || (http_status >= 200 && http_status < 300));\n  \n  const is_explicit_retryable = http_status === 408 || http_status === 425 || http_status === 429 || (http_status >= 500 && http_status <= 599);\n  const unknown = !accepted && (http_status === null);\n  const retryable = !accepted && !unknown && is_explicit_retryable;\n  const permanent = !accepted && !unknown && !retryable;\n  \n  out.push({json:{\n    ...d,\n    http_status,\n    whatsapp_message_id: messageId,\n    whatsapp_accepted: accepted,\n    retryable,\n    unknown,\n    permanent,\n    api_error_code: d.error?.code ?? d.code ?? null,\n    error_message: String(d.error?.message ?? d.message ?? '').slice(0,1000)\n  }});\n}\nreturn out;"
+      },
+      "id": "n12",
+      "name": "Normalize WhatsApp Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2310,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.whatsapp_accepted === true }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "n13",
+      "name": "WhatsApp Accepted?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        2530,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH marked_sent AS (\n  UPDATE reminder_log rl\n  SET status='SENT', sent_at=now(), last_error=NULL, locked_at=NULL, updated_at=now()\n  FROM appointments a\n  WHERE rl.id=$1::uuid\n    AND a.id=rl.appointment_id\n    AND rl.status='PENDING'\n    AND rl.locked_at=$2::timestamptz\n    AND a.status='SCHEDULED'\n    AND a.revision=$3::integer\n  RETURNING rl.id\n),\nreleased AS (\n  UPDATE reminder_log rl\n  SET status=CASE WHEN a.status='SCHEDULED' THEN 'PENDING' ELSE 'SKIPPED' END,\n      last_error=CASE\n        WHEN a.status='SCHEDULED' THEN 'RECONCILIATION_REQUIRED: WhatsApp accepted before appointment revision changed'\n        ELSE 'Appointment no longer SCHEDULED after WhatsApp delivery; reminder closed'\n      END,\n      locked_at=NULL,\n      updated_at=now()\n  FROM appointments a\n  WHERE rl.id=$1::uuid\n    AND a.id=rl.appointment_id\n    AND rl.status='PENDING'\n    AND rl.locked_at=$2::timestamptz\n    AND NOT EXISTS (SELECT 1 FROM marked_sent)\n  RETURNING rl.id, rl.status\n)\nSELECT \n  $1::uuid AS reminder_id,\n  $4::uuid AS appointment_id,\n  $5::text AS reminder_type,\n  CASE\n    WHEN EXISTS (SELECT 1 FROM marked_sent) THEN 'SENT'\n    WHEN EXISTS (SELECT 1 FROM released WHERE status='SKIPPED') THEN 'SKIPPED_AFTER_ACCEPT'\n    WHEN EXISTS (SELECT 1 FROM released WHERE status='PENDING') THEN 'RELEASED_AFTER_ACCEPT'\n    ELSE 'CLAIM_LOST'\n  END AS finalize_result;",
+        "queryParameters": "={{ [$('Final Concurrency Check').item.json.reminder_id, $('Final Concurrency Check').item.json.claim_locked_at, $('Final Concurrency Check').item.json.appointment_revision, $('Final Concurrency Check').item.json.appointment_id, $('Final Concurrency Check').item.json.reminder_type] }}"
+      },
+      "id": "n14",
+      "name": "Finalize Reminder Delivery",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        2750,
+        -100
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_CREDENTIAL_ID",
+          "name": "PostgreSQL Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO audit_log (\n  actor_type, action, entity_type, entity_id, metadata\n)\nVALUES (\n  'SYSTEM',\n  'REMINDER_WHATSAPP_ACCEPTED',\n  'APPOINTMENT',\n  $1::uuid,\n  jsonb_build_object(\n    'reminder_type',$2,\n    'whatsapp_message_id',$3,\n    'finalize_result',$4,\n    'http_status',$5\n  )\n)\nRETURNING id;",
+        "queryParameters": "={{ [$json.appointment_id, $json.reminder_type, $('Normalize WhatsApp Result').item.json.whatsapp_message_id, $json.finalize_result, $('Normalize WhatsApp Result').item.json.http_status] }}"
+      },
+      "id": "n15",
+      "name": "Audit WhatsApp Acceptance",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        2970,
+        -100
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_CREDENTIAL_ID",
+          "name": "PostgreSQL Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.retryable === true }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "n16",
+      "name": "Retryable WhatsApp Error?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        2750,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE reminder_log\nSET status=CASE WHEN attempts+1>=5 THEN 'FAILED' ELSE 'PENDING' END,\n    attempts=attempts+1,\n    last_error=$3,\n    locked_at=NULL,\n    updated_at=now()\nWHERE id=$1::uuid AND status='PENDING' AND locked_at=$2::timestamptz\nRETURNING id AS reminder_id,status,attempts;",
+        "queryParameters": "={{ [$('Final Concurrency Check').item.json.reminder_id, $('Final Concurrency Check').item.json.claim_locked_at, ('WhatsApp retryable error' + ($json.api_error_code ? ' ['+$json.api_error_code+']' : '') + ($json.error_message ? ': '+$json.error_message : '')).slice(0,1000)] }}"
+      },
+      "id": "n17",
+      "name": "Record Retryable Failure",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        2970,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_CREDENTIAL_ID",
+          "name": "PostgreSQL Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE reminder_log\nSET status='FAILED',\n    attempts=attempts+1,\n    last_error=$3,\n    locked_at=NULL,\n    updated_at=now()\nWHERE id=$1::uuid AND status='PENDING' AND locked_at=$2::timestamptz\nRETURNING id AS reminder_id,status,attempts;",
+        "queryParameters": "={{ [$('Final Concurrency Check').item.json.reminder_id, $('Final Concurrency Check').item.json.claim_locked_at, ('WhatsApp permanent error' + ($json.api_error_code ? ' ['+$json.api_error_code+']' : '') + ($json.error_message ? ': '+$json.error_message : '')).slice(0,1000)] }}"
+      },
+      "id": "n18",
+      "name": "Record Permanent Failure",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        2640,
+        400
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_CREDENTIAL_ID",
+          "name": "PostgreSQL Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH updated AS (\n  UPDATE reminder_log SET last_error='IN_FLIGHT', updated_at=now() \n  WHERE id=$1::uuid AND locked_at=$2::timestamptz AND status='PENDING' \n  RETURNING id\n)\nSELECT COALESCE((SELECT 'SUCCESS' FROM updated), 'CLAIM_LOST') AS in_flight_result;",
+        "queryParameters": "={{ [$json.reminder_id, $json.claim_locked_at] }}"
+      },
+      "id": "n19",
+      "name": "Mark In-Flight",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        1650,
+        180
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_CREDENTIAL_ID",
+          "name": "PostgreSQL Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE reminder_log SET status='PENDING', last_error='RECONCILIATION_REQUIRED: ' || $3, locked_at=NULL, updated_at=now() WHERE id=$1::uuid AND status='PENDING' AND locked_at=$2::timestamptz RETURNING id AS reminder_id,status,attempts;",
+        "queryParameters": "={{ [$('Final Concurrency Check').item.json.reminder_id, $('Final Concurrency Check').item.json.claim_locked_at, 'UNKNOWN_OUTCOME: External API did not return a response'] }}"
+      },
+      "id": "n20",
+      "name": "Record Unknown Outcome",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2,
+      "position": [
+        2750,
+        540
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "POSTGRES_CREDENTIAL_ID",
+          "name": "PostgreSQL Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.unknown === true }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "n21",
+      "name": "Unknown WhatsApp Error?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        2970,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.in_flight_result === 'SUCCESS' }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "n24",
+      "name": "In-Flight Success?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1870,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "dataType": "string",
+        "value1": "={{ $json.validation_result }}",
+        "rules": {
+          "rules": [
+            {
+              "operation": "equals",
+              "value2": "VALID",
+              "output": 0
+            },
+            {
+              "operation": "equals",
+              "value2": "INVALID",
+              "output": 1
+            },
+            {
+              "operation": "equals",
+              "value2": "AMBIGUOUS",
+              "output": 2
+            },
+            {
+              "operation": "equals",
+              "value2": "CLAIM_LOST",
+              "output": 3
+            }
+          ]
+        }
+      },
+      "id": "n25",
+      "name": "Route Validation Result",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 1,
+      "position": [
+        1540,
+        100
+      ]
+    }
+  ],
+  "connections": {
+    "Every Minute": {
+      "main": [
+        [
+          {
+            "node": "Skip Obsolete Reminders",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Skip Obsolete Reminders": {
+      "main": [
+        [
+          {
+            "node": "Sync Reminder Records",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sync Reminder Records": {
+      "main": [
+        [
+          {
+            "node": "Claim Due Reminders Atomically",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claim Due Reminders Atomically": {
+      "main": [
+        [
+          {
+            "node": "Load Claimed Appointment",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Claimed Appointment": {
+      "main": [
+        [
+          {
+            "node": "Still Eligible To Send?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Still Eligible To Send?": {
+      "main": [
+        [
+          {
+            "node": "Final Concurrency Check",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Finalize Ineligible Claim",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Final Concurrency Check": {
+      "main": [
+        [
+          {
+            "node": "Route Validation Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send WhatsApp Template": {
+      "main": [
+        [
+          {
+            "node": "Normalize WhatsApp Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize WhatsApp Result": {
+      "main": [
+        [
+          {
+            "node": "WhatsApp Accepted?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "WhatsApp Accepted?": {
+      "main": [
+        [
+          {
+            "node": "Finalize Reminder Delivery",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Retryable WhatsApp Error?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Finalize Reminder Delivery": {
+      "main": [
+        [
+          {
+            "node": "Audit WhatsApp Acceptance",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Retryable WhatsApp Error?": {
+      "main": [
+        [
+          {
+            "node": "Record Retryable Failure",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Unknown WhatsApp Error?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark In-Flight": {
+      "main": [
+        [
+          {
+            "node": "In-Flight Success?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Unknown WhatsApp Error?": {
+      "main": [
+        [
+          {
+            "node": "Record Unknown Outcome",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Record Permanent Failure",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "In-Flight Success?": {
+      "main": [
+        [
+          {
+            "node": "Send WhatsApp Template",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Route Validation Result": {
+      "main": [
+        [
+          {
+            "node": "Mark In-Flight",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Release Changed Appointment Claim",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Record Unknown Outcome",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": [
+    {
+      "id": "reminder-engine",
+      "name": "Reminder Engine"
+    }
+  ]
+}
